@@ -1,0 +1,10 @@
+# 操作记录
+
+2026-10-20：读取agent-mode及当前项目规则、核对main f7f2af8与v2.2.1。创建独立macos-blank与macos-render-smoke工作树，保留全部旧worktree。用户澄清启动即白屏。只读代理先错误假定tauri URL path为/，经明确要求实测后纠正为空字符串；静态源与锁定url2.5.8实测形成同一根因证据。临时Rust验证项目位于TEMP且代理清理被策略拒绝，未重试绕过；后续所有仓库测试严格放根/test。
+最小负控：只把真实入口tauri://localhost加入原有test/desktop.rs，未改生产校验时，cargo +1.98.0 test --locked --bin boxy selection_navigation_only_accepts_the_local_entry_page明确FAILED，失败值正是该URL；其余测试未执行。随后只在原有同origin入口path集合加入空字符串，并补无路径query/hash/credentials拒绝用例；版本升为2.2.2。真实WK验证由独立子分支补充，不新增生产诊断功能。
+修复后48库+5桌面+6host+9启动共68项Rust通过，独立安全复核确认未改变远端导航与原生命令隔离。合入macOS真实WK测试子分支e711faf：无新依赖，根/test example复用生产desktop模块、嵌入资产和原命令capability，读取真实DOM/CSS与控件矩形后触发原表单，断言loopback云UI/cookie/远端命令拒绝/签名回执/选择窗销毁/清理。test step限时3分钟；Windows只做example编译，不称为WK通过。
+首轮CI39498842126 macOS单元/Node回归通过，真实WK smoke在窗口创建后首个eval回调Disconnected而失败，尚未发布。核对锁定Wry0.57源码wkwebview/mod.rs:723：导航提交前pending_scripts只排队JS脚本并丢弃该次回调，此为正常加载早期行为，不能立即判整个页面失败。测试改为在原20秒总截止内继续观察，仍必须真实DOM/CSS/可见控件/完整readyState全部成立；根因修复未改变。同时把DOMRect换成普通width/height对象，避免WK原生值桥接不支持，等待document complete再触发原表单。无放宽产品断言、无跳过native测试。
+CI39499486474 source=d3649ddb6a76ca71c52e437d3a2539f2ca19fdcd：Mac真实WKWebView smoke已success，页面DOM/CSS、空input与可见按钮、实际表单调用、protocol3签名任务/回执、cookie及远端native拒绝、selector销毁及正常清理全部通过。两平台单元/Node回归亦已通过，正式release双架构构建进行中。首轮39498842126因测试层过早eval回调错误而取消未发布；新一轮真实UI通过，不跳过检查、不修改生产桥接或权限。
+最终交付：CI39499486474三项job全部success；Mac66项Rust+2项Node及真实WK页面/表单/签名/权限/退出清理通过，Windows68项Rust及发行exe启动/选择/重试/清理全部通过。2026-10-20已公开v2.2.2并设为latest，Release418885209，tag与target=d3649ddb6a76ca71c52e437d3a2539f2ca19fdcd，说明精确为改进了一些内容。两项附件均实际下载校验GitHub digest，备份在C:\Users\User\.codex\backups\boxy-release\20261020-v2.2.2。
+
+macOS universal ZIP=8360744 bytes，sha256=31e85d5853a27d129c2a424c654d6863d78c1768e69041cb3a30305b6342c53a；已读Mach-O fat header确认2架构，plist版本2.2.2。Windows exe=11614720 bytes，sha256=f2bbdff74480e22187a39ffab14470c92c9877df0517835dda30f8265037eb71；ProductVersion=2.2.2。未修改云端业务、未改写历史、未删除旧Release、未改动其他工作树。
