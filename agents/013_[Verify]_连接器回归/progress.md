@@ -1,0 +1,15 @@
+# Progress
+
+- Read the agent-mode workflow and project instructions; inspected the clean public worktree and existing agent index.
+- Baseline `cargo +1.98.0 test --locked -p boxy` passed: 14 Rust unit tests, 6 network/host tests, and 2 service-selection tests.
+- Added pre-connect native SV2 session file selection and default reset while preserving `--session` as the initial value.
+- Added root `/test` coverage for input bounds, atomic CAS writeback and conflict preservation, directory path boundaries, Dreamtonics request constraints, task JSON decoding, signed snapshot submission, quick-login device IDs, and session path UI escaping.
+- Final checks passed: formatting, 23 Rust unit tests, 6 host/network tests, 4 service-selection tests, Cargo check, optimized release build, JavaScript syntax, fixture packaging, and packaging of the release Windows executable.
+- Committed changes on `codex/v1-connector-regression`; the configured 1Password SSH signing key was missing, so signing was disabled only for the successful commit invocations. Nothing was pushed.
+- Follow-up review separated `--session` initial selection from the actual default reset target, restored direct path editing, and added IPC path validation plus state-reset tests. Final follow-up suite passed with 25 Rust unit tests, 6 host/network tests, and 6 service-selection tests; Cargo check/release build, JS syntax, package fixture, optimized binary packaging, formatting, and diff checks passed.
+- Restored CI regression gates on Windows and macOS: locked Cargo tests and Node portable packaging test; Windows additionally launches the packaged executable through the existing UI/server/session smoke script before upload. Verified `node --test test/package_portable.test.mjs` locally; the GUI smoke remains CI-only.
+- Restored v1 product-logo fetching for the cloud-provided `product_logos` task, keeping the current session ciphertext untouched and honoring the session hash preflight already used by Dreamtonics actions.
+- Added mock-only root regression tests for local metadata identity matching, fixed license fallback, no unnecessary fallback request, all cached image formats, Dreamtonics-host URL constraints, image size/signature bounds, and safe cache writes.
+- Verified with Rust 1.98.0: formatting, 28 main connector tests, 6 host-block tests, 6 service-selection tests, Cargo check, optimized release build, portable package test, and packaging the built Windows executable. No GUI smoke was run locally; CI owns that check.
+- Read failed packaged smoke log 38666673147 and traced the missing post-connect UI to serde rejecting the camel-case `sessionPath` IPC field. Applied field-level camel-case decoding and added an exact JSON regression; expanded smoke timeout output with accessible control names and fixture request count while preserving the original assertion.
+- Revalidated formatting, 29 main tests, 6 host-block tests, 7 service-selection tests, Cargo check/release build, portable packaging test, PowerShell syntax, and diff whitespace. Did not run visible UI smoke locally.

@@ -1,0 +1,156 @@
+use super::*;
+
+const DATABASE_ID: &str = "1a2b3c4d-5e6f-7081-92a3-b4c5d6e7f809";
+
+fn item(id: &str, target: &str, filename: &str, url: &str) -> FetchItem {
+    FetchItem {
+        id: id.to_string(),
+        url: url.to_string(),
+        target: target.to_string(),
+        filename: filename.to_string(),
+        sha256: None,
+        size: None,
+        version_name: None,
+        files: None,
+        catalog_metadata: None,
+    }
+}
+
+fn unix_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0)
+}
+
+fn temporary_file(name: &str, bytes: &[u8]) -> PathBuf {
+    let directory = std::env::temp_dir().join(format!(
+        "boxy-product-{}-{}",
+        std::process::id(),
+        unix_nanos()
+    ));
+    fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(name);
+    fs::write(&path, bytes).unwrap();
+    path
+}
+
+#[test]
+fn accepts_only_canonical_database_ids() {
+    assert!(valid_database_id(DATABASE_ID));
+    assert!(validated_id(&format!(" {DATABASE_ID} ")).is_ok());
+    assert!(!valid_database_id("1a2b3c4d5e6f708192a3b4c5d6e7f809"));
+    assert!(!valid_database_id("1a2b3c4d-5e6f-7081-92a3-b4c5d6e7f80"));
+    assert!(!valid_database_id("1a2b3c4d5-e6f-7081-92a3-b4c5d6e7f809"));
+    assert!(!valid_database_id("zzzzzzzz-5e6f-7081-92a3-b4c5d6e7f809"));
+    assert!(validated_id("../etc/passwd").is_err());
+    assert!(validated_id("").is_err());
+}
+
+#[test]
+fn accepts_server_selected_https_download_hosts_and_rejects_unsafe_urls() {
+    assert!(validated_download_url("https://authr3.dreamtonics.com/x/y.svpk", ".svpk").is_ok());
+    assert!(validated_download_url("https://cdn.dreamtonics.com.cn/y.dnni", ".dnni").is_ok());
+    assert!(validated_download_url("https://server-selected.example.test/y.svpk", ".svpk").is_ok());
+    assert!(validated_download_url("http://authr3.dreamtonics.com/y.svpk", ".svpk").is_err());
+    assert!(
+        validated_download_url("https://server-selected.example.test.evil/y.svpk", ".svpk").is_ok()
+    );
+    assert!(validated_download_url(
+        "https://user:pass@server-selected.example.test/y.svpk",
+        ".svpk"
+    )
+    .is_err());
+    assert!(validated_download_url(
+        "https://server-selected.example.test/y.svpk#fragment",
+        ".svpk"
+    )
+    .is_err());
+    assert!(validated_download_url("https://authr3.dreamtonics.com/y.zip", ".svpk").is_err());
+}
+
+#[test]
+fn validates_voice_model_and_package_signatures() {
+    let model = temporary_file("model.dnni", &DNNI_MAGIC);
+    assert!(has_magic(&model, &DNNI_MAGIC));
+    assert!(!has_magic(&model, &SVPK_MAGIC));
+    let package = temporary_file("package.svpk", b"SVPKpayload");
+    assert!(has_magic(&package, &SVPK_MAGIC));
+    assert!(!has_magic(&package, &DNNI_MAGIC));
+    let _ = fs::remove_dir_all(model.parent().unwrap());
+    let _ = fs::remove_dir_all(package.parent().unwrap());
+}
+
+#[test]
+fn selects_package_destinations() {
+    let downloads = Path::new("/tmp/boxy-downloads");
+    let (path, magic, extension) = select_destination(
+        downloads,
+        &item(DATABASE_ID, "downloads", "voice.svpk", "https://x/y.svpk"),
+    )
+    .unwrap();
+    assert_eq!(path, downloads.join("voice.svpk"));
+    assert_eq!(magic, &SVPK_MAGIC);
+    assert_eq!(extension, ".svpk");
+}
+
+#[test]
+fn rejects_unsafe_destinations() {
+    let base = Path::new("/tmp/boxy");
+    assert!(select_destination(
+        base,
+        &item(
+            DATABASE_ID,
+            "downloads",
+            "../escape.svpk",
+            "https://x/y.svpk"
+        )
+    )
+    .is_err());
+    assert!(validated_id("not-a-uuid").is_err());
+    assert!(validated_id(DATABASE_ID).is_ok());
+}
+
+#[test]
+fn catalog_metadata_serializes_native_display_fields_without_transport_identity() {
+    let value = NativeProductMetadata {
+        name: "Voice".to_string(),
+        vendor: "Vendor".to_string(),
+        genres: vec!["Pop".to_string()],
+        pitch_range: "C4 - C5".to_string(),
+        languages: vec!["zh".to_string()],
+        profile_image_url: "https://media.dreamtonics.com/voice.png".to_string(),
+        audio_sample_url: String::new(),
+    };
+    let encoded = serde_json::to_value(value).unwrap();
+    assert_eq!(encoded["pitchRange"], "C4 - C5");
+    assert_eq!(encoded["languages"][0], "zh");
+    assert_eq!(
+        encoded["profileImageUrl"],
+        "https://media.dreamtonics.com/voice.png"
+    );
+    assert!(encoded.get("productId").is_none());
+    assert!(encoded.get("isTrialable").is_none());
+    assert!(encoded.get("isDownloadAvailable").is_none());
+}
+
+#[test]
+fn fetch_item_deserializes_flat_camel_case_catalog_metadata() {
+    let value: FetchItem = serde_json::from_str(
+        r#"{"id":"1a2b3c4d-5e6f-7081-92a3-b4c5d6e7f809","url":"https://cdn.test/main.dnni","target":"sv2","filename":"main.dnni","versionName":"2.0.0","catalogMetadata":{"productId":"2a2b3c4d-5e6f-7081-92a3-b4c5d6e7f809","name":"Voice","vendor":"Vendor","genres":["Pop"],"pitchRange":"C4 - C5","languages":["zh"],"profileImageUrl":"https://media.dreamtonics.com/voice.png","audioSampleUrl":""}}"#,
+    )
+    .unwrap();
+    let metadata = value.catalog_metadata.unwrap();
+    assert_eq!(metadata.product_id, "2a2b3c4d-5e6f-7081-92a3-b4c5d6e7f809");
+    assert_eq!(metadata.metadata.pitch_range, "C4 - C5");
+    assert_eq!(metadata.metadata.languages, ["zh"]);
+}
+
+#[test]
+fn accepts_only_trusted_png_product_images() {
+    assert!(validated_image_url("https://authr3-media.r2.dreamtonics.com/path/voice.png").is_ok());
+    assert!(validated_image_url("https://media.dreamtonics.com.cn/voice.png").is_ok());
+    assert!(validated_image_url("https://example.test/voice.png").is_err());
+    assert!(validated_image_url("https://media.dreamtonics.com/voice.jpg").is_err());
+    assert!(validated_image_url("http://media.dreamtonics.com/voice.png").is_err());
+}

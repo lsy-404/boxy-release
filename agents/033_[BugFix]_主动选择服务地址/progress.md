@@ -1,0 +1,22 @@
+# 操作记录
+
+2026-10-20：读取agent-mode、项目说明和极简Release规则；fetch核对main无差异，保留所有旧worktree，创建独立服务选择实现及core/smoke工作树。公开历史此前清理属于一次性授权，本次采用正常提交，不重写历史。
+
+2026-10-20：合入显式地址core提交；prepare_config只解析启动选项，不检查session。实现内嵌空白选择页及唯一select_service命令，使用Tauri生成的allow-select-service权限、本地窗口capability和真实caller URL检查；远程窗口导航限制保持。连接前失败回到选择页，未连接关闭不等待不存在的worker，已连接关闭沿原有任务回执与销毁窗口路径清理。
+
+本地完整Rust测试先通过43库+4桌面+6host+9启动，新增精确本地选择页URL测试后桌面5项通过，2.2.1 Windows release编译通过。真实UIA验收与跨平台构建待完成。
+
+用户补充中国区旧版TLS握手EOF截图；代码定位为Boxy operation轮询GET传输错误直接退出，并非上游区域API响应。只读协议审查发现写回GET并非幂等，新增独立Worker修复及客户端安全有限GET重试任务，禁止重发start/task/receipt POST。真实大陆网络尚未复验，不把重试机制等同于跨境可达性证明。
+整合验证：48库、5桌面、6host、9启动共68项Rust测试与2项Node测试全部通过。子分支真实Windows 2.2.1 release EXE验收确认空白URL、锁定session在选择前未读取、UIA确认loopback服务、远端select_service拒绝、唯一operation创建及唯一signed read_files回执，两个正常退出均无临时profile和AppData变化。
+
+线上只读D1核对截图所示会话：2026-10-20 16:09至16:11 UTC，quick_licenses/licenses预期与实际endpoint均为国际my_licenses，多次HTTP200且product_count=8；16:09:36已有写回派发，最后logo步骤16:11:46处理200。当前operation为editor_active。该证据说明本会话已有正常产品响应，截图TLS EOF为后来Boxy轮询传输中断；不能将其当作.cn上游报错或产品空响应。代码仍按session issuer精确选择国际/中国区，不依据电脑地理位置切换。
+
+Worker修复使用最新origin/main 5d97d64建立独立worktree，原private primary及其3项untracked保持原样；live查询两仓main均unprotected。客户端poll仅重试临时GET错误，完整非法JSON/401仍终止，start/task/receipt POST不重放。
+额外真实Windows验收通过：invalid URL回显、HTTP503创建失败回显、同一选择页改正URL后完成云UI和签名任务、退出0及清理。新增清理脚本路径白名单与严格测试PID约束。独立生命周期/ACL复核未发现阻断项。
+
+Worker改动71fd6a0已由独立干净工作树推送远端main，105项Worker测试、tsc、build及Wrangler dry-run均通过。2026-10-20部署成功，version=04f46cce-d464-48f3-8063-af79e119ddba，静态资源无变化；保留dashboard变量。private primary含用户untracked，故不移动其本地main、不从该工作树合并/推送；交付基于已fetch的远端main快进，无PR及历史改写。两仓用户现有内容均保留。
+最终交付：GitHub Actions 39457543227 的prepare/Windows/macOS全部success，source=edb462b4a397a52719a26a0ffc579436ab6f6681。Windows正式包的启动、单文件及完整选择/错误重试smoke在CI通过；从Release下载的同一Windows exe再次本机选择/错误恢复/签名任务/正常退出清理验收通过。当前代码的Blob导出真实本机测试亦通过。
+
+2026-10-20已公开v2.2.1并设为latest，Release ID 418620667，正文精确为改进了一些内容；tag解析到同一source。Windows asset=659873930，size=11620864，sha256=5e43b5f119313ca9b877d38d8ab02c2e50e0b2f29f0147d9e212c2bcf8ee6210；macOS asset=659859289，size=8361403，sha256=3c56a7e1eebd64a2e1b4b379b7bc8d393e113c3b370270a65ae5222d7fb97a85。两项均实际下载校验GitHub digest；macOS Fat Mach-O 2架构及plist 2.2.1已读取核实。校验过的附件与metadata保存在C:\Users\User\.codex\backups\boxy-release\20261020-v2.2.1，未覆盖旧备份。
+
+尚无大陆机器对新版本的现场复测结果；恢复测试为本机loopback传输断连/截断响应，并不证明大陆到Boxy的网络根因已消除。本次未将客户端所在地替代令牌issuer路由，也未改写历史或删除旧Release。
