@@ -1,0 +1,60 @@
+name: Boxy verification
+
+on:
+  push:
+    branches: [main, "codex/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows runtime
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Run Rust and source checks
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo test --workspace --all-targets --locked
+          node --test test/*.test.mjs
+
+      - name: Run native WebView smoke
+        shell: pwsh
+        run: pwsh -NoProfile -File test/windows_startup_smoke.ps1
+
+  macos:
+    name: macOS runtime
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Run Rust and source checks
+        run: |
+          cargo test --workspace --all-targets --locked
+          node --test test/*.test.mjs
+
+      - name: Run native WebView smoke
+        run: bash test/macos_webview_render_smoke.sh
