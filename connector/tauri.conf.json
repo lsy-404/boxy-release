@@ -1,0 +1,28 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Boxy",
+  "version": "2.3.1",
+  "identifier": "app.boxy.bridge",
+  "build": {
+    "frontendDist": "bootstrap"
+  },
+  "app": {
+    "windows": [],
+    "withGlobalTauri": true,
+    "security": {
+      "capabilities": [{
+        "identifier": "service-selection",
+        "windows": ["service-selection"],
+        "local": true,
+        "permissions": ["allow-select-service"]
+      }],
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' boxy-local: https://boxy-local.localhost; connect-src ipc: http://ipc.localhost",
+      "assetProtocol": { "enable": false, "scope": [] }
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": ["../assets/boxy-pen.ico", "../assets/boxy-pen.icns", "../assets/boxy-pen.png"],
+    "macOS": { "minimumSystemVersion": "11.0" }
+  }
+}
