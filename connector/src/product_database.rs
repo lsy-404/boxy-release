@@ -1,0 +1,713 @@
+use std::ffi::OsStr;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use url::Url;
+
+use crate::session_io;
+
+const MAX_PACKAGE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const COPY_BUFFER_BYTES: usize = 64 * 1024;
+const DNNI_MAGIC: [u8; 5] = [0xff, 0x00, 0xca, 0x7f, 0x03];
+const SVPK_MAGIC: [u8; 4] = *b"SVPK";
+const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+const MAX_IMAGE_BYTES: u64 = 512 * 1024;
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProductDatabaseStatus {
+    pub id: String,
+    pub installed: bool,
+    pub uninstallable: bool,
+    pub dir: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchItem {
+    pub id: String,
+    pub url: String,
+    pub target: String,
+    pub filename: String,
+    pub sha256: Option<String>,
+    pub size: Option<u64>,
+    pub version_name: Option<String>,
+    pub files: Option<Vec<FetchFile>>,
+    pub catalog_metadata: Option<CatalogMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchFile {
+    pub url: String,
+    pub filename: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogMetadata {
+    pub product_id: String,
+    #[serde(flatten)]
+    pub metadata: NativeProductMetadata,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeProductMetadata {
+    pub name: String,
+    pub vendor: String,
+    pub genres: Vec<String>,
+    pub pitch_range: String,
+    pub languages: Vec<String>,
+    pub profile_image_url: String,
+    pub audio_sample_url: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DownloadProgressStage {
+    Downloading,
+    Installing,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadProgress {
+    pub stage: DownloadProgressStage,
+    pub filename: String,
+    pub downloaded_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub file_index: usize,
+    pub file_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchResult {
+    pub id: String,
+    pub operation: String,
+    pub destination_path: Option<String>,
+    pub downloaded_bytes: u64,
+}
+
+pub fn inspect() -> Vec<ProductDatabaseStatus> {
+    let Ok(databases) = databases_directory() else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(&databases) else {
+        return Vec::new();
+    };
+    let mut statuses = entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_type()
+                .map(|file_type| file_type.is_dir() && !file_type.is_symlink())
+                .unwrap_or(false)
+        })
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|id| valid_database_id(id))
+        .map(|id| {
+            let dir = databases.join(&id);
+            ProductDatabaseStatus {
+                installed: installed_database(&dir),
+                uninstallable: safe_directory(&dir),
+                dir: dir.to_string_lossy().into_owned(),
+                id,
+            }
+        })
+        .collect::<Vec<_>>();
+    statuses.sort_by(|left, right| left.id.cmp(&right.id));
+    statuses
+}
+
+pub fn fetch(
+    item: &FetchItem,
+    attempts: &mut Vec<crate::request_trace::UpstreamAttempt>,
+    progress: &mut dyn FnMut(DownloadProgress),
+) -> Result<FetchResult, String> {
+    if item.target == "sv2" {
+        return fetch_voice_models(&databases_directory()?, item, attempts, progress);
+    }
+    if item.target != "downloads" {
+        return Err("unknown product fetch target".to_string());
+    }
+    let base = downloads_directory()?;
+    let (destination, expected_magic, extension) = select_destination(&base, item)?;
+    let url = validated_download_url(&item.url, extension)?;
+    let downloaded_bytes = download_to(
+        &url,
+        &destination,
+        expected_magic,
+        MAX_PACKAGE_BYTES,
+        item,
+        attempts,
+        progress,
+        &item.filename,
+        1,
+        1,
+        true,
+    )?;
+    Ok(FetchResult {
+        id: item.id.trim().to_string(),
+        operation: "svpkDownload".to_string(),
+        destination_path: Some(destination.to_string_lossy().into_owned()),
+        downloaded_bytes,
+    })
+}
+
+fn fetch_voice_models(
+    base: &Path,
+    item: &FetchItem,
+    attempts: &mut Vec<crate::request_trace::UpstreamAttempt>,
+    progress: &mut dyn FnMut(DownloadProgress),
+) -> Result<FetchResult, String> {
+    let id = validated_id(&item.id)?;
+    let version = item
+        .version_name
+        .as_deref()
+        .map(safe_filename)
+        .transpose()?
+        .filter(|value| !value.is_empty())
+        .unwrap_or("model");
+    let files = match item.files.as_ref().filter(|files| !files.is_empty()) {
+        Some(files) => files
+            .iter()
+            .map(|file| (file.url.clone(), file.filename.clone()))
+            .collect::<Vec<_>>(),
+        None => vec![(item.url.clone(), item.filename.clone())],
+    };
+    if files.is_empty() || files.len() > 8 {
+        return Err("voice model response has an invalid file count".to_string());
+    }
+    let metadata = item
+        .catalog_metadata
+        .as_ref()
+        .ok_or_else(|| "voice model response has no product metadata".to_string())?;
+    let metadata_id = validated_id(&metadata.product_id)?;
+    let image_url = validated_image_url(&metadata.metadata.profile_image_url)?;
+    let staging = base.join(format!(".boxy-{}-{}.part", id, std::process::id()));
+    if staging.exists() {
+        fs::remove_dir_all(&staging)
+            .map_err(|error| format!("cannot prepare the voice model directory: {error}"))?;
+    }
+    fs::create_dir_all(&staging)
+        .map_err(|error| format!("cannot prepare the voice model directory: {error}"))?;
+    let mut downloaded_bytes = 0u64;
+    let active = base.join(&id);
+    let destination = active.join(&version);
+    let already_installed = destination.exists() && version_installed(&destination);
+    if destination.exists() && !already_installed {
+        let _ = fs::remove_dir_all(&staging);
+        return Err("this voice database version exists but is incomplete".to_string());
+    }
+    let download_count = if already_installed {
+        1
+    } else {
+        files.len() + 1
+    };
+    let result = (|| {
+        if !already_installed {
+            for (index, (url, filename)) in files.iter().enumerate() {
+                let filename = safe_filename(filename)?;
+                if !filename.to_ascii_lowercase().ends_with(".dnni") {
+                    return Err("product model file name is not a DNNI file".to_string());
+                }
+                let url = validated_download_url(url, ".dnni")?;
+                downloaded_bytes += download_to(
+                    &url,
+                    &staging.join(filename),
+                    &DNNI_MAGIC,
+                    MAX_PACKAGE_BYTES,
+                    item,
+                    attempts,
+                    progress,
+                    filename,
+                    index + 1,
+                    download_count,
+                    true,
+                )?;
+            }
+        }
+        let image_name = format!("{metadata_id}.png");
+        let image_path = staging.join(&image_name);
+        let image_bytes = download_to(
+            &image_url,
+            &image_path,
+            &PNG_MAGIC,
+            MAX_IMAGE_BYTES,
+            item,
+            attempts,
+            progress,
+            &image_name,
+            download_count,
+            download_count,
+            false,
+        )?;
+        downloaded_bytes += image_bytes;
+        progress(DownloadProgress {
+            stage: DownloadProgressStage::Installing,
+            filename: image_name.clone(),
+            downloaded_bytes: image_bytes,
+            total_bytes: Some(image_bytes),
+            file_index: download_count,
+            file_count: download_count,
+        });
+        if !already_installed {
+            fs::create_dir_all(&active)
+                .map_err(|error| format!("cannot create the voice database directory: {error}"))?;
+            fs::rename(&staging, &destination).map_err(|error| {
+                format!("cannot finalize the voice database installation: {error}")
+            })?;
+        }
+        let metadata_stage = if already_installed {
+            staging.as_path()
+        } else {
+            destination.as_path()
+        };
+        install_catalog_metadata(
+            base,
+            metadata_id,
+            metadata_stage,
+            &image_name,
+            &metadata.metadata,
+        )?;
+        let _ = fs::remove_dir_all(&staging);
+        Ok(destination)
+    })();
+    match result {
+        Ok(destination) => Ok(FetchResult {
+            id: id.to_string(),
+            operation: if already_installed {
+                "sv2MetadataRepair"
+            } else {
+                "sv2Install"
+            }
+            .to_string(),
+            destination_path: Some(destination.to_string_lossy().into_owned()),
+            downloaded_bytes,
+        }),
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging);
+            Err(error)
+        }
+    }
+}
+
+pub fn delete(id: &str) -> Result<(), String> {
+    let id = validated_id(id)?;
+    let target = databases_directory()?.join(id);
+    if !safe_directory(&target) {
+        return Err("this product database is not installed".to_string());
+    }
+    fs::remove_dir_all(&target)
+        .map_err(|error| format!("cannot remove the product database; close SV2 first: {error}"))
+}
+
+fn sv2_root() -> Result<PathBuf, String> {
+    session_io::default_session_path()
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "cannot determine the Synthesizer V Studio 2 data directory".to_string())
+}
+
+fn databases_directory() -> Result<PathBuf, String> {
+    let databases = sv2_root()?.join("databases");
+    if !safe_directory(&databases) {
+        return Err("the SV2 databases directory is unavailable".to_string());
+    }
+    Ok(databases)
+}
+
+fn downloads_directory() -> Result<PathBuf, String> {
+    let directory = dirs::download_dir()
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .map(PathBuf::from)
+                .map(|path| path.join("Downloads"))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|path| path.join("Downloads"))
+        })
+        .ok_or_else(|| "cannot determine the user Downloads directory".to_string())?;
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("cannot prepare the Downloads directory: {error}"))?;
+    Ok(directory)
+}
+
+fn select_destination(
+    base: &Path,
+    item: &FetchItem,
+) -> Result<(PathBuf, &'static [u8], &'static str), String> {
+    let filename = safe_filename(&item.filename)?;
+    Ok((base.join(filename), &SVPK_MAGIC, ".svpk"))
+}
+
+fn validated_download_url(value: &str, extension: &str) -> Result<Url, String> {
+    let url = Url::parse(value).map_err(|_| "product download URL is invalid".to_string())?;
+    if url.scheme() != "https" {
+        return Err("product download URL must use HTTPS".to_string());
+    }
+    if url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("product download URL is invalid".to_string());
+    }
+    if !url.path().to_ascii_lowercase().ends_with(extension) {
+        return Err("product download URL has an unexpected file type".to_string());
+    }
+    Ok(url)
+}
+
+fn validated_image_url(value: &str) -> Result<Url, String> {
+    let url = validated_download_url(value, ".png")?;
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    if !(host == "dreamtonics.com"
+        || host.ends_with(".dreamtonics.com")
+        || host == "dreamtonics.com.cn"
+        || host.ends_with(".dreamtonics.com.cn"))
+    {
+        return Err("product image URL host is not trusted".to_string());
+    }
+    Ok(url)
+}
+
+fn install_catalog_metadata(
+    base: &Path,
+    product_id: &str,
+    staging: &Path,
+    image_name: &str,
+    metadata: &NativeProductMetadata,
+) -> Result<(), String> {
+    let directory = base.join("meta");
+    if !directory.exists() {
+        fs::create_dir_all(&directory)
+            .map_err(|error| format!("cannot create product metadata directory: {error}"))?;
+    }
+    if !safe_directory(&directory) {
+        return Err("product metadata directory is unavailable".to_string());
+    }
+    let image = directory.join(image_name);
+    let json = directory.join(format!("{product_id}.json"));
+    if [image.as_path(), json.as_path()].iter().any(|path| {
+        fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+    }) {
+        return Err("product metadata path is not a regular file".to_string());
+    }
+    let serialized = serde_json::to_vec(metadata)
+        .map_err(|_| "product metadata could not be serialized".to_string())?;
+    let temporary_json = temporary_path(&staging.join(format!("{product_id}.json")));
+    let mut output = create_new_file(&temporary_json)?;
+    if let Err(error) = output
+        .write_all(&serialized)
+        .and_then(|_| output.sync_all())
+    {
+        drop(output);
+        let _ = fs::remove_file(&temporary_json);
+        return Err(format!("cannot save product metadata: {error}"));
+    }
+    drop(output);
+    let staged_image = staging.join(image_name);
+    if !has_magic(&staged_image, &PNG_MAGIC) {
+        let _ = fs::remove_file(&temporary_json);
+        return Err("downloaded product image has an invalid file signature".to_string());
+    }
+    replace_file(&staged_image, &image)?;
+    let replace_result = replace_file(&temporary_json, &json);
+    if replace_result.is_err() {
+        let _ = fs::remove_file(&temporary_json);
+    }
+    replace_result
+}
+
+fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
+        let source = source
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let destination = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        if unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(source, destination).map_err(|error| error.to_string())
+    }
+}
+
+fn safe_filename(value: &str) -> Result<&str, String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains('\\')
+        || value.chars().any(char::is_control)
+    {
+        return Err("product file name is unsafe".to_string());
+    }
+    Ok(value)
+}
+
+fn download_to(
+    url: &Url,
+    destination: &Path,
+    expected_magic: &[u8],
+    max_bytes: u64,
+    item: &FetchItem,
+    attempts: &mut Vec<crate::request_trace::UpstreamAttempt>,
+    progress: &mut dyn FnMut(DownloadProgress),
+    filename: &str,
+    file_index: usize,
+    file_count: usize,
+    validate_item: bool,
+) -> Result<u64, String> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot prepare the product directory: {error}"))?;
+    }
+    let temporary = temporary_path(destination);
+    let mut output = create_new_file(&temporary)?;
+    let download = crate::http_request::download_to_writer(
+        url.as_str(),
+        crate::http_request::MAX_HTTP_TIMEOUT_MS,
+        max_bytes,
+        &mut output,
+        &mut |downloaded_bytes, total_bytes| {
+            progress(DownloadProgress {
+                stage: DownloadProgressStage::Downloading,
+                filename: filename.to_string(),
+                downloaded_bytes,
+                total_bytes,
+                file_index,
+                file_count,
+            })
+        },
+    );
+    let copied = match download {
+        Ok(result) => {
+            attempts.extend(result.attempt);
+            result.bytes
+        }
+        Err(error) => {
+            attempts.extend(error.attempt);
+            drop(output);
+            let _ = fs::remove_file(&temporary);
+            return Err(match error.error {
+                "http_status" => {
+                    format!("product download failed ({})", error.status.unwrap_or(599))
+                }
+                "body_limit" => "product file is too large".to_string(),
+                _ => "product download failed".to_string(),
+            });
+        }
+    };
+    if let Err(error) = output.sync_all() {
+        drop(output);
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("cannot save product file: {error}"));
+    }
+    drop(output);
+    if let Err(error) = validate_download(&temporary, expected_magic, item, validate_item) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    #[cfg(windows)]
+    if destination.exists() {
+        fs::remove_file(destination)
+            .map_err(|error| format!("cannot replace {}: {error}", destination.display()))?;
+    }
+    fs::rename(&temporary, destination).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        format!("cannot finalize {}: {error}", destination.display())
+    })?;
+    Ok(copied)
+}
+
+fn validate_download(
+    path: &Path,
+    expected_magic: &[u8],
+    item: &FetchItem,
+    validate_item: bool,
+) -> Result<(), String> {
+    let length = fs::metadata(path).map_err(|error| error.to_string())?.len();
+    if !has_magic(path, expected_magic) {
+        return Err("downloaded product file has an invalid file signature".to_string());
+    }
+    if validate_item && item.size.is_some_and(|size| size != length) {
+        return Err("downloaded product file size does not match the expected size".to_string());
+    }
+    if let Some(expected) = item
+        .sha256
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && validate_item)
+    {
+        if !sha256_matches(path, expected)? {
+            return Err(
+                "downloaded product file hash does not match the expected hash".to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn sha256_matches(path: &Path, expected: &str) -> Result<bool, String> {
+    let digest = sha256_file(path)?;
+    if expected.eq_ignore_ascii_case(&hex_lower(&digest)) {
+        return Ok(true);
+    }
+    Ok(URL_SAFE_NO_PAD.encode(&digest) == expected)
+}
+
+fn sha256_file(path: &Path) -> Result<Vec<u8>, String> {
+    let mut file = File::open(path).map_err(|error| error.to_string())?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; COPY_BUFFER_BYTES];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+    }
+    Ok(hash.finalize().to_vec())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut value = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        value.push(DIGITS[(byte >> 4) as usize] as char);
+        value.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    value
+}
+
+fn temporary_path(destination: &Path) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let name = destination
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("download");
+    destination.with_file_name(format!(".boxy-{}-{nonce}-{name}.part", std::process::id()))
+}
+
+fn create_new_file(path: &Path) -> Result<File, String> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .map_err(|error| format!("cannot create {}: {error}", path.display()))
+}
+
+fn has_magic(path: &Path, expected: &[u8]) -> bool {
+    let mut signature = vec![0u8; expected.len()];
+    File::open(path)
+        .and_then(|mut file| file.read_exact(&mut signature))
+        .map(|_| signature == expected)
+        .unwrap_or(false)
+}
+
+fn safe_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+fn installed_database(path: &Path) -> bool {
+    if !safe_directory(path) {
+        return false;
+    }
+    // Accept both a flat databases/<id> layout and the version subdirectory layout SV2 uses.
+    if version_installed(path) {
+        return true;
+    }
+    fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|version| safe_directory(version))
+        .any(|version| version_installed(&version))
+}
+
+fn version_installed(directory: &Path) -> bool {
+    fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|file| {
+            file.extension()
+                .and_then(OsStr::to_str)
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("dnni"))
+                && fs::symlink_metadata(file)
+                    .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+                    .unwrap_or(false)
+                && has_magic(file, &DNNI_MAGIC)
+        })
+        .take(2)
+        .count()
+        == 2
+}
+
+fn validated_id(value: &str) -> Result<&str, String> {
+    let value = value.trim();
+    valid_database_id(value)
+        .then_some(value)
+        .ok_or_else(|| "product database ID is invalid".to_string())
+}
+
+fn valid_database_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+#[cfg(test)]
+#[path = "../../test/product_database.rs"]
+mod tests;
