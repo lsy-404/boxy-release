@@ -1,0 +1,12 @@
+# 验证记录
+
+- 两个实现分支均基于 b772625，业务代码自动合并，仅任务索引需保留两条记录。
+- 区域请求改动来自官方中国账户站公开脚本确认的固定 API 主机；Worker 对应展示元数据已部署。
+- 移除内嵌浏览器后通过现有系统浏览器入口打开授权 URL，不引入新本地服务或托盘框架。
+- 真实大陆机器不在当前主机控制范围，不能把单元回归或本地国际区样本声称为其许可证查询已成功。
+- 独立静态审查未发现区域路由、刷新重选、未知 issuer 拒绝、本地 logos 或 CAS 轮询回归。启动 smoke 仅可直接证明本地编辑器 URL 被访问且 EXE 旁未创建 profile；其输出已收窄，不声称独立识别了 HTTP 请求进程。去除 WebView2 的证据另由代码与完整 Cargo 依赖树确认。
+- 合并后 Rust 测试 29 unit + 6 host-block + 6 launch 共 41 项通过，Node 打包测试通过，fmt/diff 检查通过；最终 Windows release 为 2.0.6，3,365,376 bytes。
+- 本机实际 smoke 使用假 session、本地回环服务及仅对测试子进程指定的无效 WebView2 runtime 路径，编辑器请求到达且旁置 profile 不存在。
+- 随后通过现有浏览器工具只读核对系统 Edge 新测试标签页，页面正文为 Boxy smoke editor；核对后关闭该测试标签，不操作原有用户页。
+- GitHub Actions 38991665280 全部成功：Windows 回归、release 构建、打包和启动 smoke，macOS 回归及双架构构建、lipo 校验和打包均通过。两个资产齐全后已将 v2.0.6 公开并设为最新版本。
+- 公开 Windows 资产为 3,369,472 bytes，SHA256 775a5968201e003a079bd83a2eee9efe606235744e37540b0f706bb7d6098b5d；macOS universal ZIP 为 3,410,230 bytes，SHA256 f48a896889ae0285d661794093ada7b515c91413cd85d22c098d441418517670。CI 与本地构建环境不同，不以两者二进制逐字节相同作为结论。

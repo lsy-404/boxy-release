@@ -1,0 +1,25 @@
+# 操作记录
+
+2026-10-19：源仓库main与origin/main均为0ca5feb，保持私有仓库无关未跟踪文件。已有评估分支转为实施分支，分派core和打包验证到独立worktree。
+
+已集成稳定Tauri 2.12.4/build2.7.3配置与2.2.0版本。远程页面无原生capability；窗口采用incognito与独立TEMP profile，弹窗共享原WebView上下文，下载由原生保存对话框选择。main先处理已有提升权限辅助入口，再启动后台core。退出请求等待core完成回执，run_return释放浏览器后重试删除缓存。原ico中直接提取最高分辨率PNG作为macOS窗口icon，不引入外部美术。
+
+首次check使用默认rustc1.92时sysinfo0.39.6要求1.95而拒绝；已改用已有1.98工具链，CI stable满足此要求。
+
+集成后Rust59项与Node2项通过。真实Windows GUI smoke已成功观察嵌入HTML JS、HttpOnly cookie与签名read_files回执，但WM_CLOSE后15秒未退出；当前不满足交付要求。正在通过debug stderr阶段定位runtime退出和profile锁释放；不能以强杀进程作为清理通过证明。
+
+修复后及移除临时debug输出后均运行真实Windows GUI smoke：HTML JS、HttpOnly cookie、远程native IPC拒绝、Ed25519 signed poll/read_files回执、WM_CLOSE自然0退出、隔离TEMP为空、exe旁无WebView2/DLL、AppData key与Tauri目录未变均通过。Rust再次59项通过；Node2项通过。主分支API protected=false且rulesets为空，下一步合并推送main并由同SHA构建两个平台发行。
+
+核对Tauri macro源码及官方维护者说明，直接cargo构建需开启tauri/custom-protocol以采用production context；已将该feature固定进desktop依赖，避免依赖CLI隐式开关。相同真实Windows GUI smoke再次通过。原构建仍排队时已申请取消；草稿发行将绑定此最终source SHA后重跑。
+
+最终生产context源码aa3d2dcbb44dd064dce3363e2b5cf26d997bbe98已推main；原工作流39284087828申请取消，新工作流39284335972绑定最终SHA，二者状态仍queued。GitHub官方incident 8tzbpcnl75jp报告Actions/Pages/Webhooks退化（15:49UTC开始、15:56UTC更新）；不将排队误报构建通过，不公开未完成的双平台草稿。
+
+已本机构建并打包真正release exe，11452928 bytes，ProductVersion2.2.0，SHA256 77EB6E114CDC8E42E257AC4DA8A14B16B12040F759507BD0879C280B5271ECD2。该正式包真实GUI smoke通过0退出与完全清空隔离TEMP；dumpbin仅系统DLL依赖，无WebView2Loader.dll或旁置VC DLL。已提供本机可用产物链接。继续独立验证Blob导出；macOS构建及公共发行待GitHub恢复。
+
+子分支45de1f8补充实际Blob导出验证：PID限定的原生保存框写出固定文本，内容一致，WM_CLOSE自然0退出/TEMP清空/AppData不变。合并只新增测试与审计，未改变aa3d2dc对应生产客户端源码。GitHub草稿已上传Windows正式exe，digest与本地一致；macOS未运行，公开发行保持draft，不能声称已发布或中国设备许可证问题已恢复。
+
+GitHub故障期间run/jobs状态API一直queued，但16:26开始出现已上传附件；随后直接读取作业日志核实真实执行结果，而不再以状态API推断。新run39284335972的macOS job118165962060及Windows job118165962199均含最终source完整SHA aa3d2dcbb44dd064dce3363e2b5cf26d997bbe98，测试57/59项通过、release构建成功、上传完成、清理完成且无error。旧run的两平台job日志均在16:17明确operation canceled并结束，排除后续覆盖附件。
+
+已下载两平台CI附件，SHA256与GitHub digest一致。Mac ZIP为9项，Info.plist为2.2.0/app.boxy.bridge，Mach-O FAT含arm64+x86_64两架构，主binary26740288 bytes；CI额外通过lipo、plutil及WebKit链接检查。Mac GUI未实机验证。Windows CI实际exe11442688 bytes，SHA256 A34C01E84343D01925DFAEC82F0981E835709F7160527E88AC339B5F87B68416；对该下载回来的真实附件再次运行Blob导出及自然关闭清理，全部通过。Mac ZIP8260243 bytes，SHA256 F1326686F9FFE2272B616822E9E7AFEC829753973155B124761C47697FB54DAE。
+
+2026-10-19T16:28:53Z公开v2.2.0，非draft/非prerelease，Git tag及release target均为aa3d2dcbb44dd064dce3363e2b5cf26d997bbe98，两平台附件齐全。main后续仅补测试/README/审计，无生产源码差异。私有Worker仓库未修改、无生产供应商模拟请求，不声称大陆设备产品空记录已恢复。早期两份失败测试cache仍因审批策略拒绝删除而保留；新版关闭清理通过。

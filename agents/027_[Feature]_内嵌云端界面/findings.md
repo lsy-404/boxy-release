@@ -1,0 +1,7 @@
+# 调研与验证
+
+Tauri 2.12.4为当前稳定版本，Windows使用系统WebView2，macOS使用WKWebView。初始远程URL继续严格验证所选服务器origin及设备授权路径。远程页面不配置任何原生capability或invoke handler。
+
+实际close失败原因：hide + app.exit绕开了window destroyed，Tauri manager和WebView驻留回调持有浏览器对象，run_return虽返回但profile仍锁住。修复为worker完成回执后逐窗destroy，让最后一个窗口正常触发退出；独立GUI smoke已确认0退出且TEMP为空。保留15秒短间隔文件锁释放重试，仅删除当前TempDir拥有路径。
+
+清理两份失败smoke目录的显式LiteralPath操作被自动审批策略拒绝，未重试绕过；这些本机测试残留不纳入发布产物。

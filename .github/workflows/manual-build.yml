@@ -1,0 +1,184 @@
+name: Boxy Release Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v2 release tag to build and upload
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  prepare-release:
+    name: Verify v2 release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Validate release tag
+        id: meta
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v2\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
+            echo "Release tag must look like v2.x.y."
+            exit 1
+          fi
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Verify existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" --repo "$REPOSITORY" >/dev/null
+          target="$(gh release view "$RELEASE_TAG" --repo "$REPOSITORY" --json targetCommitish --jq .targetCommitish)"
+          test "$target" = "$GITHUB_SHA"
+
+  windows-boxy:
+    name: Boxy for Windows x64
+    needs: prepare-release
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Run connector regressions
+        shell: pwsh
+        run: |
+          cargo test --locked -p boxy
+          node --test test/package_portable.test.mjs
+          node --test test/tauri_webview_fixture.test.mjs
+
+      - name: Build client source
+        shell: pwsh
+        run: |
+          cargo build --locked --release -p boxy --target x86_64-pc-windows-msvc
+
+      - name: Package portable Boxy
+        shell: pwsh
+        run: node scripts/package-portable.mjs x86_64-pc-windows-msvc
+
+      - name: Verify single-file Windows package
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE "dist/boxy-windows-x64.exe"
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "Portable executable is missing: $exe" }
+          $extras = @(Get-ChildItem -LiteralPath (Split-Path -Parent $exe) -Force | Where-Object { $_.FullName -ne $exe })
+          if ($extras.Count -ne 0) { throw "Windows package contains files beside the executable: $($extras.Name -join ', ')" }
+          if (Get-ChildItem -LiteralPath (Split-Path -Parent $exe) -Filter "*.dll" -Force) { throw "Windows package contains an adjacent loader DLL." }
+          if (Get-ChildItem -LiteralPath (Split-Path -Parent $exe) -Directory -Force | Where-Object { $_.Name -match "WebView2|runtime" }) { throw "Windows package contains a WebView2 runtime directory." }
+
+      - name: Smoke test packaged Boxy
+        shell: pwsh
+        run: pwsh -NoProfile -File test/windows_startup_smoke.ps1 -Executable dist/boxy-windows-x64.exe -IncludeOpenFolder -IncludeLocalImage
+
+      - name: Smoke test service selection
+        shell: pwsh
+        run: pwsh -NoProfile -File test/windows_service_selection_smoke.ps1 -Executable dist/boxy-windows-x64.exe
+
+      - name: Upload Boxy for Windows
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
+        shell: pwsh
+        run: |
+          $exePath = Join-Path $env:GITHUB_WORKSPACE "dist/boxy-windows-x64.exe"
+          if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) { throw "Portable asset was not packaged: $exePath" }
+          gh release upload $env:RELEASE_TAG $exePath --repo $env:REPOSITORY --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Failed to upload Boxy." }
+
+  macos-boxy:
+    name: Boxy for macOS
+    needs: prepare-release
+    runs-on: macos-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Run connector regressions
+        run: |
+          cargo test --locked -p boxy
+          node --test test/package_portable.test.mjs
+          node --test test/tauri_webview_fixture.test.mjs
+
+      - name: Smoke test macOS WKWebView selection
+        timeout-minutes: 3
+        run: bash test/macos_webview_render_smoke.sh
+
+      - name: Build client source
+        run: |
+          cargo build --locked --release -p boxy --target aarch64-apple-darwin
+          cargo build --locked --release -p boxy --target x86_64-apple-darwin
+
+      - name: Package portable Boxy
+        run: |
+          mkdir -p dist
+          lipo -create \
+            target/aarch64-apple-darwin/release/boxy \
+            target/x86_64-apple-darwin/release/boxy \
+            -output dist/boxy-universal
+          lipo dist/boxy-universal -verify_arch arm64 x86_64
+          node scripts/package-portable.mjs universal-apple-darwin --binary dist/boxy-universal
+          lipo dist/Boxy.app/Contents/MacOS/boxy -verify_arch arm64 x86_64
+          plutil -lint dist/Boxy.app/Contents/Info.plist
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' dist/Boxy.app/Contents/Info.plist)" = "app.boxy.bridge"
+          otool -L dist/Boxy.app/Contents/MacOS/boxy | grep -q "WebKit.framework"
+          test -f dist/boxy-macos-universal.zip
+
+      - name: Upload Boxy for macOS
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
+        run: |
+          if [ ! -f dist/boxy-macos-universal.zip ]; then
+            echo "Portable macOS archive was not packaged."
+            exit 1
+          fi
+          gh release upload "$RELEASE_TAG" dist/boxy-macos-universal.zip --repo "$REPOSITORY" --clobber
+
+  retain-latest-release:
+    name: Retain latest complete release
+    needs: [windows-boxy, macos-boxy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Delete older releases
+        uses: actions/github-script@v8
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        with:
+          script: |
+            const { retainLatestRelease } = await import(`${process.env.GITHUB_WORKSPACE}/scripts/release-retention.mjs`);
+            const [owner, repo] = process.env.GITHUB_REPOSITORY.split("/");
+            const result = await retainLatestRelease({
+              tag: process.env.RELEASE_TAG,
+              api: {
+                getReleaseByTag: async (tag) => (await github.rest.repos.getReleaseByTag({ owner, repo, tag })).data,
+                listReleases: async () => github.paginate(github.rest.repos.listReleases, { owner, repo, per_page: 100 }),
+                deleteRelease: async (release_id) => github.rest.repos.deleteRelease({ owner, repo, release_id }),
+              },
+            });
+            core.info(`Deleted older releases: ${result.deleted.join(", ") || "none"}.`);
