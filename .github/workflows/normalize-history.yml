@@ -1,0 +1,28 @@
+name: Normalize main history
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: normalize-main-history
+  cancel-in-progress: false
+
+jobs:
+  normalize:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Verify history normalization
+        run: node --test test/normalize_history.test.mjs
+
+      - name: Normalize main commit
+        run: node scripts/normalize-history.mjs
