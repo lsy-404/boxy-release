@@ -1,0 +1,47 @@
+name: Actions history retention
+
+on:
+  workflow_run:
+    workflows:
+      - Boxy Release Build
+      - Boxy verification
+      - Normalize main history
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: actions-history-retention
+  queue: max
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Retain the latest workflow runs
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { retainLatestWorkflowRuns } = await import(`${process.env.GITHUB_WORKSPACE}/scripts/actions-retention.mjs`);
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const api = {
+              listWorkflows: async () => github.paginate(github.rest.actions.listRepoWorkflows, { owner, repo, per_page: 100 }),
+              listWorkflowRuns: async (workflow_id) => github.paginate(github.rest.actions.listWorkflowRuns, { owner, repo, workflow_id, per_page: 100 }),
+              deleteWorkflowRun: async (run_id) => github.rest.actions.deleteWorkflowRun({ owner, repo, run_id }),
+            };
+            const result = await retainLatestWorkflowRuns({
+              api,
+              producerWorkflowNames: ["Boxy Release Build", "Boxy verification", "Normalize main history"],
+              cleanupWorkflowName: "Actions history retention",
+              cleanupRunId: context.runId,
+            });
+            core.info(JSON.stringify(result));
