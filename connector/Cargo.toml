@@ -1,0 +1,58 @@
+[package]
+name = "boxy"
+version = "2.3.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[features]
+default = ["desktop"]
+desktop = ["dep:tauri", "dep:tauri-build"]
+
+[dependencies]
+base64 = "0.22"
+dirs = "6"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+notify = "8"
+percent-encoding = "2"
+rand_core = { version = "0.6", features = ["getrandom"] }
+rfd = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sysinfo = "0.39"
+tauri = { version = "=2.12.4", features = ["custom-protocol"], optional = true }
+tempfile = "3.27"
+time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
+ureq = { version = "2", features = ["json"] }
+url = "2"
+zeroize = "1.9"
+
+[build-dependencies]
+tauri-build = { version = "=2.7.3", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "boxy"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[[example]]
+name = "desktop_render_smoke"
+path = "../test/desktop_render_smoke.rs"
+required-features = ["desktop"]
+
+[[test]]
+name = "launch_options"
+path = "../test/launch_options.rs"
