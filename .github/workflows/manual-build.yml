@@ -40,13 +40,13 @@ jobs:
       - name: Create or reuse release
         env:
           GH_TOKEN: ${{ github.token }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
+          REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ steps.meta.outputs.tag }}
           PRERELEASE: ${{ inputs.prerelease }}
         shell: bash
         run: |
           set -euo pipefail
-          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          if gh release view "$RELEASE_TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
             echo "Using existing release $RELEASE_TAG"
             exit 0
           fi
@@ -56,7 +56,7 @@ jobs:
           else
             args+=(--latest)
           fi
-          gh release create "${args[@]}" --repo "$GITHUB_REPOSITORY"
+          gh release create "${args[@]}" --repo "$REPOSITORY"
 
   windows:
     name: Windows x64
@@ -79,7 +79,7 @@ jobs:
       - name: Upload Windows release assets
         env:
           GH_TOKEN: ${{ github.token }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
+          REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
         shell: pwsh
         run: |
@@ -92,7 +92,7 @@ jobs:
 
           $installerPath = Join-Path $env:RUNNER_TEMP "sv2-session-editor-windows-x64-setup.exe"
           Copy-Item -LiteralPath $installers[0].FullName -Destination $installerPath
-          gh release upload $env:RELEASE_TAG $installerPath $portablePath --repo $env:GITHUB_REPOSITORY --clobber
+          gh release upload $env:RELEASE_TAG $installerPath $portablePath --repo $env:REPOSITORY --clobber
           if ($LASTEXITCODE -ne 0) { throw "Failed to upload Windows release assets." }
 
   macos:
@@ -116,7 +116,7 @@ jobs:
       - name: Upload macOS release assets
         env:
           GH_TOKEN: ${{ github.token }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
+          REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
         shell: bash
         run: |
@@ -128,4 +128,4 @@ jobs:
 
           portable_path="$RUNNER_TEMP/sv2-session-editor-macos-universal-portable.zip"
           ditto -c -k --sequesterRsrc --keepParent "$app_path" "$portable_path"
-          gh release upload "$RELEASE_TAG" "$dmg_path" "$portable_path" --repo "$GITHUB_REPOSITORY" --clobber
+          gh release upload "$RELEASE_TAG" "$dmg_path" "$portable_path" --repo "$REPOSITORY" --clobber
