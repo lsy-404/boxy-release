@@ -89,3 +89,35 @@ jobs:
           Copy-Item -LiteralPath $binaryPath -Destination $portablePath
           gh release upload $env:RELEASE_TAG $portablePath --repo $env:REPOSITORY --clobber
           if ($LASTEXITCODE -ne 0) { throw "Failed to upload Windows release assets." }
+
+  macos:
+    name: macOS Universal portable app
+    needs: prepare-release
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install Rust targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Build universal app
+        working-directory: src-tauri
+        run: npm exec --yes --package=@tauri-apps/cli@2.9.6 -- tauri build --target universal-apple-darwin --bundles app
+
+      - name: Upload macOS portable asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_path="$(find target/universal-apple-darwin/release/bundle/macos -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -n "$app_path"
+          portable_path="$RUNNER_TEMP/sv2-session-editor-macos-universal-portable.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$app_path" "$portable_path"
+          gh release upload "$RELEASE_TAG" "$portable_path" --repo "$REPOSITORY" --clobber
