@@ -6,7 +6,7 @@ on:
       tag:
         description: Release tag to create or update
         required: true
-        default: v0.1.0-debug
+        default: v0.1.1-debug
         type: string
       prerelease:
         description: Mark a newly created release as a pre-release
@@ -50,7 +50,7 @@ jobs:
             echo "Using existing release $RELEASE_TAG"
             exit 0
           fi
-          args=("$RELEASE_TAG" --target "$GITHUB_SHA" --title "SV2 Session Editor $RELEASE_TAG" --notes "Private debug build for SV2 Session Editor.")
+          args=("$RELEASE_TAG" --target "$GITHUB_SHA" --title "SV2 Smooth $RELEASE_TAG" --notes "Private debug build for SV2 Smooth.")
           if [[ "$PRERELEASE" == "true" ]]; then
             args+=(--prerelease --latest=false)
           else
@@ -83,8 +83,8 @@ jobs:
           RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
         shell: pwsh
         run: |
-          $portablePath = Join-Path $env:RUNNER_TEMP "sv2-session-editor-windows-x64-portable.exe"
-          $binaryPath = Join-Path $env:GITHUB_WORKSPACE "target/x86_64-pc-windows-msvc/release/sv2-session-editor.exe"
+          $portablePath = Join-Path $env:RUNNER_TEMP "sv2-smooth-windows-x64-portable.exe"
+          $binaryPath = Join-Path $env:GITHUB_WORKSPACE "target/x86_64-pc-windows-msvc/release/sv2-smooth.exe"
           if (-not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) { throw "Portable executable was not built." }
           Copy-Item -LiteralPath $binaryPath -Destination $portablePath
           gh release upload $env:RELEASE_TAG $portablePath --repo $env:REPOSITORY --clobber
@@ -118,6 +118,6 @@ jobs:
           set -euo pipefail
           app_path="$(find target/universal-apple-darwin/release/bundle/macos -maxdepth 1 -type d -name '*.app' -print -quit)"
           test -n "$app_path"
-          portable_path="$RUNNER_TEMP/sv2-session-editor-macos-universal-portable.zip"
+          portable_path="$RUNNER_TEMP/sv2-smooth-macos-universal-portable.zip"
           ditto -c -k --sequesterRsrc --keepParent "$app_path" "$portable_path"
           gh release upload "$RELEASE_TAG" "$portable_path" --repo "$REPOSITORY" --clobber
