@@ -1,5 +1,6 @@
 /target/
 node_modules/
+/ui/vendor/
 *.log
 /src-tauri/gen/
 /src-tauri/icons/[0-9]*.png
