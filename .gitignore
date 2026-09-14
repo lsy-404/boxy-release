@@ -2,3 +2,8 @@
 node_modules/
 *.log
 /src-tauri/gen/
+/src-tauri/icons/[0-9]*.png
+/src-tauri/icons/Square*Logo.png
+/src-tauri/icons/StoreLogo.png
+/src-tauri/icons/android/
+/src-tauri/icons/ios/

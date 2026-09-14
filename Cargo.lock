@@ -3011,26 +3011,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
-name = "sv2-smooth"
-version = "0.1.1"
-dependencies = [
- "base64 0.22.1",
- "blowfish",
- "chrono",
- "hex",
- "serde",
- "serde_json",
- "sha2",
- "tauri",
- "tauri-build",
- "ureq",
- "url",
- "windows-sys 0.61.2",
- "winreg",
- "zeroize",
-]
-
-[[package]]
 name = "swift-rs"
 version = "1.0.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3091,6 +3071,26 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "synthesizer-v-studio-2-boxy"
+version = "1.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "blowfish",
+ "chrono",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tauri",
+ "tauri-build",
+ "ureq",
+ "url",
+ "windows-sys 0.61.2",
+ "winreg",
+ "zeroize",
 ]
 
 [[package]]
