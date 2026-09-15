@@ -8,3 +8,5 @@ node_modules/
 /src-tauri/icons/StoreLogo.png
 /src-tauri/icons/android/
 /src-tauri/icons/ios/
+!/test/
+!/agents/
