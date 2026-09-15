@@ -6,7 +6,7 @@ on:
       tag:
         description: Release tag to create or update
         required: true
-        default: v1.0.4
+        default: v1.0.5
         type: string
       prerelease:
         description: Mark a newly created release as a pre-release

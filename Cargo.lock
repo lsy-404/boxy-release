@@ -3080,7 +3080,6 @@ dependencies = [
  "base64 0.22.1",
  "blowfish",
  "chrono",
- "dirs",
  "hex",
  "serde",
  "serde_json",
