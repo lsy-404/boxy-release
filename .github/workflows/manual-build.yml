@@ -1,25 +1,18 @@
-name: Manual Portable Release Build
+name: Release Build
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to create or update
+        description: Existing release tag to build and upload
         required: true
-        default: v1.1.1
         type: string
-      prerelease:
-        description: Mark a newly created release as a pre-release
-        required: true
-        default: false
-        type: boolean
-
 permissions:
   contents: write
 
 jobs:
   prepare-release:
-    name: Prepare Release
+    name: Verify Release
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
@@ -37,26 +30,17 @@ jobs:
           fi
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Create or reuse release
+      - name: Verify existing release
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ steps.meta.outputs.tag }}
-          PRERELEASE: ${{ inputs.prerelease }}
         shell: bash
         run: |
           set -euo pipefail
-          if gh release view "$RELEASE_TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
-            echo "Using existing release $RELEASE_TAG"
-            exit 0
-          fi
-          args=("$RELEASE_TAG" --target "$GITHUB_SHA" --title "Synthesizer V Studio 2 Boxy $RELEASE_TAG" --notes "Portable release for Synthesizer V Studio 2 Boxy.")
-          if [[ "$PRERELEASE" == "true" ]]; then
-            args+=(--prerelease --latest=false)
-          else
-            args+=(--latest)
-          fi
-          gh release create "${args[@]}" --repo "$REPOSITORY"
+          gh release view "$RELEASE_TAG" --repo "$REPOSITORY" >/dev/null
+          target="$(gh release view "$RELEASE_TAG" --repo "$REPOSITORY" --json targetCommitish --jq .targetCommitish)"
+          test "$target" = "$GITHUB_SHA"
 
   windows:
     name: Windows x64
@@ -81,6 +65,9 @@ jobs:
       - name: Prepare Fluent UI assets
         run: |
           npm ci
+          npm run check:ui
+          node --test test/ui_download_contract.test.mjs
+          cargo test --locked --workspace
           npm run prepare-ui
 
       - name: Build portable executable
@@ -124,6 +111,9 @@ jobs:
       - name: Prepare Fluent UI assets
         run: |
           npm ci
+          npm run check:ui
+          node --test test/ui_download_contract.test.mjs
+          cargo test --locked --workspace
           npm run prepare-ui
 
       - name: Build universal app

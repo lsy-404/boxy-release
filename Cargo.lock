@@ -3075,7 +3075,7 @@ dependencies = [
 
 [[package]]
 name = "synthesizer-v-studio-2-boxy"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "base64 0.22.1",
  "blowfish",
