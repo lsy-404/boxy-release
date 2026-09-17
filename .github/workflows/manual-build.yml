@@ -1,18 +1,19 @@
-name: Release Build
+name: Boxy Release Build
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag to build and upload
+        description: Existing v2 release tag to build and upload
         required: true
         type: string
+
 permissions:
   contents: write
 
 jobs:
   prepare-release:
-    name: Verify Release
+    name: Verify v2 release
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
@@ -24,8 +25,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
-            echo "Release tag must look like v0.1.0 or v0.1.0-debug."
+          if [[ ! "$RELEASE_TAG" =~ ^v2\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
+            echo "Release tag must look like v2.0.0."
             exit 1
           fi
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
@@ -42,57 +43,44 @@ jobs:
           target="$(gh release view "$RELEASE_TAG" --repo "$REPOSITORY" --json targetCommitish --jq .targetCommitish)"
           test "$target" = "$GITHUB_SHA"
 
-  windows:
-    name: Windows x64
+  windows-boxy:
+    name: Boxy for Windows x64
     needs: prepare-release
     runs-on: windows-latest
-    timeout-minutes: 45
     steps:
       - name: Check out source
         uses: actions/checkout@v6
 
-      - name: Set up Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: 24
-          cache: npm
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-msvc
+          targets: x86_64-pc-windows-msvc,wasm32-unknown-unknown
 
-      - name: Prepare Fluent UI assets
+      - name: Verify v2 source
+        shell: pwsh
         run: |
-          npm ci
-          npm run check:ui
-          node --test test/ui_download_contract.test.mjs
-          cargo test --locked --workspace
-          npm run prepare-ui
+          cargo test --locked -p sv2-session-codec
+          cargo test --locked -p boxy
+          cargo build --locked --release -p boxy --target x86_64-pc-windows-msvc
 
-      - name: Build portable executable
-        working-directory: src-tauri
-        run: npm exec --yes --package=@tauri-apps/cli@2.9.6 -- tauri build --target x86_64-pc-windows-msvc --no-bundle
-
-      - name: Upload Windows release assets
+      - name: Upload Boxy for Windows
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
         shell: pwsh
         run: |
-          $portablePath = Join-Path $env:RUNNER_TEMP "synthesizer-v-studio-2-boxy-windows-x64-portable.exe"
-          $binaryPath = Join-Path $env:GITHUB_WORKSPACE "target/x86_64-pc-windows-msvc/release/synthesizer-v-studio-2-boxy.exe"
-          if (-not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) { throw "Portable executable was not built." }
-          Copy-Item -LiteralPath $binaryPath -Destination $portablePath
-          gh release upload $env:RELEASE_TAG $portablePath --repo $env:REPOSITORY --clobber
-          if ($LASTEXITCODE -ne 0) { throw "Failed to upload Windows release assets." }
+          $assetPath = Join-Path $env:RUNNER_TEMP "boxy-windows-x64.exe"
+          $binaryPath = Join-Path $env:GITHUB_WORKSPACE "target/x86_64-pc-windows-msvc/release/boxy.exe"
+          if (-not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) { throw "Boxy executable was not built." }
+          Copy-Item -LiteralPath $binaryPath -Destination $assetPath
+          gh release upload $env:RELEASE_TAG $assetPath --repo $env:REPOSITORY --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Failed to upload Boxy." }
 
-  macos:
-    name: macOS Universal portable app
+  cloud-verification:
+    name: Cloud service verification
     needs: prepare-release
-    runs-on: macos-14
-    timeout-minutes: 45
+    runs-on: ubuntu-latest
     steps:
       - name: Check out source
         uses: actions/checkout@v6
@@ -102,34 +90,16 @@ jobs:
         with:
           node-version: 24
           cache: npm
+          cache-dependency-path: cloud/package-lock.json
 
-      - name: Install Rust targets
+      - name: Install Rust with Wasm target
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: wasm32-unknown-unknown
 
-      - name: Prepare Fluent UI assets
+      - name: Validate Cloudflare Worker
+        working-directory: cloud
         run: |
           npm ci
-          npm run check:ui
-          node --test test/ui_download_contract.test.mjs
-          cargo test --locked --workspace
-          npm run prepare-ui
-
-      - name: Build universal app
-        working-directory: src-tauri
-        run: npm exec --yes --package=@tauri-apps/cli@2.9.6 -- tauri build --target universal-apple-darwin --bundles app
-
-      - name: Upload macOS portable asset
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          app_path="$(find target/universal-apple-darwin/release/bundle/macos -maxdepth 1 -type d -name '*.app' -print -quit)"
-          test -n "$app_path"
-          portable_path="$RUNNER_TEMP/synthesizer-v-studio-2-boxy-macos-universal-portable.zip"
-          ditto -c -k --sequesterRsrc --keepParent "$app_path" "$portable_path"
-          gh release upload "$RELEASE_TAG" "$portable_path" --repo "$REPOSITORY" --clobber
+          npm run build
+          npm run test
