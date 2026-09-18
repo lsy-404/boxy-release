@@ -1,4 +1,3 @@
 [workspace]
-members = ["v2/session-codec", "v2/connector"]
-exclude = ["src-tauri"]
+members = ["cloud/codec", "connector"]
 resolver = "2"
