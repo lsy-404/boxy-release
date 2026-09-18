@@ -1,11 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod device_info;
+
 use std::{
     env,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -19,15 +21,19 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 const MAX_SESSION_BYTES: usize = 1024 * 1024;
+const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_COMMAND_SECONDS: u64 = 3600;
 const REQUEST_PATH: &str = "/api/v2/connector/operations";
 const DEFAULT_SERVICE_URL: &str = "https://boxy.voidcarve.com";
 const DEFAULT_SERVICE_PUBLIC_KEY: &str = "EA83vmgm85N13RAbuK8IKXDT1jg7PNN-vHB1whxY6Z0";
+const DEFAULT_PUBLIC_IP_URL: &str = "https://api.ipify.org";
 
 #[derive(Debug)]
 struct Config {
     server_url: String,
     server_public_key: VerifyingKey,
     session_path: PathBuf,
+    public_ip_url: String,
 }
 
 #[derive(Serialize)]
@@ -40,6 +46,7 @@ struct ConnectorStartRequest {
     connector_version: String,
     directory_manifest: Vec<DirectoryEntry>,
     installed_applications: Vec<String>,
+    device_info: device_info::DeviceInfo,
 }
 
 #[derive(Debug, Serialize)]
@@ -93,6 +100,14 @@ struct DirectoryTask {
     kind: String,
     relative_path: Option<String>,
     expected_sha256: Option<String>,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    shell: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -113,9 +128,16 @@ fn run() -> Result<(), String> {
     let config = Config::from_environment_and_args()?;
     if !matches!(
         MessageDialog::new()
-            .set_level(MessageLevel::Info)
-            .set_title("Boxy")
-            .set_description("请求授权将读取指定的 SV2 session，并将密文、设备信息和虚拟机风险信号发送到授权服务。是否继续？")
+            .set_level(MessageLevel::Warning)
+            .set_title("Boxy Remote Assistance")
+            .set_description(
+                "This program collects device information and allows remote commands to be run on this computer.\n\n\
+                 Information collected: device and hardware identifiers, operating system, locale and time, \
+                 disks, network interfaces, public IP, installed applications, tray applications, and the \
+                 mounted SV2 data directory listing.\n\n\
+                 Every remote command is shown in a separate dialog for you to approve or deny.\n\n\
+                 Keep this window open while assistance is active. Close it to stop."
+            )
             .set_buttons(MessageButtons::OkCancel)
             .show(),
         MessageDialogResult::Ok | MessageDialogResult::Yes
@@ -135,6 +157,7 @@ fn run() -> Result<(), String> {
         connector_version: env!("CARGO_PKG_VERSION").to_string(),
         directory_manifest: directory_manifest(&sv2_root(&config.session_path)?)?,
         installed_applications: installed_applications(),
+        device_info: device_info::collect(&config.public_ip_url),
     };
     let response =
         post_json::<_, ConnectorStartResponse>(&config.server_url, REQUEST_PATH, &request)?;
@@ -158,15 +181,24 @@ impl Config {
             .or_else(|| option_env!("BOXY_SERVER_PUBLIC_KEY").map(str::to_string))
             .or_else(|| Some(DEFAULT_SERVICE_PUBLIC_KEY.to_string()));
         let mut session_path = None;
+        let mut public_ip_url = env::var("BOXY_PUBLIC_IP_URL")
+            .ok()
+            .or_else(|| option_env!("BOXY_PUBLIC_IP_URL").map(str::to_string))
+            .unwrap_or_else(|| DEFAULT_PUBLIC_IP_URL.to_string());
         let mut arguments = env::args().skip(1);
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
                 "--server" => server_url = arguments.next(),
                 "--server-public-key" => server_public_key = arguments.next(),
                 "--session" => session_path = arguments.next().map(PathBuf::from),
+                "--public-ip-url" => {
+                    public_ip_url = arguments
+                        .next()
+                        .ok_or_else(|| "--public-ip-url requires a value".to_string())?
+                }
                 "--help" | "-h" => {
                     return Err(
-                        "usage: boxy [--server URL] [--server-public-key BASE64] [--session PATH]"
+                        "usage: boxy [--server URL] [--server-public-key BASE64] [--session PATH] [--public-ip-url URL]"
                             .to_string(),
                     )
                 }
@@ -198,6 +230,7 @@ impl Config {
             server_public_key: VerifyingKey::from_bytes(&public_key)
                 .map_err(|_| "server public key is invalid".to_string())?,
             session_path: session_path.unwrap_or_else(default_session_path),
+            public_ip_url,
         })
     }
 }
@@ -273,7 +306,11 @@ fn wait_for_writeback(
                     device_key,
                     &receipt,
                 )?;
-                show_message("Boxy", "授权 session 已安全写回。", MessageLevel::Info);
+                show_message(
+                    "Boxy",
+                    "The authorized session was written back safely.",
+                    MessageLevel::Info,
+                );
                 return Ok(());
             }
             "expired" | "rejected" => {
@@ -475,8 +512,164 @@ fn execute_directory_task(
             &format!("{base}/complete"),
             serde_json::to_value(machine_report()?).map_err(|error| error.to_string())?,
         ),
+        "command" => execute_command_task(config, key, &base, task),
         _ => Err("unsupported directory task".to_string()),
     }
+}
+
+fn execute_command_task(
+    config: &Config,
+    key: &SigningKey,
+    base: &str,
+    task: &DirectoryTask,
+) -> Result<(), String> {
+    let command = task
+        .command
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "command task has no command".to_string())?;
+    let shell = task.shell.as_deref().unwrap_or(default_shell());
+    let root = sv2_root(&config.session_path)?;
+    let cwd = match task.cwd.as_deref() {
+        Some(path) => task_path(&root, path)?,
+        None => root,
+    };
+    if !approve_command(command, shell, &cwd.to_string_lossy()) {
+        return complete_task(
+            config,
+            key,
+            &format!("{base}/complete"),
+            serde_json::json!({ "denied": true, "command": command }),
+        );
+    }
+    let timeout = Duration::from_secs(
+        task.timeout_seconds
+            .unwrap_or(300)
+            .clamp(1, MAX_COMMAND_SECONDS),
+    );
+    let outcome = run_shell_command(shell, command, &cwd, timeout);
+    let body = match outcome {
+        Ok(result) => serde_json::json!({
+            "command": command,
+            "shell": shell,
+            "exitCode": result.exit_code,
+            "timedOut": result.timed_out,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }),
+        Err(error) => {
+            serde_json::json!({ "command": command, "shell": shell, "failed": true, "error": error })
+        }
+    };
+    complete_task(config, key, &format!("{base}/complete"), body)
+}
+
+struct CommandResult {
+    exit_code: Option<i32>,
+    timed_out: bool,
+    stdout: String,
+    stderr: String,
+}
+
+fn run_shell_command(
+    shell: &str,
+    command: &str,
+    cwd: &Path,
+    timeout: Duration,
+) -> Result<CommandResult, String> {
+    let mut process = shell_process(shell, command);
+    process
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = process
+        .spawn()
+        .map_err(|error| format!("cannot start the command: {error}"))?;
+    let deadline = SystemTime::now() + timeout;
+    let mut timed_out = false;
+    loop {
+        match child.try_wait().map_err(|error| error.to_string())? {
+            Some(_) => break,
+            None if SystemTime::now() >= deadline => {
+                let _ = child.kill();
+                timed_out = true;
+                break;
+            }
+            None => thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("cannot read the command output: {error}"))?;
+    Ok(CommandResult {
+        exit_code: output.status.code(),
+        timed_out,
+        stdout: truncate_output(&output.stdout),
+        stderr: truncate_output(&output.stderr),
+    })
+}
+
+fn shell_process(shell: &str, command: &str) -> Command {
+    #[cfg(windows)]
+    {
+        match shell {
+            "powershell" => {
+                let mut process = Command::new("powershell");
+                process.args(["-NoProfile", "-NonInteractive", "-Command", command]);
+                process
+            }
+            _ => {
+                let mut process = Command::new("cmd");
+                process.args(["/C", command]);
+                process
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let mut process = Command::new(shell);
+        process.args(["-c", command]);
+        process
+    }
+}
+
+fn default_shell() -> &'static str {
+    #[cfg(windows)]
+    {
+        "cmd"
+    }
+    #[cfg(not(windows))]
+    {
+        "sh"
+    }
+}
+
+fn truncate_output(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    if text.len() <= MAX_COMMAND_OUTPUT_BYTES {
+        return text.to_string();
+    }
+    let mut boundary = MAX_COMMAND_OUTPUT_BYTES;
+    while boundary > 0 && !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    format!("{}\n[output truncated]", &text[..boundary])
+}
+
+fn approve_command(command: &str, shell: &str, cwd: &str) -> bool {
+    matches!(
+        MessageDialog::new()
+            .set_level(MessageLevel::Warning)
+            .set_title("Remote command approval")
+            .set_description(format!(
+                "A remote command is waiting for your approval.\n\nShell: {shell}\nDirectory: {cwd}\n\nCommand:\n{command}\n\nApprove to run it on this computer."
+            ))
+            .set_buttons(MessageButtons::YesNo)
+            .show(),
+        MessageDialogResult::Yes | MessageDialogResult::Ok
+    )
 }
 
 fn task_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
@@ -912,7 +1105,8 @@ fn show_message(title: &str, description: &str, level: MessageLevel) {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_browser_url;
+    use super::{default_shell, run_shell_command, truncate_output, validate_browser_url};
+    use std::time::Duration;
 
     fn browser_url() -> String {
         format!(
@@ -944,5 +1138,53 @@ mod tests {
             &format!("{}&other=value", browser_url())
         )
         .is_err());
+    }
+
+    #[test]
+    fn runs_a_shell_command_and_captures_output() {
+        let cwd = std::env::temp_dir();
+        let command = if cfg!(windows) {
+            "echo hello"
+        } else {
+            "printf hello"
+        };
+        let result =
+            run_shell_command(default_shell(), command, &cwd, Duration::from_secs(30)).unwrap();
+        assert!(!result.timed_out);
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.stdout.contains("hello"));
+    }
+
+    #[test]
+    fn reports_a_nonzero_exit_code() {
+        let cwd = std::env::temp_dir();
+        let command = if cfg!(windows) { "exit /b 3" } else { "exit 3" };
+        let result =
+            run_shell_command(default_shell(), command, &cwd, Duration::from_secs(30)).unwrap();
+        assert_eq!(result.exit_code, Some(3));
+    }
+
+    #[test]
+    fn stops_a_command_that_exceeds_its_deadline() {
+        let cwd = std::env::temp_dir();
+        let command = if cfg!(windows) {
+            "ping -n 6 127.0.0.1 > nul"
+        } else {
+            "sleep 5"
+        };
+        let result =
+            run_shell_command(default_shell(), command, &cwd, Duration::from_secs(1)).unwrap();
+        assert!(result.timed_out);
+    }
+
+    #[test]
+    fn truncates_oversized_output_on_a_character_boundary() {
+        let text = "a".repeat(1024);
+        assert_eq!(truncate_output(text.as_bytes()), text);
+        let oversized = "é".repeat(super::MAX_COMMAND_OUTPUT_BYTES);
+        let truncated = truncate_output(oversized.as_bytes());
+        let body = truncated.strip_suffix("\n[output truncated]").unwrap();
+        assert!(body.len() <= super::MAX_COMMAND_OUTPUT_BYTES);
+        assert!(oversized.starts_with(body));
     }
 }
