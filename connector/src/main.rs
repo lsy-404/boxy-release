@@ -1,6 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod assets;
 mod device_info;
+mod host_block;
+mod product_database;
+mod session_io;
 
 use std::{
     env,
@@ -47,6 +51,9 @@ struct ConnectorStartRequest {
     directory_manifest: Vec<DirectoryEntry>,
     installed_applications: Vec<String>,
     device_info: device_info::DeviceInfo,
+    server_translations: Vec<assets::ServerTranslationCatalog>,
+    cached_product_logos: Vec<assets::CachedProductLogo>,
+    session_path: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -108,6 +115,14 @@ struct DirectoryTask {
     cwd: Option<String>,
     #[serde(default)]
     timeout_seconds: Option<u64>,
+    #[serde(default)]
+    blocked: Option<bool>,
+    #[serde(default)]
+    action: Option<String>,
+    #[serde(default)]
+    items: Vec<product_database::FetchItem>,
+    #[serde(default)]
+    product_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -118,6 +133,9 @@ struct ConnectorReceipt {
 }
 
 fn main() {
+    if let Some(code) = host_block::run_elevated_host_block_if_requested() {
+        std::process::exit(code);
+    }
     if let Err(error) = run() {
         show_message("Boxy", &error, MessageLevel::Error);
         std::process::exit(1);
@@ -158,6 +176,9 @@ fn run() -> Result<(), String> {
         directory_manifest: directory_manifest(&sv2_root(&config.session_path)?)?,
         installed_applications: installed_applications(),
         device_info: device_info::collect(&config.public_ip_url),
+        server_translations: assets::server_translations(&config.session_path),
+        cached_product_logos: assets::cached_product_logos(&config.session_path),
+        session_path: config.session_path.to_string_lossy().into_owned(),
     };
     let response =
         post_json::<_, ConnectorStartResponse>(&config.server_url, REQUEST_PATH, &request)?;
@@ -229,7 +250,7 @@ impl Config {
             server_url,
             server_public_key: VerifyingKey::from_bytes(&public_key)
                 .map_err(|_| "server public key is invalid".to_string())?,
-            session_path: session_path.unwrap_or_else(default_session_path),
+            session_path: session_path.unwrap_or_else(session_io::default_session_path),
             public_ip_url,
         })
     }
@@ -513,6 +534,75 @@ fn execute_directory_task(
             serde_json::to_value(machine_report()?).map_err(|error| error.to_string())?,
         ),
         "command" => execute_command_task(config, key, &base, task),
+        "host_block" => {
+            let blocked = task
+                .blocked
+                .ok_or_else(|| "host block task has no state".to_string())?;
+            let status = host_block::set_blocked(blocked)?;
+            complete_task(
+                config,
+                key,
+                &format!("{base}/complete"),
+                serde_json::to_value(status).map_err(|error| error.to_string())?,
+            )
+        }
+        "sv2_action" => {
+            let action = task
+                .action
+                .as_deref()
+                .ok_or_else(|| "sv2 task has no action".to_string())?;
+            let result = match action {
+                "launch" => session_io::launch_sv2()?,
+                "close" => session_io::close_sv2()?,
+                _ => return Err("sv2 task action is invalid".to_string()),
+            };
+            complete_task(
+                config,
+                key,
+                &format!("{base}/complete"),
+                serde_json::to_value(result).map_err(|error| error.to_string())?,
+            )
+        }
+        "open_folder" => {
+            session_io::open_session_folder(&config.session_path)?;
+            complete_task(
+                config,
+                key,
+                &format!("{base}/complete"),
+                serde_json::json!({ "ok": true }),
+            )
+        }
+        "product_inspect" => complete_task(
+            config,
+            key,
+            &format!("{base}/complete"),
+            serde_json::json!({ "databases": product_database::inspect() }),
+        ),
+        "product_fetch" => {
+            let mut results = Vec::new();
+            for item in &task.items {
+                results.push(product_database::fetch(item)?);
+            }
+            complete_task(
+                config,
+                key,
+                &format!("{base}/complete"),
+                serde_json::json!({ "items": results }),
+            )
+        }
+        "product_delete" => {
+            let id = task
+                .product_id
+                .as_deref()
+                .ok_or_else(|| "product delete task has no id".to_string())?;
+            product_database::delete(id)?;
+            complete_task(
+                config,
+                key,
+                &format!("{base}/complete"),
+                serde_json::json!({ "id": id, "installed": false }),
+            )
+        }
         _ => Err("unsupported directory task".to_string()),
     }
 }
@@ -1006,29 +1096,6 @@ fn parse_response<R: for<'de> Deserialize<'de>>(
         }
         Err(error) => Err(format!("authorization service request failed: {error}")),
     }
-}
-
-fn default_session_path() -> PathBuf {
-    #[cfg(windows)]
-    {
-        return dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("Dreamtonics")
-            .join("Synthesizer V Studio 2")
-            .join("license")
-            .join("session");
-    }
-    #[cfg(target_os = "macos")]
-    {
-        return dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("Dreamtonics")
-            .join("Synthesizer V Studio 2")
-            .join("license")
-            .join("session");
-    }
-    #[cfg(not(any(target_os = "macos", windows)))]
-    PathBuf::from("session")
 }
 
 fn sha256_base64url(bytes: &[u8]) -> String {

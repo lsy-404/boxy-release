@@ -63,6 +63,9 @@ jobs:
           cargo test --locked -p boxy
           cargo build --locked --release -p boxy --target x86_64-pc-windows-msvc
 
+      - name: Package portable Boxy
+        run: node scripts/package-portable.mjs x86_64-pc-windows-msvc
+
       - name: Upload Boxy for Windows
         env:
           GH_TOKEN: ${{ github.token }}
@@ -70,12 +73,48 @@ jobs:
           RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
         shell: pwsh
         run: |
-          $assetPath = Join-Path $env:RUNNER_TEMP "boxy-windows-x64.exe"
-          $binaryPath = Join-Path $env:GITHUB_WORKSPACE "target/x86_64-pc-windows-msvc/release/boxy.exe"
-          if (-not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) { throw "Boxy executable was not built." }
-          Copy-Item -LiteralPath $binaryPath -Destination $assetPath
-          gh release upload $env:RELEASE_TAG $assetPath --repo $env:REPOSITORY --clobber
+          $exePath = Join-Path $env:GITHUB_WORKSPACE "dist/boxy-windows-x64.exe"
+          $zipPath = Join-Path $env:GITHUB_WORKSPACE "dist/boxy-windows-x64.zip"
+          foreach ($assetPath in @($exePath, $zipPath)) {
+            if (-not (Test-Path -LiteralPath $assetPath -PathType Leaf)) { throw "Portable asset was not packaged: $assetPath" }
+          }
+          gh release upload $env:RELEASE_TAG $exePath $zipPath --repo $env:REPOSITORY --clobber
           if ($LASTEXITCODE -ne 0) { throw "Failed to upload Boxy." }
+
+  macos-boxy:
+    name: Boxy for macOS
+    needs: prepare-release
+    runs-on: macos-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify v2 source
+        run: |
+          cargo test --locked -p sv2-session-codec
+          cargo test --locked -p boxy
+          cargo build --locked --release -p boxy
+
+      - name: Package portable Boxy
+        run: |
+          node scripts/package-portable.mjs "$(rustc -Vv | sed -n 's/^host: //p')"
+
+      - name: Upload Boxy for macOS
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
+        run: |
+          shopt -s nullglob
+          assets=(dist/boxy-macos-*.zip)
+          if [ ${#assets[@]} -eq 0 ]; then
+            echo "Portable macOS archive was not packaged."
+            exit 1
+          fi
+          gh release upload "$RELEASE_TAG" "${assets[@]}" --repo "$REPOSITORY" --clobber
 
   cloud-verification:
     name: Cloud service verification
