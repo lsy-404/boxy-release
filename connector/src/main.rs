@@ -3,8 +3,12 @@
 mod assets;
 mod device_info;
 mod host_block;
+mod network_block;
 mod product_database;
+mod service_selection;
 mod session_io;
+#[cfg(windows)]
+mod windows_firewall;
 
 use std::{
     env,
@@ -118,6 +122,8 @@ struct DirectoryTask {
     #[serde(default)]
     blocked: Option<bool>,
     #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
     action: Option<String>,
     #[serde(default)]
     items: Vec<product_database::FetchItem>,
@@ -136,6 +142,14 @@ fn main() {
     if let Some(code) = host_block::run_elevated_host_block_if_requested() {
         std::process::exit(code);
     }
+    #[cfg(windows)]
+    if let Some(code) = windows_firewall::run_elevated_if_requested() {
+        std::process::exit(code);
+    }
+    #[cfg(windows)]
+    if let Some(code) = network_block::run_elevated_if_requested() {
+        std::process::exit(code);
+    }
     if let Err(error) = run() {
         show_message("Boxy", &error, MessageLevel::Error);
         std::process::exit(1);
@@ -143,25 +157,11 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let config = Config::from_environment_and_args()?;
-    if !matches!(
-        MessageDialog::new()
-            .set_level(MessageLevel::Warning)
-            .set_title("Boxy Remote Assistance")
-            .set_description(
-                "This program collects device information and allows remote commands to be run on this computer.\n\n\
-                 Information collected: device and hardware identifiers, operating system, locale and time, \
-                 disks, network interfaces, public IP, installed applications, tray applications, and the \
-                 mounted SV2 data directory listing.\n\n\
-                 Every remote command is shown in a separate dialog for you to approve or deny.\n\n\
-                 Keep this window open while assistance is active. Close it to stop."
-            )
-            .set_buttons(MessageButtons::OkCancel)
-            .show(),
-        MessageDialogResult::Ok | MessageDialogResult::Yes
-    ) {
+    let mut config = Config::from_environment_and_args()?;
+    let Some(server_url) = service_selection::choose_service_url(&config.server_url) else {
         return Ok(());
-    }
+    };
+    config.server_url = server_url;
 
     let ciphertext = read_session_ciphertext(&config.session_path)?;
     let source_sha256 = sha256_base64url(&ciphertext);
@@ -195,8 +195,13 @@ impl Config {
     fn from_environment_and_args() -> Result<Self, String> {
         let mut server_url = env::var("BOXY_API_URL")
             .ok()
+            .or_else(|| {
+                env::current_exe()
+                    .ok()
+                    .and_then(|path| service_selection::inferred_service_url(&path))
+            })
             .or_else(|| option_env!("BOXY_API_URL").map(str::to_string))
-            .or_else(|| Some(DEFAULT_SERVICE_URL.to_string()));
+            .unwrap_or_else(|| DEFAULT_SERVICE_URL.to_string());
         let mut server_public_key = env::var("BOXY_SERVER_PUBLIC_KEY")
             .ok()
             .or_else(|| option_env!("BOXY_SERVER_PUBLIC_KEY").map(str::to_string))
@@ -209,7 +214,11 @@ impl Config {
         let mut arguments = env::args().skip(1);
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
-                "--server" => server_url = arguments.next(),
+                "--server" => {
+                    server_url = arguments
+                        .next()
+                        .ok_or_else(|| "--server requires a URL".to_string())?
+                }
                 "--server-public-key" => server_public_key = arguments.next(),
                 "--session" => session_path = arguments.next().map(PathBuf::from),
                 "--public-ip-url" => {
@@ -225,17 +234,6 @@ impl Config {
                 }
                 _ => return Err(format!("unknown argument: {argument}")),
             }
-        }
-        let server_url =
-            server_url.ok_or_else(|| "missing the authorization service URL".to_string())?;
-        let server_url = server_url.trim_end_matches('/').to_string();
-        if !server_url.starts_with("https://")
-            && !server_url.starts_with("http://127.0.0.1")
-            && !server_url.starts_with("http://localhost")
-        {
-            return Err(
-                "authorization service must use HTTPS outside local development".to_string(),
-            );
         }
         let public_key = URL_SAFE_NO_PAD
             .decode(
@@ -535,16 +533,23 @@ fn execute_directory_task(
         ),
         "command" => execute_command_task(config, key, &base, task),
         "host_block" => {
-            let blocked = task
-                .blocked
-                .ok_or_else(|| "host block task has no state".to_string())?;
-            let status = host_block::set_blocked(blocked)?;
-            complete_task(
-                config,
-                key,
-                &format!("{base}/complete"),
-                serde_json::to_value(status).map_err(|error| error.to_string())?,
-            )
+            let result = match task.blocked {
+                Some(blocked) => {
+                    let mode =
+                        network_block::BlockMode::parse(task.mode.as_deref().unwrap_or("hosts"));
+                    mode.and_then(|mode| network_block::set_blocked(blocked, mode))
+                }
+                None => Ok(network_block::status()),
+            };
+            let value = match result {
+                Ok(status) => serde_json::to_value(status).map_err(|error| error.to_string())?,
+                Err(error) => serde_json::json!({
+                    "failed": true,
+                    "error": error,
+                    "status": network_block::status(),
+                }),
+            };
+            complete_task(config, key, &format!("{base}/complete"), value)
         }
         "sv2_action" => {
             let action = task

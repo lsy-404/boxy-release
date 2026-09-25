@@ -3,10 +3,12 @@ use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
 use std::ffi::OsStr;
+#[cfg(windows)]
+use std::ffi::OsString;
 #[cfg(target_os = "macos")]
 use std::io::Write;
 #[cfg(windows)]
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 #[cfg(target_os = "macos")]
 use std::process::Stdio;
 
@@ -50,7 +52,7 @@ pub fn set_blocked(blocked: bool) -> Result<HostBlockStatus, String> {
     #[cfg(windows)]
     {
         if !is_elevated() {
-            elevate_and_wait(blocked)?;
+            elevate_and_wait_windows(ELEVATED_ARGUMENT, blocked)?;
             return Ok(status());
         }
         return set_blocked_direct(blocked);
@@ -66,13 +68,52 @@ pub fn set_blocked(blocked: bool) -> Result<HostBlockStatus, String> {
 
 #[cfg(not(target_os = "macos"))]
 fn set_blocked_direct(blocked: bool) -> Result<HostBlockStatus, String> {
+    #[cfg(windows)]
+    let path = windows_system_directory()?.join("drivers/etc/hosts");
+    #[cfg(not(windows))]
     let path = hosts_path();
     let current = read_hosts(&path)?;
     let next = rewrite_managed_rules(&current, blocked);
     if next != current {
         write_hosts(&path, &next)?;
+        #[cfg(windows)]
+        flush_windows_dns_cache()?;
     }
     Ok(status_for(&path, &read_hosts(&path)?))
+}
+
+#[cfg(windows)]
+fn flush_windows_dns_cache() -> Result<(), String> {
+    let result = std::process::Command::new(windows_system_directory()?.join("ipconfig.exe"))
+        .arg("/flushdns")
+        .status()
+        .map_err(|error| {
+            format!("hosts file changed, but DNS cache flush could not start: {error}")
+        })?;
+    if !result.success() {
+        return Err(format!(
+            "hosts file changed, but DNS cache flush failed ({result})"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_system_directory() -> Result<PathBuf, String> {
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    let mut buffer = vec![0u16; 260];
+    let mut length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+    if length as usize >= buffer.len() {
+        buffer.resize(length as usize + 1, 0);
+        length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+    }
+    if length == 0 || length as usize >= buffer.len() {
+        return Err("cannot locate Windows system directory".to_string());
+    }
+    Ok(PathBuf::from(OsString::from_wide(
+        &buffer[..length as usize],
+    )))
 }
 
 pub fn run_elevated_host_block_if_requested() -> Option<i32> {
@@ -83,7 +124,11 @@ pub fn run_elevated_host_block_if_requested() -> Option<i32> {
         if args.next()?.to_string_lossy() != ELEVATED_ARGUMENT {
             return None;
         }
-        let blocked = args.next().is_some_and(|value| value == "enable");
+        let blocked = match args.next()?.to_string_lossy().as_ref() {
+            "enable" => true,
+            "disable" => false,
+            _ => return Some(1),
+        };
         return Some(match set_blocked_direct(blocked) {
             Ok(_) => 0,
             Err(_) => 1,
@@ -122,6 +167,17 @@ fn elevate_and_wait(blocked: bool) -> Result<(), String> {
         .wait_with_output()
         .map_err(|error| format!("cannot finish macOS authorization: {error}"))?;
     if output.status.success() {
+        let flushed = std::process::Command::new("/usr/bin/dscacheutil")
+            .arg("-flushcache")
+            .status()
+            .map_err(|error| {
+                format!("hosts file changed, but DNS cache flush could not start: {error}")
+            })?;
+        if !flushed.success() {
+            return Err(format!(
+                "hosts file changed, but DNS cache flush failed ({flushed})"
+            ));
+        }
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -132,7 +188,7 @@ fn elevate_and_wait(blocked: bool) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn is_elevated() -> bool {
+pub(crate) fn is_elevated() -> bool {
     use std::ptr::null_mut;
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::Security::{
@@ -162,7 +218,7 @@ fn is_elevated() -> bool {
 }
 
 #[cfg(windows)]
-fn elevate_and_wait(blocked: bool) -> Result<(), String> {
+pub(crate) fn elevate_and_wait_windows(argument: &str, blocked: bool) -> Result<(), String> {
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, WAIT_OBJECT_0};
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, WaitForSingleObject, INFINITE,
@@ -176,11 +232,10 @@ fn elevate_and_wait(blocked: bool) -> Result<(), String> {
     })?;
     let verb = wide(OsStr::new("runas"));
     let file = wide(executable.as_os_str());
-    let parameters = wide(OsStr::new(if blocked {
-        "--sv2-host-block enable"
-    } else {
-        "--sv2-host-block disable"
-    }));
+    let parameters = wide(OsStr::new(&format!(
+        "{argument} {}",
+        if blocked { "enable" } else { "disable" }
+    )));
     let directory = executable.parent().map(|path| wide(path.as_os_str()));
     let mut execute_info = SHELLEXECUTEINFOW::default();
     execute_info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
@@ -198,7 +253,7 @@ fn elevate_and_wait(blocked: bool) -> Result<(), String> {
             Err("administrator approval was cancelled".to_string())
         } else {
             Err(format!(
-                "cannot start elevated hosts update (Windows error {error})"
+                "cannot start elevated network update (Windows error {error})"
             ))
         };
     }
@@ -207,7 +262,7 @@ fn elevate_and_wait(blocked: bool) -> Result<(), String> {
         unsafe {
             CloseHandle(execute_info.hProcess);
         }
-        return Err("elevated hosts update did not complete".to_string());
+        return Err("elevated network update did not complete".to_string());
     }
     let mut exit_code = 1u32;
     let read_code = unsafe { GetExitCodeProcess(execute_info.hProcess, &mut exit_code) } != 0;
@@ -215,11 +270,11 @@ fn elevate_and_wait(blocked: bool) -> Result<(), String> {
         CloseHandle(execute_info.hProcess);
     }
     if !read_code {
-        return Err("cannot read elevated hosts update result".to_string());
+        return Err("cannot read elevated network update result".to_string());
     }
     if exit_code != 0 {
         return Err(format!(
-            "elevated hosts update failed (exit code {exit_code})"
+            "elevated network update failed (exit code {exit_code})"
         ));
     }
     Ok(())
@@ -381,10 +436,8 @@ fn restore_attributes(path: &Path, attributes: u32) -> Result<(), String> {
 
 #[cfg(windows)]
 fn hosts_path() -> PathBuf {
-    let root = std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-    root.join("System32")
+    windows_system_directory()
+        .unwrap_or_else(|_| PathBuf::from(r"C:\Windows\System32"))
         .join("drivers")
         .join("etc")
         .join("hosts")

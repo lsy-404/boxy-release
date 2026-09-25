@@ -12,6 +12,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 iana-time-zone = "0.1"
 rand_core = { version = "0.6", features = ["getrandom"] }
 rfd = "0.17"
+tinyfiledialogs = "3.9.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -33,3 +34,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
     "Win32_UI_Shell",
 ] }
+
+[[test]]
+name = "service_selection"
+path = "../test/service_selection.rs"

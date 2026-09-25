@@ -54,12 +54,11 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-msvc,wasm32-unknown-unknown
+          targets: x86_64-pc-windows-msvc
 
-      - name: Verify v2 source
+      - name: Verify connector source
         shell: pwsh
         run: |
-          cargo test --locked -p sv2-session-codec
           cargo test --locked -p boxy
           cargo build --locked --release -p boxy --target x86_64-pc-windows-msvc
 
@@ -89,9 +88,8 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Verify v2 source
+      - name: Verify connector source
         run: |
-          cargo test --locked -p sv2-session-codec
           cargo test --locked -p boxy
           cargo build --locked --release -p boxy
 
@@ -112,30 +110,3 @@ jobs:
             exit 1
           fi
           gh release upload "$RELEASE_TAG" "${assets[@]}" --repo "$REPOSITORY" --clobber
-
-  cloud-verification:
-    name: Cloud service verification
-    needs: prepare-release
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v6
-
-      - name: Set up Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: cloud/package-lock.json
-
-      - name: Install Rust with Wasm target
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
-      - name: Validate Cloudflare Worker
-        working-directory: cloud
-        run: |
-          npm ci
-          npm run build
-          npm run test

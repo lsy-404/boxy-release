@@ -72,10 +72,7 @@ function packageMac() {
   chmodSync(appBinary, 0o755);
   writeFileSync(join(contentsDir, "Info.plist"), infoPlist(version));
 
-  const icon = readRecoveredIcon();
-  if (icon) {
-    writeFileSync(join(resourcesDir, "boxy-pen.svg"), icon);
-  }
+  writeFileSync(join(resourcesDir, "boxy-pen.svg"), readFileSync(resolve(repositoryRoot, "assets/boxy-pen.svg")));
 
   try {
     execFileSync("codesign", ["--force", "--deep", "--sign", "-", appDir], { stdio: "ignore" });
@@ -142,18 +139,6 @@ function readCargoVersion() {
     fail("Could not read version from connector/Cargo.toml.");
   }
   return match[1];
-}
-
-function readRecoveredIcon() {
-  try {
-    return execFileSync("git", ["show", "7285e27:src-tauri/icons/boxy-pen.svg"], {
-      cwd: repositoryRoot,
-      maxBuffer: 16 * 1024 * 1024,
-    });
-  } catch {
-    console.warn("Recovered Boxy icon unavailable; skipping resource.");
-    return null;
-  }
 }
 
 function report(artifacts) {

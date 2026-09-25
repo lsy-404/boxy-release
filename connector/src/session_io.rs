@@ -136,7 +136,7 @@ fn result(action: &str, executable: PathBuf) -> Sv2ControlResult {
 }
 
 #[cfg(windows)]
-fn windows_executable() -> Result<PathBuf, String> {
+pub(crate) fn windows_executable() -> Result<PathBuf, String> {
     use winreg::enums::{
         HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY,
     };
@@ -193,7 +193,7 @@ fn windows_executable() -> Result<PathBuf, String> {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_application() -> Result<PathBuf, String> {
+pub(crate) fn macos_application() -> Result<PathBuf, String> {
     [
         "/Applications/Synthesizer V Studio 2.app",
         "/Applications/Synthesizer V Studio 2 Pro.app",
