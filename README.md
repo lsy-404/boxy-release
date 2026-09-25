@@ -28,7 +28,6 @@ The client can prefill the address from its filename:
 | --- | --- |
 | boxy.a.b.exe or boxy.a.b.app | https://boxy.a.b |
 | a.b.exe or a.b.app | https://a.b |
-| boxy.voidcarve.com (1).exe | https://boxy.voidcarve.com |
 
 Boxy uses the longest valid domain-style part of the filename as the HTTPS host, including when copy text such as ` (1)` appears around it. It does not add `boxy.`. Without a matching name, the default is https://boxy.voidcarve.com. BOXY_API_URL or --server URL overrides the filename suggestion, and the address remains editable in the startup prompt. On macOS the client reads the outer .app bundle name, not the internal binary name.
 
