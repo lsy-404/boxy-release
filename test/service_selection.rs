@@ -6,17 +6,32 @@ use std::path::Path;
 
 #[test]
 fn executable_names_prefill_the_service_origin() {
-    for name in ["boxy.a.b.exe", "a.b.exe", "BOXY.A.B.exe"] {
+    for (name, expected) in [
+        ("boxy.a.b.exe", "https://boxy.a.b"),
+        ("a.b.exe", "https://a.b"),
+        ("BOXY.A.B.exe", "https://boxy.a.b"),
+        ("music.example.com.exe", "https://music.example.com"),
+        ("boxy.voidcarve.com (1).exe", "https://boxy.voidcarve.com"),
+        ("copy boxy.example.com 2.exe", "https://boxy.example.com"),
+        (
+            "a.b copy boxy.voidcarve.com 2.exe",
+            "https://boxy.voidcarve.com",
+        ),
+    ] {
         assert_eq!(
             service_selection::inferred_service_url(Path::new(name)).as_deref(),
-            Some("https://boxy.a.b")
+            Some(expected)
         );
     }
-    for name in ["boxy.a.b.app", "a.b.app"] {
+    for (name, expected) in [
+        ("boxy.a.b.app", "https://boxy.a.b"),
+        ("a.b.app", "https://a.b"),
+        ("BOXY.Voidcarve.com (1).app", "https://boxy.voidcarve.com"),
+    ] {
         let path = format!("/Applications/{name}/Contents/MacOS/boxy");
         assert_eq!(
             service_selection::inferred_service_url(Path::new(&path)).as_deref(),
-            Some("https://boxy.a.b")
+            Some(expected)
         );
     }
 }
@@ -27,7 +42,7 @@ fn unrelated_and_invalid_names_do_not_select_a_service() {
         "boxy.exe",
         "boxy-windows-x64.exe",
         "boxy..example.exe",
-        "a_b.example.exe",
+        "a_b.exe",
     ] {
         assert!(service_selection::inferred_service_url(Path::new(name)).is_none());
     }

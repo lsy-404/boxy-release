@@ -27,9 +27,10 @@ The client can prefill the address from its filename:
 | File or app bundle name | Prefilled address |
 | --- | --- |
 | boxy.a.b.exe or boxy.a.b.app | https://boxy.a.b |
-| a.b.exe or a.b.app | https://boxy.a.b |
+| a.b.exe or a.b.app | https://a.b |
+| boxy.voidcarve.com (1).exe | https://boxy.voidcarve.com |
 
-Without a matching name, the default is https://boxy.voidcarve.com. BOXY_API_URL or --server URL overrides the filename suggestion, and the address remains editable in the startup prompt. On macOS the client reads the outer .app bundle name, not the internal binary name.
+Boxy uses the longest valid domain-style part of the filename as the HTTPS host, including when copy text such as ` (1)` appears around it. It does not add `boxy.`. Without a matching name, the default is https://boxy.voidcarve.com. BOXY_API_URL or --server URL overrides the filename suggestion, and the address remains editable in the startup prompt. On macOS the client reads the outer .app bundle name, not the internal binary name.
 
 The server signing public key remains independent of the selected address. BOXY_SERVER_PUBLIC_KEY or --server-public-key BASE64 can set the expected key for another service; Boxy does not accept an unverified writeback. --session PATH selects a non-default SV2 session, and --public-ip-url URL changes the public IP lookup endpoint.
 

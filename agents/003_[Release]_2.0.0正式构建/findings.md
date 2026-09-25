@@ -5,3 +5,4 @@
 - macOS 本机可构建 arm64；Windows MSVC 交叉编译缺少 Windows SDK 头文件，需 Windows 构建环境。
 - 2026-09-25 现行主仓库已改为仅在启用屏蔽时下载并校验 WebView2 Fixed Runtime；Windows 发行包应恢复为单 exe，旧固定运行时打包方案已过时。
 - GitHub 的私有 boxy-release 远端目前为空；本地 main 有客户端源码，旧 v2.0.0 标签指向迁移前提交。
+- 2026-09-25 源码已推到远端 main，建立 v2.0.0 草稿发行；首次跨平台构建在文件名规则变更后取消，正式产物必须从更新后的源码重新生成。

@@ -43,23 +43,32 @@ pub(crate) fn inferred_service_url(executable: &Path) -> Option<String> {
     let stem = name
         .strip_suffix(".app")
         .or_else(|| name.strip_suffix(".exe"))?;
-    let suffix = stem.strip_prefix("boxy.").unwrap_or(stem);
-    let labels: Vec<_> = suffix.split('.').collect();
-    if labels.len() < 2
-        || labels.iter().any(|label| {
-            label.is_empty()
-                || label.len() > 63
-                || label.starts_with('-')
-                || label.ends_with('-')
-                || !label
+    let mut hostname = None;
+    for candidate in stem.split(|character: char| {
+        !character.is_ascii_alphanumeric() && character != '-' && character != '.'
+    }) {
+        if valid_hostname(candidate)
+            && hostname.is_none_or(|current: &str| candidate.len() > current.len())
+        {
+            hostname = Some(candidate);
+        }
+    }
+    Some(format!("https://{}", hostname?))
+}
+
+fn valid_hostname(candidate: &str) -> bool {
+    let labels: Vec<_> = candidate.split('.').collect();
+    labels.len() >= 2
+        && candidate.len() <= 248
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         })
-        || suffix.len() > 248
-    {
-        return None;
-    }
-    Some(format!("https://boxy.{suffix}"))
 }
 
 pub(crate) fn validate_service_url(value: &str) -> Result<String, String> {
