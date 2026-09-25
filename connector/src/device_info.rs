@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, io::Read, process::Command, time::Duration};
+use std::{collections::BTreeSet, process::Command};
 
 use serde::Serialize;
 use sysinfo::{Disks, Networks, System};
@@ -65,7 +65,7 @@ struct NetworkInterface {
     is_loopback: bool,
 }
 
-pub fn collect(public_ip_url: &str) -> DeviceInfo {
+pub fn collect() -> DeviceInfo {
     let (language, languages, region) = locale();
     let (local_time, utc_offset_seconds, timezone) = local_time();
     DeviceInfo {
@@ -79,7 +79,7 @@ pub fn collect(public_ip_url: &str) -> DeviceInfo {
         disks: disks(),
         network: NetworkInfo {
             interfaces: network_interfaces(),
-            detected_public_ip: detected_public_ip(public_ip_url),
+            detected_public_ip: None,
         },
         tray_applications: tray_applications(),
     }
@@ -203,26 +203,6 @@ fn network_interfaces() -> Vec<NetworkInterface> {
                 .any(|network| network.addr.is_loopback()),
         })
         .collect()
-}
-
-fn detected_public_ip(url: &str) -> Option<String> {
-    let response = ureq::get(url).timeout(Duration::from_secs(6)).call().ok()?;
-    let mut body = String::new();
-    response
-        .into_reader()
-        .take(4096)
-        .read_to_string(&mut body)
-        .ok()?;
-    let candidate = body.trim();
-    if candidate.is_empty()
-        || candidate.len() > 64
-        || !candidate
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || byte == b'.' || byte == b':')
-    {
-        return None;
-    }
-    Some(candidate.to_string())
 }
 
 fn gpus() -> Vec<String> {
@@ -367,7 +347,7 @@ mod tests {
 
     #[test]
     fn collects_device_info_without_network_access() {
-        let info = collect("http://127.0.0.1:9/");
+        let info = collect();
         let value = serde_json::to_value(&info).unwrap();
         assert!(value.get("hardware").is_some());
         assert!(value.get("disks").is_some());

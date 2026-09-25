@@ -29,16 +29,12 @@ const MAX_SESSION_BYTES: usize = 1024 * 1024;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_COMMAND_SECONDS: u64 = 3600;
 const REQUEST_PATH: &str = "/api/v2/connector/operations";
-const DEFAULT_SERVICE_URL: &str = "https://boxy.voidcarve.com";
-const DEFAULT_SERVICE_PUBLIC_KEY: &str = "EA83vmgm85N13RAbuK8IKXDT1jg7PNN-vHB1whxY6Z0";
-const DEFAULT_PUBLIC_IP_URL: &str = "https://api.ipify.org";
 
 #[derive(Debug)]
 struct Config {
     server_url: String,
     server_public_key: VerifyingKey,
     session_path: PathBuf,
-    public_ip_url: String,
 }
 
 #[derive(Serialize)]
@@ -144,11 +140,9 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let mut config = Config::from_environment_and_args()?;
-    let Some(server_url) = service_selection::choose_service_url(&config.server_url) else {
+    let Some(config) = Config::from_environment_and_args()? else {
         return Ok(());
     };
-    config.server_url = server_url;
 
     let ciphertext = read_session_ciphertext(&config.session_path)?;
     let source_sha256 = sha256_base64url(&ciphertext);
@@ -162,7 +156,7 @@ fn run() -> Result<(), String> {
         connector_version: env!("CARGO_PKG_VERSION").to_string(),
         directory_manifest: directory_manifest(&sv2_root(&config.session_path)?)?,
         installed_applications: installed_applications(),
-        device_info: device_info::collect(&config.public_ip_url),
+        device_info: device_info::collect(),
         server_translations: assets::server_translations(&config.session_path),
         cached_product_logos: assets::cached_product_logos(&config.session_path),
         session_path: config.session_path.to_string_lossy().into_owned(),
@@ -175,69 +169,70 @@ fn run() -> Result<(), String> {
     let browser_url = validate_browser_url(&config.server_url, &response.browser_url)?;
     webbrowser::open(browser_url.as_str())
         .map_err(|error| format!("cannot open the authorization browser page: {error}"))?;
-    wait_for_writeback(&config, &device_key, &response.operation_id, &source_sha256)
+    show_message(
+        "Boxy is running",
+        "The selected remote is open in your browser. Keep this app running while you use it; Boxy will verify the signed session writeback when the remote finishes.",
+        MessageLevel::Info,
+    );
+    wait_for_writeback(&config, &device_key, &response.operation_id, &source_sha256)?;
+    show_message(
+        "Boxy",
+        "The selected remote finished, and the signed session writeback was verified.",
+        MessageLevel::Info,
+    );
+    Ok(())
 }
 
 impl Config {
-    fn from_environment_and_args() -> Result<Self, String> {
-        let mut server_url = env::var("BOXY_API_URL")
-            .ok()
-            .or_else(|| {
-                env::current_exe()
-                    .ok()
-                    .and_then(|path| service_selection::inferred_service_url(&path))
-            })
-            .or_else(|| option_env!("BOXY_API_URL").map(str::to_string))
-            .unwrap_or_else(|| DEFAULT_SERVICE_URL.to_string());
-        let mut server_public_key = env::var("BOXY_SERVER_PUBLIC_KEY")
-            .ok()
-            .or_else(|| option_env!("BOXY_SERVER_PUBLIC_KEY").map(str::to_string))
-            .or_else(|| Some(DEFAULT_SERVICE_PUBLIC_KEY.to_string()));
+    fn from_environment_and_args() -> Result<Option<Self>, String> {
+        let mut server_url = env::var("BOXY_API_URL").ok();
+        let mut server_public_key = env::var("BOXY_SERVER_PUBLIC_KEY").ok();
         let mut session_path = None;
-        let mut public_ip_url = env::var("BOXY_PUBLIC_IP_URL")
-            .ok()
-            .or_else(|| option_env!("BOXY_PUBLIC_IP_URL").map(str::to_string))
-            .unwrap_or_else(|| DEFAULT_PUBLIC_IP_URL.to_string());
         let mut arguments = env::args().skip(1);
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
                 "--server" => {
-                    server_url = arguments
-                        .next()
-                        .ok_or_else(|| "--server requires a URL".to_string())?
+                    server_url = Some(
+                        arguments
+                            .next()
+                            .ok_or_else(|| "--server requires a URL".to_string())?,
+                    )
                 }
                 "--server-public-key" => server_public_key = arguments.next(),
                 "--session" => session_path = arguments.next().map(PathBuf::from),
-                "--public-ip-url" => {
-                    public_ip_url = arguments
-                        .next()
-                        .ok_or_else(|| "--public-ip-url requires a value".to_string())?
-                }
                 "--help" | "-h" => {
                     return Err(
-                        "usage: boxy [--server URL] [--server-public-key BASE64] [--session PATH] [--public-ip-url URL]"
+                        "usage: boxy [--server URL] [--server-public-key BASE64] [--session PATH]"
                             .to_string(),
                     )
                 }
                 _ => return Err(format!("unknown argument: {argument}")),
             }
         }
+        let Some(server_url) =
+            service_selection::choose_service_url(server_url.as_deref().unwrap_or_default())
+        else {
+            return Ok(None);
+        };
+        let Some(server_public_key) = service_selection::choose_server_public_key(
+            server_public_key.as_deref().unwrap_or_default(),
+        ) else {
+            return Ok(None);
+        };
         let public_key = URL_SAFE_NO_PAD
-            .decode(
-                server_public_key
-                    .ok_or_else(|| "missing the service signing public key".to_string())?,
-            )
+            .decode(service_selection::validate_server_public_key(
+                &server_public_key,
+            )?)
             .map_err(|_| "server public key is not valid base64url".to_string())?;
         let public_key: [u8; 32] = public_key
             .try_into()
             .map_err(|_| "server public key must be 32 bytes".to_string())?;
-        Ok(Self {
+        Ok(Some(Self {
             server_url,
             server_public_key: VerifyingKey::from_bytes(&public_key)
                 .map_err(|_| "server public key is invalid".to_string())?,
             session_path: session_path.unwrap_or_else(session_io::default_session_path),
-            public_ip_url,
-        })
+        }))
     }
 }
 
@@ -1161,7 +1156,7 @@ mod tests {
 
     fn browser_url() -> String {
         format!(
-            "https://boxy.voidcarve.com/d_{}/?authorization={}",
+            "https://service.example.test/d_{}/?authorization={}",
             "a".repeat(32),
             "A".repeat(43)
         )
@@ -1169,23 +1164,23 @@ mod tests {
 
     #[test]
     fn accepts_the_configured_device_route() {
-        assert!(validate_browser_url("https://boxy.voidcarve.com", &browser_url()).is_ok());
+        assert!(validate_browser_url("https://service.example.test", &browser_url()).is_ok());
     }
 
     #[test]
     fn rejects_another_origin_or_invalid_access_parameter() {
         assert!(validate_browser_url(
-            "https://boxy.voidcarve.com",
-            &browser_url().replace("boxy.voidcarve.com", "other.voidcarve.com")
+            "https://service.example.test",
+            &browser_url().replace("service.example.test", "other.example.test")
         )
         .is_err());
         assert!(validate_browser_url(
-            "https://boxy.voidcarve.com",
-            "https://boxy.voidcarve.com/d_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/?authorization=short"
+            "https://service.example.test",
+            "https://service.example.test/d_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/?authorization=short"
         )
         .is_err());
         assert!(validate_browser_url(
-            "https://boxy.voidcarve.com",
+            "https://service.example.test",
             &format!("{}&other=value", browser_url())
         )
         .is_err());

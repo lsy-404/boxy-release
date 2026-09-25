@@ -73,9 +73,9 @@ jobs:
           RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
         shell: pwsh
         run: |
-          $zipPath = Join-Path $env:GITHUB_WORKSPACE "dist/boxy-windows-x64.zip"
-          if (-not (Test-Path -LiteralPath $zipPath -PathType Leaf)) { throw "Portable asset was not packaged: $zipPath" }
-          gh release upload $env:RELEASE_TAG $zipPath --repo $env:REPOSITORY --clobber
+          $exePath = Join-Path $env:GITHUB_WORKSPACE "dist/boxy-windows-x64.exe"
+          if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) { throw "Portable asset was not packaged: $exePath" }
+          gh release upload $env:RELEASE_TAG $exePath --repo $env:REPOSITORY --clobber
           if ($LASTEXITCODE -ne 0) { throw "Failed to upload Boxy." }
 
   macos-boxy:

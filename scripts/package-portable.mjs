@@ -138,7 +138,7 @@ function infoPlist(version) {
 \t<key>CFBundleExecutable</key>
 \t<string>boxy</string>
 \t<key>CFBundleIdentifier</key>
-\t<string>dev.voidcarve.boxy</string>
+\t<string>app.boxy.bridge</string>
 \t<key>CFBundleVersion</key>
 \t<string>${version}</string>
 \t<key>CFBundleShortVersionString</key>

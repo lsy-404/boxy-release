@@ -1,7 +1,7 @@
-use std::path::Path;
 use url::Url;
 
-const STARTUP_NOTICE: &str = "Boxy connects to the service you select. It sends an encrypted SV2 session, device information, public IP, installed applications, and a listing of the SV2 data directory. The service can request bounded local file and application actions. Every shell command asks for separate approval.\n\nEnter the service address and choose OK to continue. Cancel exits. Keep Boxy open while assistance is active.";
+const STARTUP_NOTICE: &str = "Boxy is a local bridge to the remote service you choose. That service controls the browser editor and remote operations it requests. Boxy sends it an encrypted SV2 session and device information, including installed applications and a listing of the SV2 data directory. The selected service sees your public IP. Every shell command asks for separate approval.\n\nEnter the service address and choose OK to continue. Cancel exits. Keep Boxy open while assistance is active.";
+const SIGNING_KEY_NOTICE: &str = "Enter the selected service's base64url Ed25519 public key. Boxy uses this key to verify signed session writebacks. Only use a key supplied by the service owner you trust.";
 
 pub(crate) fn choose_service_url(initial: &str) -> Option<String> {
     if initial.contains('\0') {
@@ -29,46 +29,36 @@ pub(crate) fn choose_service_url(initial: &str) -> Option<String> {
     }
 }
 
-pub(crate) fn inferred_service_url(executable: &Path) -> Option<String> {
-    let app_name = executable.ancestors().find_map(|path| {
-        let name = path.file_name()?.to_str()?;
-        name.to_ascii_lowercase()
-            .ends_with(".app")
-            .then(|| name.to_ascii_lowercase())
-    });
-    let name = app_name.or_else(|| {
-        let name = executable.file_name()?.to_str()?.to_ascii_lowercase();
-        name.ends_with(".exe").then_some(name)
-    })?;
-    let stem = name
-        .strip_suffix(".app")
-        .or_else(|| name.strip_suffix(".exe"))?;
-    let mut hostname = None;
-    for candidate in stem.split(|character: char| {
-        !character.is_ascii_alphanumeric() && character != '-' && character != '.'
-    }) {
-        if valid_hostname(candidate)
-            && hostname.is_none_or(|current: &str| candidate.len() > current.len())
-        {
-            hostname = Some(candidate);
+pub(crate) fn choose_server_public_key(initial: &str) -> Option<String> {
+    let mut value = initial.to_string();
+    loop {
+        let chosen =
+            tinyfiledialogs::input_box("Remote service signing key", SIGNING_KEY_NOTICE, &value)?;
+        match validate_server_public_key(&chosen) {
+            Ok(key) => return Some(key.to_string()),
+            Err(error) => {
+                tinyfiledialogs::message_box_ok(
+                    "Invalid signing key",
+                    &error,
+                    tinyfiledialogs::MessageBoxIcon::Error,
+                );
+                value = chosen;
+            }
         }
     }
-    Some(format!("https://{}", hostname?))
 }
 
-fn valid_hostname(candidate: &str) -> bool {
-    let labels: Vec<_> = candidate.split('.').collect();
-    labels.len() >= 2
-        && candidate.len() <= 248
-        && labels.iter().all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        })
+pub(crate) fn validate_server_public_key(value: &str) -> Result<&str, String> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+    let value = value.trim();
+    let decoded = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| "Enter a valid base64url service signing key.".to_string())?;
+    if decoded.len() != 32 {
+        return Err("The service signing key must decode to 32 bytes.".to_string());
+    }
+    Ok(value)
 }
 
 pub(crate) fn validate_service_url(value: &str) -> Result<String, String> {

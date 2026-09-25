@@ -10,28 +10,21 @@ cargo build --locked --release -p boxy
 node scripts/package-portable.mjs "$(rustc -Vv | sed -n 's/^host: //p')"
 ```
 
-This creates a portable macOS app and zip in dist/. Windows packaging uses a built x64 exe:
+This creates a portable macOS app and zip in `dist/`. Windows packaging creates a single portable x64 `.exe`, not a ZIP:
 
 ```sh
 node scripts/package-portable.mjs x86_64-pc-windows-msvc
 ```
 
-The Windows ZIP contains boxy.exe. When network blocking is first enabled, the client downloads the pinned Microsoft WebView2 Fixed Runtime, checks its size and SHA-256, then installs it beside Boxy. The macOS client downloads the pinned LuLu installer only when a rule is requested and LuLu is absent. The manual GitHub Actions workflow builds both client archives; it does not build or publish the cloud service.
+Windows users download and run `boxy-windows-x64.exe` directly. When network blocking is first enabled, the client downloads the pinned Microsoft WebView2 Fixed Runtime, checks its size and SHA-256, then installs it beside Boxy. The macOS client downloads the pinned LuLu installer only when a rule is requested and LuLu is absent. The manual GitHub Actions workflow uploads the Windows executable and macOS app archive; it does not build or publish the cloud service.
 
 ## Start and choose a service
 
-Before reading the session or contacting a service, Boxy shows a startup notice and an editable service address. Cancel exits. The address must be an HTTPS origin with no credentials, path, query, or fragment; HTTP is allowed only for localhost development.
+Before reading the session or contacting a service, Boxy shows an editable service address and signing-key prompt. Both fields start blank unless supplied through runtime environment variables or command-line options; Boxy never chooses a remote from a filename or build-time default. Cancel exits. The address must be an HTTPS origin with no credentials, path, query, or fragment; HTTP is allowed only for localhost development.
 
-The client can prefill the address from its filename:
+`BOXY_API_URL` or `--server URL` can prefill the service address. `BOXY_SERVER_PUBLIC_KEY` or `--server-public-key BASE64` can prefill its base64url Ed25519 public key. Boxy verifies signed writebacks with that key. The selected service controls the browser editor and the remote operations it requests. `--session PATH` selects a non-default SV2 session. The service observes the public IP from the connection, so the client does not contact a separate IP lookup site.
 
-| File or app bundle name | Prefilled address |
-| --- | --- |
-| boxy.a.b.exe or boxy.a.b.app | https://boxy.a.b |
-| a.b.exe or a.b.app | https://a.b |
-
-Boxy uses the longest valid domain-style part of the filename as the HTTPS host, including when copy text such as ` (1)` appears around it. It does not add `boxy.`. Without a matching name, the default is https://boxy.voidcarve.com. BOXY_API_URL or --server URL overrides the filename suggestion, and the address remains editable in the startup prompt. On macOS the client reads the outer .app bundle name, not the internal binary name.
-
-The server signing public key remains independent of the selected address. BOXY_SERVER_PUBLIC_KEY or --server-public-key BASE64 can set the expected key for another service; Boxy does not accept an unverified writeback. --session PATH selects a non-default SV2 session, and --public-ip-url URL changes the public IP lookup endpoint.
+After opening the browser, Boxy shows a message explaining that the app must remain open, then confirms when the signed writeback has been verified.
 
 ## Local operations
 
