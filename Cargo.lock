@@ -61,6 +61,7 @@ dependencies = [
  "dirs",
  "ed25519-dalek",
  "iana-time-zone",
+ "libc",
  "rand_core",
  "rfd",
  "serde",

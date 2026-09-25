@@ -7,9 +7,9 @@
 
 ## 技术栈
 
-- Rust 2021：本地连接器
+- Rust 2021：本地连接器、Windows WFP 和 macOS LuLu 规则导出
 - Node.js：便携应用打包脚本
-- GitHub Actions：跨平台验证和便携发行构建
+- GitHub Actions：跨平台验证和便携发行构建；Windows ZIP 包含专属 WebView2 Runtime
 
 ## 模块结构
 

@@ -3,12 +3,9 @@
 mod assets;
 mod device_info;
 mod host_block;
-mod network_block;
 mod product_database;
 mod service_selection;
 mod session_io;
-#[cfg(windows)]
-mod windows_firewall;
 
 use std::{
     env,
@@ -122,8 +119,6 @@ struct DirectoryTask {
     #[serde(default)]
     blocked: Option<bool>,
     #[serde(default)]
-    mode: Option<String>,
-    #[serde(default)]
     action: Option<String>,
     #[serde(default)]
     items: Vec<product_database::FetchItem>,
@@ -140,14 +135,6 @@ struct ConnectorReceipt {
 
 fn main() {
     if let Some(code) = host_block::run_elevated_host_block_if_requested() {
-        std::process::exit(code);
-    }
-    #[cfg(windows)]
-    if let Some(code) = windows_firewall::run_elevated_if_requested() {
-        std::process::exit(code);
-    }
-    #[cfg(windows)]
-    if let Some(code) = network_block::run_elevated_if_requested() {
         std::process::exit(code);
     }
     if let Err(error) = run() {
@@ -534,22 +521,14 @@ fn execute_directory_task(
         "command" => execute_command_task(config, key, &base, task),
         "host_block" => {
             let result = match task.blocked {
-                Some(blocked) => {
-                    let mode =
-                        network_block::BlockMode::parse(task.mode.as_deref().unwrap_or("hosts"));
-                    mode.and_then(|mode| network_block::set_blocked(blocked, mode))
-                }
-                None => Ok(network_block::status()),
+                Some(blocked) => host_block::set_blocked(blocked),
+                None => host_block::status(),
             };
-            let value = match result {
+            let result = match result {
                 Ok(status) => serde_json::to_value(status).map_err(|error| error.to_string())?,
-                Err(error) => serde_json::json!({
-                    "failed": true,
-                    "error": error,
-                    "status": network_block::status(),
-                }),
+                Err(error) => serde_json::json!({"error": error}),
             };
-            complete_task(config, key, &format!("{base}/complete"), value)
+            complete_task(config, key, &format!("{base}/complete"), result)
         }
         "sv2_action" => {
             let action = task

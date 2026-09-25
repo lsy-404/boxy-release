@@ -174,16 +174,24 @@ pub(crate) fn windows_executable() -> Result<PathBuf, String> {
                     }
                 }
                 if let Ok(display_icon) = subkey.get_value::<String, _>("DisplayIcon") {
-                    let candidate = PathBuf::from(
-                        display_icon
-                            .trim()
-                            .trim_matches('"')
-                            .split(',')
-                            .next()
-                            .unwrap_or_default(),
-                    );
-                    if candidate.is_file() {
+                    let Some(candidate) = display_icon_path(&display_icon) else {
+                        continue;
+                    };
+                    if candidate.is_file()
+                        && candidate
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.eq_ignore_ascii_case("synthv-studio.exe"))
+                    {
                         return Ok(candidate);
+                    }
+                    if let Some(sibling) = candidate
+                        .parent()
+                        .map(|directory| directory.join("synthv-studio.exe"))
+                    {
+                        if sibling.is_file() {
+                            return Ok(sibling);
+                        }
                     }
                 }
             }
@@ -192,8 +200,21 @@ pub(crate) fn windows_executable() -> Result<PathBuf, String> {
     Err("cannot locate SV2; install Synthesizer V Studio 2 before launching it".to_string())
 }
 
+#[cfg(windows)]
+pub(crate) fn display_icon_path(value: &str) -> Option<PathBuf> {
+    let value = value.trim();
+    if let Some(value) = value.strip_prefix('"') {
+        return value.split_once('"').map(|(path, _)| PathBuf::from(path));
+    }
+    let path = value
+        .rsplit_once(',')
+        .and_then(|(path, index)| index.trim().parse::<i32>().ok().map(|_| path))
+        .unwrap_or(value);
+    (!path.is_empty()).then(|| PathBuf::from(path.trim()))
+}
+
 #[cfg(target_os = "macos")]
-pub(crate) fn macos_application() -> Result<PathBuf, String> {
+fn macos_application() -> Result<PathBuf, String> {
     [
         "/Applications/Synthesizer V Studio 2.app",
         "/Applications/Synthesizer V Studio 2 Pro.app",
