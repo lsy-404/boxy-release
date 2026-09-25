@@ -10,13 +10,13 @@ cargo build --locked --release -p boxy
 node scripts/package-portable.mjs "$(rustc -Vv | sed -n 's/^host: //p')"
 ```
 
-This creates a portable macOS app and zip in dist/. Windows packaging uses a built x64 exe and a complete Microsoft WebView2 Fixed Runtime directory:
+This creates a portable macOS app and zip in dist/. Windows packaging uses a built x64 exe:
 
 ```sh
-node scripts/package-portable.mjs x86_64-pc-windows-msvc --webview-runtime <directory>
+node scripts/package-portable.mjs x86_64-pc-windows-msvc
 ```
 
-The Windows output is a ZIP containing boxy.exe beside WebView2Runtime. The manual GitHub Actions workflow verifies the official runtime CAB against its version and SHA-256 before packaging. It does not build or publish the cloud service.
+The Windows ZIP contains boxy.exe. When network blocking is first enabled, the client downloads the pinned Microsoft WebView2 Fixed Runtime, checks its size and SHA-256, then installs it beside Boxy. The macOS client downloads the pinned LuLu installer only when a rule is requested and LuLu is absent. The manual GitHub Actions workflow builds both client archives; it does not build or publish the cloud service.
 
 ## Start and choose a service
 
@@ -35,6 +35,6 @@ The server signing public key remains independent of the selected address. BOXY_
 
 ## Local operations
 
-The client reports device information and the SV2 directory manifest when starting an operation. Bounded tasks include encrypted session and directory I/O, network block status or changes, SV2 launch or close, opening the session folder, and voice database inspection, download, installation, or removal. Windows network blocking uses WFP rules for SV2 and its private WebView2 runtime; macOS exports a LuLu rule for manual import. See docs/network-blocking.md for the verification boundary. Every arbitrary shell command requires separate approval. Close the client to stop the assistance session.
+The client reports device information and the SV2 directory manifest when starting an operation. Bounded tasks include encrypted session and directory I/O, network block status or changes, SV2 launch or close, opening the session folder, and voice database inspection, download, installation, or removal. Windows network blocking uses WFP rules for SV2 and its private WebView2 runtime; macOS exports a LuLu rule for manual import into a dedicated profile. See docs/network-blocking.md for the verification boundary. Every arbitrary shell command requires separate approval. Close the client to stop the assistance session.
 
 The HTTP JSON task and writeback protocol is implemented by the cloud service; changes to task fields must be verified against its Worker tests before a client release.

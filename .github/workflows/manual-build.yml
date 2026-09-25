@@ -7,18 +7,6 @@ on:
         description: Existing v2 release tag to build and upload
         required: true
         type: string
-      webview2_fixed_runtime_url:
-        description: HTTPS URL for the Microsoft x64 WebView2 Fixed Runtime CAB
-        required: true
-        type: string
-      webview2_fixed_runtime_version:
-        description: Four-part version of the Microsoft x64 WebView2 Fixed Runtime
-        required: true
-        type: string
-      webview2_fixed_runtime_sha256:
-        description: SHA-256 digest for the Microsoft x64 WebView2 Fixed Runtime CAB
-        required: true
-        type: string
 
 permissions:
   contents: write
@@ -74,44 +62,9 @@ jobs:
           cargo test --locked -p boxy
           cargo build --locked --release -p boxy --target x86_64-pc-windows-msvc
 
-      - name: Fetch and verify Microsoft WebView2 Fixed Runtime
-        env:
-          RUNTIME_URL: ${{ inputs.webview2_fixed_runtime_url }}
-          RUNTIME_VERSION: ${{ inputs.webview2_fixed_runtime_version }}
-          RUNTIME_SHA256: ${{ inputs.webview2_fixed_runtime_sha256 }}
-        shell: pwsh
-        run: |
-          $expectedHost = 'msedge.sf.dl.delivery.mp.microsoft.com'
-          $expectedDigest = $env:RUNTIME_SHA256.ToLowerInvariant()
-          $expectedRuntimeDirectoryName = "Microsoft.WebView2.FixedVersionRuntime.$($env:RUNTIME_VERSION).x64"
-          if ($expectedDigest -notmatch '^[0-9a-f]{64}$') { throw 'WebView2 Fixed Runtime SHA-256 must be 64 hexadecimal characters.' }
-          if ($env:RUNTIME_VERSION -notmatch '^\d+\.\d+\.\d+\.\d+$') { throw 'WebView2 Fixed Runtime version must have four numeric parts.' }
-          if (-not [Uri]::TryCreate($env:RUNTIME_URL, [UriKind]::Absolute, [ref]$runtimeUri)) { throw 'WebView2 Fixed Runtime URL is invalid.' }
-          if ($runtimeUri.Scheme -ne 'https' -or $runtimeUri.Host -ne $expectedHost -or -not $runtimeUri.AbsolutePath.EndsWith('.cab')) {
-            throw 'WebView2 Fixed Runtime URL must be an HTTPS CAB from the Microsoft delivery host.'
-          }
-          $downloadDir = Join-Path $env:RUNNER_TEMP 'boxy-webview2-runtime'
-          $cabPath = Join-Path $downloadDir 'webview2-fixed-runtime.cab'
-          $extractDir = Join-Path $downloadDir 'extract'
-          New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
-          curl.exe --fail --location --proto '=https' --tlsv1.2 --output $cabPath $runtimeUri.AbsoluteUri
-          if ($LASTEXITCODE -ne 0) { throw 'Failed to download the WebView2 Fixed Runtime CAB.' }
-          $actualDigest = (Get-FileHash -LiteralPath $cabPath -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actualDigest -cne $expectedDigest) { throw 'WebView2 Fixed Runtime SHA-256 does not match the workflow input.' }
-          & expand.exe $cabPath '-F:*' $extractDir
-          if ($LASTEXITCODE -ne 0) { throw 'Failed to extract the WebView2 Fixed Runtime CAB.' }
-          $runtimeDirectories = @(Get-ChildItem -LiteralPath $extractDir -Directory -Recurse | Where-Object {
-            (Test-Path -LiteralPath (Join-Path $_.FullName 'msedgewebview2.exe') -PathType Leaf) -and
-            (Test-Path -LiteralPath (Join-Path $_.FullName 'msedge.dll') -PathType Leaf)
-          })
-          if ($runtimeDirectories.Count -ne 1 -or $runtimeDirectories[0].Name -cne $expectedRuntimeDirectoryName) {
-            throw 'The verified CAB does not contain the requested complete x64 WebView2 Fixed Runtime directory.'
-          }
-          "WEBVIEW2_RUNTIME_DIR=$($runtimeDirectories[0].FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
       - name: Package portable Boxy
         shell: pwsh
-        run: node scripts/package-portable.mjs x86_64-pc-windows-msvc --webview-runtime $env:WEBVIEW2_RUNTIME_DIR
+        run: node scripts/package-portable.mjs x86_64-pc-windows-msvc
 
       - name: Upload Boxy for Windows
         env:

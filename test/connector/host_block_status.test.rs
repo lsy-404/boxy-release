@@ -19,6 +19,8 @@ fn status_serializes_the_platform_rule_contract() {
         blocked_rules: 0,
         total_rules: 4,
         artifact_path: None,
+        installer_path: None,
+        target_path: None,
         manual_import_required: None,
         instructions: None,
     };
@@ -35,6 +37,19 @@ fn status_serializes_the_platform_rule_contract() {
 }
 
 #[test]
+fn fixed_webview_runtime_manifest_pins_the_microsoft_x64_cab() {
+    let manifest =
+        host_block::webview_runtime_manifest().expect("runtime manifest should validate");
+    assert_eq!(manifest.version, "153.0.4234.48");
+    assert_eq!(manifest.size_bytes, 308_509_880);
+    assert_eq!(manifest.sha256.len(), 64);
+    assert!(manifest
+        .url
+        .starts_with("https://msedge.sf.dl.delivery.mp.microsoft.com/"));
+    assert!(manifest.url.ends_with(".x64.cab"));
+}
+
+#[test]
 fn lulu_import_rule_scopes_sv2_and_its_children() {
     let executable = std::path::Path::new(
         "/Applications/Synthesizer V Studio 2.app/Contents/MacOS/Synthesizer V Studio 2",
@@ -48,8 +63,11 @@ fn lulu_import_rule_scopes_sv2_and_its_children() {
     assert_eq!(rules.len(), 1);
     let rule = &rules[0];
     assert_eq!(rule["path"], executable.to_str().unwrap());
+    assert_eq!(rule["key"], executable.to_str().unwrap());
+    assert_eq!(rule["name"], "Synthesizer V Studio 2 (Boxy block)");
     assert_eq!(rule["endpointAddr"], "*");
     assert_eq!(rule["endpointPort"], "*");
+    assert_eq!(rule["isEndpointAddrRegex"], 0);
     assert_eq!(rule["type"], 3);
     assert_eq!(rule["scope"], 2);
     assert_eq!(rule["action"], 0);
@@ -78,6 +96,28 @@ fn strips_extended_length_prefix_before_writing_the_webview_policy() {
         host_block::browser_executable_folder(std::path::Path::new(r"\\?\C:\Boxy\WebView2Runtime"))
             .expect("a local extended-length path should be normalized");
     assert_eq!(directory, r"C:\Boxy\WebView2Runtime");
+}
+
+#[test]
+#[cfg(windows)]
+fn creates_wfp_app_blobs_over_caller_owned_bytes() {
+    let mut bytes = [1u8, 2, 3, 4];
+    let blob = host_block::wfp_byte_blob(&mut bytes).expect("the app id should fit in a WFP blob");
+
+    assert_eq!(blob.size, bytes.len() as u32);
+    assert_eq!(blob.data, bytes.as_mut_ptr());
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(blob.data, blob.size as usize) },
+        &bytes
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn derives_and_releases_a_wfp_app_id() {
+    let executable = std::env::current_exe().expect("test executable path");
+    let app_id = host_block::wfp_app_id(&executable, "test executable").expect("WFP app ID");
+    assert!(!app_id.is_empty());
 }
 
 #[test]

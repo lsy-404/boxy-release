@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -8,7 +8,6 @@ const outputDir = resolve(repositoryRoot, "dist");
 
 let targetTriple;
 let binaryOverride;
-let webViewRuntime;
 const args = process.argv.slice(2);
 for (let index = 0; index < args.length; index += 1) {
   const arg = args[index];
@@ -17,12 +16,6 @@ for (let index = 0; index < args.length; index += 1) {
     index += 1;
     if (!binaryOverride) {
       fail("--binary requires a path.");
-    }
-  } else if (arg === "--webview-runtime") {
-    webViewRuntime = args[index + 1];
-    index += 1;
-    if (!webViewRuntime) {
-      fail("--webview-runtime requires a directory.");
     }
   } else if (arg.startsWith("--")) {
     fail(`Unknown option: ${arg}`);
@@ -34,7 +27,7 @@ for (let index = 0; index < args.length; index += 1) {
 }
 
 if (!targetTriple) {
-  fail("Usage: node scripts/package-portable.mjs <target-triple> [--binary <path>] [--webview-runtime <path>]");
+  fail("Usage: node scripts/package-portable.mjs <target-triple> [--binary <path>]");
 }
 
 const isWindows = targetTriple.includes("windows");
@@ -53,11 +46,6 @@ const binaryPath = binaryOverride
 
 if (!existsSync(binaryPath) || !statSync(binaryPath).isFile()) {
   fail(`Boxy binary not found: ${binaryPath}`);
-}
-
-const webViewRuntimePath = webViewRuntime ? resolve(process.cwd(), webViewRuntime) : null;
-if (webViewRuntimePath && (!isWindows || !statSync(webViewRuntimePath, { throwIfNoEntry: false })?.isDirectory())) {
-  fail("--webview-runtime is only supported for Windows and must name a directory.");
 }
 
 function main() {
@@ -108,14 +96,8 @@ function packageMac() {
 }
 
 function packageWindows() {
-  if (!webViewRuntimePath) {
-    fail("Windows packaging requires --webview-runtime with a complete Microsoft WebView2 Fixed Runtime directory.");
-  }
-
-  assertWebViewRuntime(webViewRuntimePath);
   const bundleName = "boxy-windows-x64";
   const bundleDir = join(outputDir, bundleName);
-  const runtimeDestination = join(bundleDir, "WebView2Runtime");
   const zipPath = join(outputDir, `${bundleName}.zip`);
   mkdirSync(outputDir, { recursive: true });
   rmSync(bundleDir, { recursive: true, force: true });
@@ -124,20 +106,9 @@ function packageWindows() {
   const exePath = join(bundleDir, "boxy.exe");
   copyFileSync(binaryPath, exePath);
   chmodSync(exePath, 0o755);
-  cpSync(webViewRuntimePath, runtimeDestination, { recursive: true, force: true });
-  assertWebViewRuntime(runtimeDestination);
   createWindowsZip(bundleName, zipPath);
 
   report([bundleDir, zipPath]);
-}
-
-function assertWebViewRuntime(path) {
-  for (const filename of ["msedgewebview2.exe", "msedge.dll"]) {
-    const candidate = join(path, filename);
-    if (!existsSync(candidate) || !statSync(candidate).isFile()) {
-      fail(`WebView2 Fixed Runtime is incomplete: missing ${filename} in ${path}`);
-    }
-  }
 }
 
 function createWindowsZip(bundleName, zipPath) {

@@ -20,6 +20,8 @@ use std::path::PathBuf;
 #[cfg(windows)]
 use std::ffi::OsStr;
 #[cfg(windows)]
+use std::io::{Read, Write};
+#[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 
 #[cfg(any(windows, target_os = "macos", test))]
@@ -40,6 +42,10 @@ const WEBVIEW_RUNTIME_DIRECTORY: &str = "WebView2Runtime";
 const WEBVIEW_EXECUTABLE: &str = "msedgewebview2.exe";
 #[cfg(windows)]
 const WEBVIEW_LIBRARY: &str = "msedge.dll";
+#[cfg(windows)]
+const WEBVIEW_RUNTIME_MARKER: &str = ".boxy-webview2-runtime.json";
+#[cfg(any(windows, test))]
+const WEBVIEW_RUNTIME_MANIFEST: &str = include_str!("webview2-runtime.json");
 #[cfg(windows)]
 const WEBVIEW_POLICY_PATH: &str =
     "SOFTWARE\\Policies\\Microsoft\\Edge\\WebView2\\BrowserExecutableFolder";
@@ -65,6 +71,17 @@ const LULU_METHOD: &str = "lulu";
 const LULU_RULE_NAME: &str = "Synthesizer V Studio 2 (Boxy block)";
 #[cfg(target_os = "macos")]
 const LULU_RULE_TOTAL: usize = 1;
+#[cfg(target_os = "macos")]
+const LULU_VERSION: &str = "4.5.1";
+#[cfg(target_os = "macos")]
+const LULU_DMG_URL: &str =
+    "https://github.com/objective-see/LuLu/releases/download/v4.5.1/LuLu_4.5.1.dmg";
+#[cfg(target_os = "macos")]
+const LULU_DMG_SHA256: &str = "98f4d3427f4c6fccf9680fed22879be90a5ae81e80eb8616c1d758755b6bb624";
+#[cfg(target_os = "macos")]
+const LULU_DMG_BYTES: u64 = 7_251_712;
+#[cfg(target_os = "macos")]
+const MAX_LULU_DMG_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -82,6 +99,10 @@ pub struct HostBlockStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub installer_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub manual_import_required: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
@@ -96,7 +117,7 @@ pub fn status() -> Result<HostBlockStatus, String> {
         let (legacy_hosts, warning) = macos_legacy_hosts_state();
         let mut status = lulu_status(
             None,
-            lulu_import_instructions(None, legacy_hosts),
+            lulu_import_instructions(None, None, legacy_hosts),
             legacy_hosts,
         );
         status.warning = warning;
@@ -111,19 +132,18 @@ pub fn set_blocked(blocked: bool) -> Result<HostBlockStatus, String> {
     #[cfg(windows)]
     {
         if blocked {
-            let targets = block_targets()?;
-            if sv2_is_running(&targets.sv2_executable)? {
+            let sv2_executable = crate::session_io::windows_executable()?;
+            if sv2_is_running(&sv2_executable)? {
                 return Err(
                     "close Synthesizer V Studio 2 before enabling the network block".to_string(),
                 );
             }
-            ensure_no_webview_runtime_override(&targets)?;
         }
         if !is_elevated() {
             elevate_and_wait(blocked)?;
             return status();
         }
-        return set_wfp_blocked(blocked);
+        return set_blocked_elevated(blocked);
     }
     #[cfg(target_os = "macos")]
     {
@@ -169,7 +189,7 @@ pub fn run_elevated_host_block_if_requested() -> Option<i32> {
         if args.next().is_some() {
             return Some(1);
         }
-        return Some(if set_wfp_blocked(blocked).is_ok() {
+        return Some(if set_blocked_elevated(blocked).is_ok() {
             0
         } else {
             1
@@ -301,6 +321,8 @@ const WFP_SUBLAYER: windows_sys::core::GUID =
 #[cfg(windows)]
 const WFP_FILTER_COUNT: usize = 4;
 #[cfg(windows)]
+const WFP_SUBLAYER_WEIGHT: u16 = 0xfffe;
+#[cfg(windows)]
 const FWP_E_FILTER_NOT_FOUND: u32 = windows_sys::Win32::Foundation::FWP_E_FILTER_NOT_FOUND as u32;
 #[cfg(windows)]
 const FWP_E_SUBLAYER_NOT_FOUND: u32 =
@@ -354,6 +376,18 @@ fn open_wfp_engine() -> Result<WfpEngine, String> {
 }
 
 #[cfg(windows)]
+unsafe fn free_wfp_memory<T>(pointer: &mut *mut T) {
+    // The API needs a separate void pointer slot, not the allocation pointer itself.
+    let mut allocation = (*pointer).cast::<core::ffi::c_void>();
+    unsafe {
+        windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFreeMemory0(
+            &mut allocation,
+        )
+    };
+    *pointer = std::ptr::null_mut();
+}
+
+#[cfg(windows)]
 fn wfp_result(status: u32, operation: &str) -> Result<(), String> {
     if status == 0 {
         Ok(())
@@ -365,7 +399,7 @@ fn wfp_result(status: u32, operation: &str) -> Result<(), String> {
 #[cfg(windows)]
 fn wfp_status() -> Result<HostBlockStatus, String> {
     use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
-        FwpmFilterGetByKey0, FwpmFreeMemory0, FwpmSubLayerGetByKey0,
+        FwpmFilterGetByKey0, FwpmSubLayerGetByKey0,
     };
     let engine = open_wfp_engine()?;
     let targets = block_targets().ok();
@@ -382,7 +416,7 @@ fn wfp_status() -> Result<HostBlockStatus, String> {
         false
     } else {
         let valid = unsafe { wfp_sublayer_is_valid(&*sublayer) };
-        unsafe { FwpmFreeMemory0((&mut sublayer).cast()) };
+        unsafe { free_wfp_memory(&mut sublayer) };
         valid
     };
     let sublayer_present = match sublayer_result {
@@ -419,7 +453,7 @@ fn wfp_status() -> Result<HostBlockStatus, String> {
                     .is_some_and(|rules| unsafe {
                         wfp_filter_is_valid(&*filter, layer, rules[expected_index].2)
                     });
-                unsafe { FwpmFreeMemory0((&mut filter).cast()) };
+                unsafe { free_wfp_memory(&mut filter) };
                 valid
             };
             match result {
@@ -451,6 +485,8 @@ fn wfp_status() -> Result<HostBlockStatus, String> {
         blocked_rules,
         total_rules: WFP_FILTER_COUNT,
         artifact_path: None,
+        installer_path: None,
+        target_path: None,
         manual_import_required: None,
         instructions: None,
     })
@@ -473,6 +509,8 @@ fn lulu_status(
         blocked_rules: 0,
         total_rules: LULU_RULE_TOTAL,
         artifact_path,
+        installer_path: None,
+        target_path: None,
         manual_import_required: Some(true),
         instructions: Some(instructions),
     }
@@ -482,7 +520,13 @@ fn lulu_status(
 fn create_lulu_import_rule() -> Result<HostBlockStatus, String> {
     let executable = macos_sv2_executable()?;
     let rule = lulu_import_document(&executable, LULU_RULE_NAME)?;
-    let directory = dirs::download_dir().unwrap_or_else(std::env::temp_dir);
+    let download_dir = dirs::download_dir().unwrap_or_else(std::env::temp_dir);
+    let lulu_installer = if lulu_is_installed() {
+        None
+    } else {
+        Some(download_lulu_installer(&download_dir)?)
+    };
+    let directory = download_dir.join("Boxy");
     std::fs::create_dir_all(&directory)
         .map_err(|error| format!("cannot prepare the LuLu rule directory: {error}"))?;
     let file = directory.join(format!("Boxy-SV2-LuLu-block-{}.json", random_uuid_v4()));
@@ -495,20 +539,34 @@ fn create_lulu_import_rule() -> Result<HostBlockStatus, String> {
         )
     })?;
     let path = file.to_string_lossy().into_owned();
+    let installer_path = lulu_installer
+        .as_deref()
+        .map(|path| path.to_string_lossy().into_owned());
     let (legacy_hosts, warning) = macos_legacy_hosts_state();
     let mut status = lulu_status(
         Some(path.clone()),
-        lulu_import_instructions(Some(&path), legacy_hosts),
+        lulu_import_instructions(Some(&path), installer_path.as_deref(), legacy_hosts),
         legacy_hosts,
     );
+    status.installer_path = installer_path;
+    status.target_path = Some(executable.to_string_lossy().into_owned());
     status.warning = warning;
     Ok(status)
 }
 
 #[cfg(target_os = "macos")]
-fn lulu_import_instructions(artifact_path: Option<&str>, legacy_hosts: bool) -> String {
+fn lulu_import_instructions(
+    artifact_path: Option<&str>,
+    installer_path: Option<&str>,
+    legacy_hosts: bool,
+) -> String {
     let file = artifact_path
-        .map(|path| format!(" Select {path}."))
+        .map(|path| format!(" at {path}"))
+        .unwrap_or_default();
+    let installer = installer_path
+        .map(|path| format!(
+            " LuLu is not installed; the official {LULU_VERSION} disk image was downloaded to {path}. Open it, copy LuLu.app to /Applications, launch it, and approve its Network Filter and System Extension in System Settings."
+        ))
         .unwrap_or_default();
     let migration = legacy_hosts
         .then_some(
@@ -516,8 +574,114 @@ fn lulu_import_instructions(artifact_path: Option<&str>, legacy_hosts: bool) -> 
         )
         .unwrap_or_default();
     format!(
-        "Install LuLu 4.5.0 or newer, then choose LuLu > Rules > Import… and import the generated file.{file} Verify the imported rule is Block +kids. Boxy cannot verify LuLu state until LuLu applies the rule.{migration}"
+        "{installer} Create and activate a separate Boxy profile in LuLu, verify it has no unrelated user rules, then choose LuLu > Rules > Import… and import the JSON file{file}. LuLu's user-only import replaces existing user rules in the active profile. Keep your default profile unchanged. Verify the imported rule targets the SV2 executable and is Block +kids. Boxy cannot verify LuLu state and reports the network as unblocked until LuLu applies the rule.{migration}"
     )
+}
+
+#[cfg(target_os = "macos")]
+fn lulu_is_installed() -> bool {
+    [
+        PathBuf::from("/Applications/LuLu.app"),
+        dirs::home_dir()
+            .unwrap_or_default()
+            .join("Applications/LuLu.app"),
+    ]
+    .iter()
+    .any(|path| path.is_dir())
+}
+
+#[cfg(target_os = "macos")]
+fn download_lulu_installer(download_dir: &Path) -> Result<PathBuf, String> {
+    use std::io::Read;
+
+    let directory = download_dir.join("Boxy");
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("cannot prepare the LuLu download directory: {error}"))?;
+    let destination = directory.join(format!("LuLu_{LULU_VERSION}.dmg"));
+    if destination.is_file() && macos_sha256_matches(&destination, LULU_DMG_SHA256)? {
+        return Ok(destination);
+    }
+
+    let response = ureq::get(LULU_DMG_URL)
+        .timeout(std::time::Duration::from_secs(90))
+        .call()
+        .map_err(|error| format!("cannot download the official LuLu installer: {error}"))?;
+    if response.status() != 200 {
+        return Err(format!(
+            "cannot download the official LuLu installer (HTTP {})",
+            response.status()
+        ));
+    }
+    if response
+        .header("Content-Length")
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length != LULU_DMG_BYTES)
+    {
+        return Err(
+            "the LuLu installer size does not match Objective-See's published file".to_string(),
+        );
+    }
+
+    let temporary = directory.join(format!(".LuLu_{}.dmg.part", random_uuid_v4()));
+    let result = (|| {
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| format!("cannot create the LuLu download file: {error}"))?;
+        let mut reader = response.into_reader().take(MAX_LULU_DMG_BYTES + 1);
+        std::io::copy(&mut reader, &mut output)
+            .map_err(|error| format!("cannot save the LuLu installer: {error}"))?;
+        output
+            .sync_all()
+            .map_err(|error| format!("cannot save the LuLu installer: {error}"))?;
+        drop(output);
+        let length = fs::metadata(&temporary)
+            .map_err(|error| format!("cannot inspect the LuLu installer: {error}"))?
+            .len();
+        if length != LULU_DMG_BYTES {
+            return Err("the LuLu installer has an invalid size".to_string());
+        }
+        if !macos_sha256_matches(&temporary, LULU_DMG_SHA256)? {
+            return Err(
+                "the LuLu installer SHA-256 does not match Objective-See's published value"
+                    .to_string(),
+            );
+        }
+        fs::rename(&temporary, &destination)
+            .map_err(|error| format!("cannot finalize the LuLu installer: {error}"))?;
+        Ok(destination.clone())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn macos_sha256_matches(path: &Path, expected: &str) -> Result<bool, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut file =
+        fs::File::open(path).map_err(|error| format!("cannot read the LuLu installer: {error}"))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| format!("cannot verify the LuLu installer: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    let actual = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(actual.eq_ignore_ascii_case(expected))
 }
 
 #[cfg(target_os = "macos")]
@@ -526,7 +690,7 @@ fn lulu_removal_instructions(executable: Option<&Path>) -> String {
         .map(|path| format!(" for {}", path.display()))
         .unwrap_or_default();
     format!(
-        "Open LuLu > Rules and remove the Boxy SV2 Block rule{target}. Boxy does not modify LuLu's internal rules file or claim that the rule was removed."
+        "To unblock SV2, use LuLu's menu bar Profiles menu to switch from the Boxy profile to the Default profile; switch back to the Boxy profile to block it again. Profile switching changes LuLu's active rules and settings for the whole Mac. Boxy cannot read the active LuLu profile and keeps the status unverified. You can alternatively remove the Boxy SV2 Block rule{target} from the Boxy profile."
     )
 }
 
@@ -841,7 +1005,7 @@ fn block_targets() -> Result<BlockTargets, String> {
     let webview_library = runtime.join(WEBVIEW_LIBRARY);
     if !webview_executable.is_file() || !webview_library.is_file() {
         return Err(
-            "the bundled WebView2 runtime is incomplete; reinstall the Boxy package before enabling the network block"
+            "the private WebView2 runtime is incomplete; remove WebView2Runtime beside Boxy and retry"
                 .to_string(),
         );
     }
@@ -849,20 +1013,20 @@ fn block_targets() -> Result<BlockTargets, String> {
     reject_reparse_point(&webview_executable, "WebView2 executable")?;
     reject_reparse_point(&webview_library, "WebView2 library")?;
     let webview_runtime = runtime.canonicalize().map_err(|error| {
-        format!("cannot resolve the bundled WebView2 runtime directory: {error}")
+        format!("cannot resolve the private WebView2 runtime directory: {error}")
     })?;
     let webview_executable = webview_executable
         .canonicalize()
-        .map_err(|error| format!("cannot resolve the bundled WebView2 executable: {error}"))?;
+        .map_err(|error| format!("cannot resolve the private WebView2 executable: {error}"))?;
     let webview_library = webview_library
         .canonicalize()
-        .map_err(|error| format!("cannot resolve the bundled WebView2 library: {error}"))?;
+        .map_err(|error| format!("cannot resolve the private WebView2 library: {error}"))?;
     if !is_path_within(&boxy_root, &webview_runtime)
         || !is_path_within(&boxy_root, &webview_executable)
         || !is_path_within(&boxy_root, &webview_library)
     {
         return Err(
-            "the bundled WebView2 runtime resolves outside the Boxy installation; reinstall the Boxy package"
+            "the private WebView2 runtime resolves outside the Boxy installation; remove WebView2Runtime beside Boxy and retry"
                 .to_string(),
         );
     }
@@ -871,6 +1035,203 @@ fn block_targets() -> Result<BlockTargets, String> {
         webview_policy_directory: browser_executable_folder(&webview_runtime)?,
         webview_executable,
     })
+}
+
+#[cfg(any(windows, test))]
+#[derive(serde::Deserialize)]
+pub(crate) struct WebViewRuntimeManifest {
+    pub(crate) version: String,
+    pub(crate) url: String,
+    pub(crate) sha256: String,
+    pub(crate) size_bytes: u64,
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn webview_runtime_manifest() -> Result<WebViewRuntimeManifest, String> {
+    let manifest: WebViewRuntimeManifest = serde_json::from_str(WEBVIEW_RUNTIME_MANIFEST)
+        .map_err(|error| format!("WebView2 runtime manifest is invalid: {error}"))?;
+    let url = url::Url::parse(&manifest.url)
+        .map_err(|_| "WebView2 runtime download URL is invalid".to_string())?;
+    if manifest.version.split('.').count() != 4
+        || manifest
+            .version
+            .split('.')
+            .any(|part| part.parse::<u32>().is_err())
+        || manifest.sha256.len() != 64
+        || !manifest.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || manifest.size_bytes == 0
+        || url.scheme() != "https"
+        || url.host_str() != Some("msedge.sf.dl.delivery.mp.microsoft.com")
+        || !url.path().ends_with(".cab")
+    {
+        return Err("WebView2 runtime manifest failed validation".to_string());
+    }
+    Ok(manifest)
+}
+
+#[cfg(windows)]
+fn ensure_fixed_webview_runtime() -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    let manifest = webview_runtime_manifest()?;
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("cannot locate Boxy executable: {error}"))?;
+    let root = executable
+        .parent()
+        .ok_or_else(|| "Boxy executable has no parent directory".to_string())?;
+    let destination = root.join(WEBVIEW_RUNTIME_DIRECTORY);
+    if destination.exists() {
+        if destination.join(WEBVIEW_EXECUTABLE).is_file()
+            && destination.join(WEBVIEW_LIBRARY).is_file()
+            && fs::read_to_string(destination.join(WEBVIEW_RUNTIME_MARKER))
+                .is_ok_and(|marker| marker == runtime_marker(&manifest))
+        {
+            return Ok(());
+        }
+        return Err(
+            "the installed WebView2 Fixed Runtime is incomplete; remove it and retry".to_string(),
+        );
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_nanos();
+    let staging = root.join(format!(".boxy-webview2-{}-{nonce}", std::process::id()));
+    fs::create_dir(&staging)
+        .map_err(|error| format!("cannot create WebView2 runtime staging directory: {error}"))?;
+    let result = (|| {
+        let cab = staging.join(format!(
+            "Microsoft.WebView2.FixedVersionRuntime.{}.x64.cab",
+            manifest.version
+        ));
+        let response = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(30))
+            .timeout_read(Duration::from_secs(120))
+            .build()
+            .get(&manifest.url)
+            .call()
+            .map_err(|error| {
+                format!("cannot download Microsoft WebView2 Fixed Runtime: {error}")
+            })?;
+        if let Some(length) = response.header("Content-Length") {
+            if length.parse::<u64>().ok() != Some(manifest.size_bytes) {
+                return Err(
+                    "Microsoft WebView2 Fixed Runtime download has an unexpected size".to_string(),
+                );
+            }
+        }
+        let mut reader = response.into_reader();
+        let mut output = fs::File::create(&cab)
+            .map_err(|error| format!("cannot create WebView2 runtime download file: {error}"))?;
+        let mut hasher = Sha256::new();
+        let mut downloaded = 0u64;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = reader
+                .read(&mut buffer)
+                .map_err(|error| format!("WebView2 runtime download failed: {error}"))?;
+            if count == 0 {
+                break;
+            }
+            downloaded = downloaded.saturating_add(count as u64);
+            if downloaded > manifest.size_bytes {
+                return Err(
+                    "Microsoft WebView2 Fixed Runtime download exceeded its expected size"
+                        .to_string(),
+                );
+            }
+            hasher.update(&buffer[..count]);
+            output
+                .write_all(&buffer[..count])
+                .map_err(|error| format!("cannot write WebView2 runtime download: {error}"))?;
+        }
+        output
+            .sync_all()
+            .map_err(|error| format!("cannot flush WebView2 runtime download: {error}"))?;
+        drop(output);
+        if downloaded != manifest.size_bytes {
+            return Err("Microsoft WebView2 Fixed Runtime download was incomplete".to_string());
+        }
+        let actual_digest = format!("{:x}", hasher.finalize());
+        if !actual_digest.eq_ignore_ascii_case(&manifest.sha256) {
+            return Err("Microsoft WebView2 Fixed Runtime SHA-256 verification failed".to_string());
+        }
+
+        let extract = staging.join("extract");
+        fs::create_dir(&extract)
+            .map_err(|error| format!("cannot create WebView2 extraction directory: {error}"))?;
+        let status = std::process::Command::new("expand.exe")
+            .arg(&cab)
+            .arg("-F:*")
+            .arg(&extract)
+            .status()
+            .map_err(|error| format!("cannot start Windows CAB extraction: {error}"))?;
+        if !status.success() {
+            return Err("Microsoft WebView2 Fixed Runtime CAB extraction failed".to_string());
+        }
+        let directory_name = format!(
+            "Microsoft.WebView2.FixedVersionRuntime.{}.x64",
+            manifest.version
+        );
+        let extracted = find_runtime_directory(&extract, &directory_name)?;
+        if !extracted.join(WEBVIEW_EXECUTABLE).is_file()
+            || !extracted.join(WEBVIEW_LIBRARY).is_file()
+        {
+            return Err(
+                "verified Microsoft CAB does not contain the complete requested runtime"
+                    .to_string(),
+            );
+        }
+        fs::write(
+            extracted.join(WEBVIEW_RUNTIME_MARKER),
+            runtime_marker(&manifest),
+        )
+        .map_err(|error| format!("cannot mark the verified WebView2 runtime: {error}"))?;
+        fs::rename(&extracted, &destination)
+            .map_err(|error| format!("cannot install the verified WebView2 runtime: {error}"))?;
+        Ok(())
+    })();
+    let _ = fs::remove_dir_all(&staging);
+    result
+}
+
+#[cfg(windows)]
+fn runtime_marker(manifest: &WebViewRuntimeManifest) -> String {
+    format!(
+        "{}\n{}\n",
+        manifest.version,
+        manifest.sha256.to_ascii_lowercase()
+    )
+}
+
+#[cfg(windows)]
+fn find_runtime_directory(root: &Path, expected_name: &str) -> Result<PathBuf, String> {
+    let mut matches = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)
+            .map_err(|error| format!("cannot inspect extracted WebView2 runtime: {error}"))?
+        {
+            let entry = entry
+                .map_err(|error| format!("cannot inspect extracted WebView2 runtime: {error}"))?;
+            let path = entry.path();
+            if path.is_dir() {
+                if entry.file_name().to_string_lossy() == expected_name {
+                    matches.push(path.clone());
+                }
+                pending.push(path);
+            }
+        }
+    }
+    if matches.len() != 1 {
+        return Err(
+            "verified Microsoft CAB does not contain exactly one requested runtime directory"
+                .to_string(),
+        );
+    }
+    Ok(matches.remove(0))
 }
 
 #[cfg(windows)]
@@ -886,7 +1247,7 @@ fn reject_reparse_point(path: &Path, item: &str) -> Result<(), String> {
     }
     if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(format!(
-            "the {item} is a link or junction; reinstall the Boxy package with an unpacked private WebView2 runtime"
+            "the {item} is a link or junction; remove WebView2Runtime beside Boxy and retry"
         ));
     }
     Ok(())
@@ -913,14 +1274,14 @@ pub(crate) fn browser_executable_folder(runtime: &Path) -> Result<String, String
     let runtime = runtime.to_string_lossy();
     if runtime.starts_with(r"\\?\UNC\") {
         return Err(
-            "the bundled WebView2 runtime must be installed in an absolute local drive path; reinstall the Boxy package outside a network share"
+            "the private WebView2 runtime must be installed in an absolute local drive path; move Boxy outside a network share and retry"
                 .to_string(),
         );
     }
     let runtime = runtime.strip_prefix(r"\\?\").unwrap_or(&runtime);
     if runtime.starts_with(r"\\") || !Path::new(runtime).is_absolute() {
         return Err(
-            "the bundled WebView2 runtime must be installed in an absolute local drive path; reinstall the Boxy package outside a network share"
+            "the private WebView2 runtime must be installed in an absolute local drive path; move Boxy outside a network share and retry"
                 .to_string(),
         );
     }
@@ -931,12 +1292,12 @@ pub(crate) fn browser_executable_folder(runtime: &Path) -> Result<String, String
 fn wfp_app_ids(targets: &BlockTargets) -> Result<WfpAppIds, String> {
     Ok(WfpAppIds {
         sv2: wfp_app_id(&targets.sv2_executable, "installed SV2")?,
-        webview: wfp_app_id(&targets.webview_executable, "bundled WebView2")?,
+        webview: wfp_app_id(&targets.webview_executable, "private WebView2")?,
     })
 }
 
 #[cfg(windows)]
-fn wfp_app_id(executable: &Path, name: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn wfp_app_id(executable: &Path, name: &str) -> Result<Vec<u8>, String> {
     let executable = wide(executable.as_os_str());
     let mut app_id = std::ptr::null_mut();
     wfp_result(
@@ -950,11 +1311,7 @@ fn wfp_app_id(executable: &Path, name: &str) -> Result<Vec<u8>, String> {
     )?;
     if app_id.is_null() || unsafe { (*app_id).data.is_null() } {
         if !app_id.is_null() {
-            unsafe {
-                windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFreeMemory0(
-                    (&mut app_id).cast(),
-                )
-            };
+            unsafe { free_wfp_memory(&mut app_id) };
         }
         return Err(format!(
             "Windows returned an empty {name} WFP application identifier"
@@ -962,12 +1319,21 @@ fn wfp_app_id(executable: &Path, name: &str) -> Result<Vec<u8>, String> {
     }
     let bytes =
         unsafe { std::slice::from_raw_parts((*app_id).data, (*app_id).size as usize).to_vec() };
-    unsafe {
-        windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFreeMemory0(
-            (&mut app_id).cast(),
-        )
-    };
+    unsafe { free_wfp_memory(&mut app_id) };
     Ok(bytes)
+}
+
+#[cfg(windows)]
+pub(crate) fn wfp_byte_blob(
+    data: &mut [u8],
+) -> Result<windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_BYTE_BLOB, String>
+{
+    use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_BYTE_BLOB;
+    Ok(FWP_BYTE_BLOB {
+        size: u32::try_from(data.len())
+            .map_err(|_| "WFP application identifier is too large".to_string())?,
+        data: data.as_mut_ptr(),
+    })
 }
 
 #[cfg(windows)]
@@ -978,7 +1344,7 @@ unsafe fn wfp_sublayer_is_valid(
         && sublayer.flags
             & windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_SUBLAYER_FLAG_PERSISTENT
             != 0
-        && sublayer.weight == 0xffff
+        && sublayer.weight == WFP_SUBLAYER_WEIGHT
 }
 
 #[cfg(windows)]
@@ -988,12 +1354,13 @@ unsafe fn wfp_filter_is_valid(
     expected_app_id: &[u8],
 ) -> bool {
     use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
-        FWPM_CONDITION_ALE_APP_ID, FWPM_FILTER_FLAG_PERSISTENT, FWP_ACTION_BLOCK,
-        FWP_BYTE_BLOB_TYPE, FWP_MATCH_EQUAL,
+        FWPM_CONDITION_ALE_APP_ID, FWPM_FILTER_FLAG_DISABLED, FWPM_FILTER_FLAG_PERSISTENT,
+        FWP_ACTION_BLOCK, FWP_BYTE_BLOB_TYPE, FWP_MATCH_EQUAL,
     };
     if !guid_is(filter.layerKey, layer)
         || !guid_is(filter.subLayerKey, WFP_SUBLAYER)
         || filter.flags & FWPM_FILTER_FLAG_PERSISTENT == 0
+        || filter.flags & FWPM_FILTER_FLAG_DISABLED != 0
         || filter.action.r#type != FWP_ACTION_BLOCK
         || filter.numFilterConditions != 1
         || filter.filterCondition.is_null()
@@ -1024,6 +1391,22 @@ fn guid_is(left: windows_sys::core::GUID, right: windows_sys::core::GUID) -> boo
 }
 
 #[cfg(windows)]
+fn set_blocked_elevated(blocked: bool) -> Result<HostBlockStatus, String> {
+    if blocked {
+        let sv2_executable = crate::session_io::windows_executable()?;
+        if sv2_is_running(&sv2_executable)? {
+            return Err(
+                "close Synthesizer V Studio 2 before enabling the network block".to_string(),
+            );
+        }
+        ensure_fixed_webview_runtime()?;
+        let targets = block_targets()?;
+        ensure_no_webview_runtime_override(&targets)?;
+    }
+    set_wfp_blocked(blocked)
+}
+
+#[cfg(windows)]
 fn set_wfp_blocked(blocked: bool) -> Result<HostBlockStatus, String> {
     use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
         FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0,
@@ -1037,6 +1420,14 @@ fn set_wfp_blocked(blocked: bool) -> Result<HostBlockStatus, String> {
         }
         ensure_no_webview_runtime_override(targets)?;
         ensure_webview_runtime_access(Path::new(&targets.webview_policy_directory))?;
+    }
+    if blocked {
+        let current = wfp_status()?;
+        if current.blocked {
+            let engine = open_wfp_engine()?;
+            grant_wfp_read_access(&engine)?;
+            return wfp_status();
+        }
     }
     let engine = open_wfp_engine()?;
     wfp_result(
@@ -1073,6 +1464,18 @@ fn set_wfp_blocked(blocked: bool) -> Result<HostBlockStatus, String> {
         unsafe { FwpmTransactionAbort0(engine.0) };
         return Err(rollback_policy_change(policy_change, error));
     }
+    if blocked {
+        if let Err(error) = grant_wfp_read_access(&engine) {
+            let rollback = rollback_committed_wfp_block(&engine);
+            let error = match rollback {
+                Ok(()) => error,
+                Err(rollback_error) => {
+                    format!("{error}; WFP rule cleanup also failed: {rollback_error}")
+                }
+            };
+            return Err(rollback_policy_change(policy_change, error));
+        }
+    }
     let cleanup_warning = cleanup_legacy_windows_hosts().err();
     let mut current = wfp_status()?;
     if current.blocked != blocked {
@@ -1086,6 +1489,29 @@ fn set_wfp_blocked(blocked: bool) -> Result<HostBlockStatus, String> {
         });
     }
     Ok(current)
+}
+
+#[cfg(windows)]
+fn rollback_committed_wfp_block(engine: &WfpEngine) -> Result<(), String> {
+    use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
+        FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0,
+    };
+    wfp_result(
+        unsafe { FwpmTransactionBegin0(engine.0, 0) },
+        "begin WFP cleanup transaction",
+    )?;
+    if let Err(error) = remove_wfp_filters(engine) {
+        unsafe { FwpmTransactionAbort0(engine.0) };
+        return Err(error);
+    }
+    if let Err(error) = wfp_result(
+        unsafe { FwpmTransactionCommit0(engine.0) },
+        "commit WFP cleanup transaction",
+    ) {
+        unsafe { FwpmTransactionAbort0(engine.0) };
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1254,14 +1680,14 @@ fn ensure_webview_runtime_access(runtime: &Path) -> Result<(), String> {
         .output()
         .map_err(|error| {
             format!(
-                "cannot grant the bundled WebView2 runtime the AppContainer read-and-execute access required on Windows 10: {error}"
+                "cannot grant the private WebView2 runtime the AppContainer read-and-execute access required on Windows 10: {error}"
             )
         })?;
     if output.status.success() {
         Ok(())
     } else {
         Err(
-            "cannot grant the bundled WebView2 runtime the AppContainer read-and-execute access required on Windows 10; repair the Boxy installation and try again"
+            "cannot grant the private WebView2 runtime the AppContainer read-and-execute access required on Windows 10; check the Boxy folder permissions and retry"
                 .to_string(),
         )
     }
@@ -1551,28 +1977,15 @@ pub(crate) fn same_windows_path(left: &str, right: &str) -> bool {
 fn install_wfp_filters(engine: &WfpEngine, targets: &BlockTargets) -> Result<(), String> {
     use std::ptr::null_mut;
     use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
-        FwpmFilterAdd0, FwpmFilterDeleteByKey0, FwpmFreeMemory0, FwpmGetAppIdFromFileName0,
-        FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0, FWPM_ACTION0, FWPM_CONDITION_ALE_APP_ID,
-        FWPM_DISPLAY_DATA0, FWPM_FILTER0, FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_PERSISTENT,
-        FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_SUBLAYER0,
-        FWPM_SUBLAYER_FLAG_PERSISTENT, FWP_ACTION_BLOCK, FWP_BYTE_BLOB_TYPE, FWP_CONDITION_VALUE0,
-        FWP_CONDITION_VALUE0_0, FWP_MATCH_EQUAL,
+        FwpmFilterAdd0, FwpmFilterDeleteByKey0, FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0,
+        FWPM_ACTION0, FWPM_CONDITION_ALE_APP_ID, FWPM_DISPLAY_DATA0, FWPM_FILTER0,
+        FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_PERSISTENT, FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+        FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_SUBLAYER0, FWPM_SUBLAYER_FLAG_PERSISTENT,
+        FWP_ACTION_BLOCK, FWP_BYTE_BLOB_TYPE, FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0,
+        FWP_MATCH_EQUAL,
     };
-    let sv2_executable = wide(targets.sv2_executable.as_os_str());
-    let webview_executable = wide(targets.webview_executable.as_os_str());
-    let mut sv2_app_id = null_mut();
-    let mut webview_app_id = null_mut();
-    wfp_result(
-        unsafe { FwpmGetAppIdFromFileName0(sv2_executable.as_ptr(), &mut sv2_app_id) },
-        "derive the SV2 WFP application identifier",
-    )?;
-    if let Err(error) = wfp_result(
-        unsafe { FwpmGetAppIdFromFileName0(webview_executable.as_ptr(), &mut webview_app_id) },
-        "derive the bundled WebView2 WFP application identifier",
-    ) {
-        unsafe { FwpmFreeMemory0((&mut sv2_app_id).cast()) };
-        return Err(error);
-    }
+    let sv2_app_id = wfp_app_id(&targets.sv2_executable, "installed SV2")?;
+    let webview_app_id = wfp_app_id(&targets.webview_executable, "private WebView2")?;
     let result = (|| {
         for key in [
             WFP_FILTER_V4,
@@ -1599,7 +2012,7 @@ fn install_wfp_filters(engine: &WfpEngine, targets: &BlockTargets) -> Result<(),
             flags: FWPM_SUBLAYER_FLAG_PERSISTENT,
             providerKey: null_mut(),
             providerData: Default::default(),
-            weight: 0xffff,
+            weight: WFP_SUBLAYER_WEIGHT,
         };
         wfp_result(
             unsafe { FwpmSubLayerAdd0(engine.0, &sublayer, null_mut()) },
@@ -1610,34 +2023,38 @@ fn install_wfp_filters(engine: &WfpEngine, targets: &BlockTargets) -> Result<(),
                 WFP_FILTER_V4,
                 FWPM_LAYER_ALE_AUTH_CONNECT_V4,
                 "Block SV2 network (IPv4)",
-                sv2_app_id,
+                sv2_app_id.as_slice(),
             ),
             (
                 WFP_FILTER_V6,
                 FWPM_LAYER_ALE_AUTH_CONNECT_V6,
                 "Block SV2 network (IPv6)",
-                sv2_app_id,
+                sv2_app_id.as_slice(),
             ),
             (
                 WFP_FILTER_WEBVIEW_V4,
                 FWPM_LAYER_ALE_AUTH_CONNECT_V4,
                 "Block SV2 WebView2 network (IPv4)",
-                webview_app_id,
+                webview_app_id.as_slice(),
             ),
             (
                 WFP_FILTER_WEBVIEW_V6,
                 FWPM_LAYER_ALE_AUTH_CONNECT_V6,
                 "Block SV2 WebView2 network (IPv6)",
-                webview_app_id,
+                webview_app_id.as_slice(),
             ),
         ] {
             let mut name = wide(OsStr::new(name));
+            let mut app_id_bytes = app_id.to_vec();
+            let mut app_blob = wfp_byte_blob(&mut app_id_bytes)?;
             let mut condition = FWPM_FILTER_CONDITION0 {
                 fieldKey: FWPM_CONDITION_ALE_APP_ID,
                 matchType: FWP_MATCH_EQUAL,
                 conditionValue: FWP_CONDITION_VALUE0 {
                     r#type: FWP_BYTE_BLOB_TYPE,
-                    Anonymous: FWP_CONDITION_VALUE0_0 { byteBlob: app_id },
+                    Anonymous: FWP_CONDITION_VALUE0_0 {
+                        byteBlob: &mut app_blob,
+                    },
                 },
             };
             let filter = FWPM_FILTER0 {
@@ -1670,10 +2087,182 @@ fn install_wfp_filters(engine: &WfpEngine, targets: &BlockTargets) -> Result<(),
         }
         Ok(())
     })();
-    unsafe {
-        FwpmFreeMemory0((&mut sv2_app_id).cast());
-        FwpmFreeMemory0((&mut webview_app_id).cast());
+    result
+}
+
+#[cfg(windows)]
+fn grant_wfp_read_access(engine: &WfpEngine) -> Result<(), String> {
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
+        FwpmFilterGetSecurityInfoByKey0, FwpmFilterSetSecurityInfoByKey0,
+        FwpmSubLayerGetSecurityInfoByKey0, FwpmSubLayerSetSecurityInfoByKey0, FWPM_ACTRL_READ,
     };
+    use windows_sys::Win32::Security::Authorization::{
+        EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, TRUSTEE_IS_SID,
+        TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::{
+        CreateWellKnownSid, WinAuthenticatedUserSid, DACL_SECURITY_INFORMATION,
+        SECURITY_MAX_SID_SIZE,
+    };
+
+    let mut sid_storage = [0usize; (SECURITY_MAX_SID_SIZE as usize).div_ceil(size_of::<usize>())];
+    let sid = sid_storage.as_mut_ptr().cast();
+    let mut sid_size = SECURITY_MAX_SID_SIZE;
+    if unsafe { CreateWellKnownSid(WinAuthenticatedUserSid, null_mut(), sid, &mut sid_size) } == 0 {
+        return Err("cannot create Authenticated Users SID".to_string());
+    }
+    let access = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: FWPM_ACTRL_READ,
+        grfAccessMode: GRANT_ACCESS,
+        grfInheritance: 0,
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_WELL_KNOWN_GROUP,
+            ptstrName: sid.cast(),
+        },
+    };
+
+    let key = WFP_SUBLAYER;
+    grant_wfp_object_read_access(
+        engine,
+        Some(&key),
+        &access,
+        |engine, key, descriptor, dacl| unsafe {
+            FwpmSubLayerGetSecurityInfoByKey0(
+                engine,
+                key,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                dacl,
+                null_mut(),
+                descriptor,
+            )
+        },
+        |engine, key, dacl| unsafe {
+            FwpmSubLayerSetSecurityInfoByKey0(
+                engine,
+                key,
+                DACL_SECURITY_INFORMATION,
+                null(),
+                null(),
+                dacl,
+                null(),
+            )
+        },
+    )?;
+    let filter_keys = [
+        WFP_FILTER_V4,
+        WFP_FILTER_V6,
+        WFP_FILTER_WEBVIEW_V4,
+        WFP_FILTER_WEBVIEW_V6,
+    ];
+    for key in filter_keys {
+        grant_wfp_object_read_access(
+            engine,
+            Some(&key),
+            &access,
+            |engine, key, descriptor, dacl| unsafe {
+                FwpmFilterGetSecurityInfoByKey0(
+                    engine,
+                    key,
+                    DACL_SECURITY_INFORMATION,
+                    null_mut(),
+                    null_mut(),
+                    dacl,
+                    null_mut(),
+                    descriptor,
+                )
+            },
+            |engine, key, dacl| unsafe {
+                FwpmFilterSetSecurityInfoByKey0(
+                    engine,
+                    key,
+                    DACL_SECURITY_INFORMATION,
+                    null(),
+                    null(),
+                    dacl,
+                    null(),
+                )
+            },
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn grant_wfp_object_read_access<G, S>(
+    engine: &WfpEngine,
+    key: Option<&windows_sys::core::GUID>,
+    access: &windows_sys::Win32::Security::Authorization::EXPLICIT_ACCESS_W,
+    get_security: G,
+    set_security: S,
+) -> Result<(), String>
+where
+    G: FnOnce(
+        windows_sys::Win32::Foundation::HANDLE,
+        *const windows_sys::core::GUID,
+        *mut windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+        *mut *mut windows_sys::Win32::Security::ACL,
+    ) -> u32,
+    S: FnOnce(
+        windows_sys::Win32::Foundation::HANDLE,
+        *const windows_sys::core::GUID,
+        *const windows_sys::Win32::Security::ACL,
+    ) -> u32,
+{
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows_sys::Win32::Security::Authorization::SetEntriesInAclW;
+    use windows_sys::Win32::Security::{GetSecurityDescriptorDacl, ACL, PSECURITY_DESCRIPTOR};
+
+    let key = key.map_or(null(), |key| key as *const _);
+    let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+    let mut original_dacl: *mut ACL = null_mut();
+    let get_result = get_security(engine.0, key, &mut descriptor, &mut original_dacl);
+    if get_result != 0 {
+        return Err(format!(
+            "cannot read WFP object security descriptor (error 0x{get_result:08x})"
+        ));
+    }
+    let result = (|| {
+        let mut dacl_present = 0;
+        let mut dacl_defaulted = 0;
+        let mut descriptor_dacl: *mut ACL = null_mut();
+        if unsafe {
+            GetSecurityDescriptorDacl(
+                descriptor,
+                &mut dacl_present,
+                &mut descriptor_dacl,
+                &mut dacl_defaulted,
+            )
+        } == 0
+        {
+            return Err("cannot inspect WFP object DACL".to_string());
+        }
+        if dacl_present == 0 || descriptor_dacl.is_null() {
+            return Err("WFP object has a null or absent DACL".to_string());
+        }
+        let mut new_dacl: *mut ACL = null_mut();
+        let acl_result = unsafe { SetEntriesInAclW(1, access, original_dacl, &mut new_dacl) };
+        if acl_result != 0 {
+            return Err(format!(
+                "cannot extend WFP object DACL (error 0x{acl_result:08x})"
+            ));
+        }
+        let set_result = set_security(engine.0, key, new_dacl);
+        unsafe { LocalFree(new_dacl.cast::<core::ffi::c_void>() as HLOCAL) };
+        if set_result != 0 {
+            return Err(format!(
+                "cannot grant read access to WFP object (error 0x{set_result:08x})"
+            ));
+        }
+        Ok(())
+    })();
+    unsafe { free_wfp_memory(&mut descriptor) };
     result
 }
 
