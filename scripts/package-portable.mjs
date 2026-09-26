@@ -72,7 +72,7 @@ function packageMac() {
   chmodSync(appBinary, 0o755);
   writeFileSync(join(contentsDir, "Info.plist"), infoPlist(version));
 
-  writeFileSync(join(resourcesDir, "boxy-pen.svg"), readFileSync(resolve(repositoryRoot, "assets/boxy-pen.svg")));
+  copyFileSync(resolve(repositoryRoot, "assets/boxy-pen.icns"), join(resourcesDir, "boxy-pen.icns"));
 
   try {
     execFileSync("codesign", ["--force", "--deep", "--sign", "-", appDir], { stdio: "ignore" });
@@ -97,33 +97,14 @@ function packageMac() {
 
 function packageWindows() {
   const bundleName = "boxy-windows-x64";
-  const bundleDir = join(outputDir, bundleName);
   const zipPath = join(outputDir, `${bundleName}.zip`);
+  const exePath = join(outputDir, `${bundleName}.exe`);
   mkdirSync(outputDir, { recursive: true });
-  rmSync(bundleDir, { recursive: true, force: true });
   rmSync(zipPath, { force: true });
-  mkdirSync(bundleDir, { recursive: true });
-  const exePath = join(bundleDir, "boxy.exe");
+  rmSync(join(outputDir, bundleName), { recursive: true, force: true });
+  rmSync(exePath, { force: true });
   copyFileSync(binaryPath, exePath);
-  chmodSync(exePath, 0o755);
-  createWindowsZip(bundleName, zipPath);
-
-  report([bundleDir, zipPath]);
-}
-
-function createWindowsZip(bundleName, zipPath) {
-  try {
-    execFileSync("tar", ["-a", "-c", "-f", zipPath, "-C", outputDir, bundleName], { stdio: "ignore" });
-  } catch {
-    execFileSync(
-      "powershell",
-      ["-NoProfile", "-Command", "Compress-Archive -LiteralPath $args[0] -DestinationPath $args[1] -Force", join(outputDir, bundleName), zipPath],
-      { stdio: "ignore" },
-    );
-  }
-  if (!existsSync(zipPath) || !statSync(zipPath).isFile()) {
-    fail("Windows bundle archive was not created.");
-  }
+  report([exePath]);
 }
 
 function infoPlist(version) {
@@ -137,6 +118,8 @@ function infoPlist(version) {
 \t<string>Boxy</string>
 \t<key>CFBundleExecutable</key>
 \t<string>boxy</string>
+\t<key>CFBundleIconFile</key>
+\t<string>boxy-pen.icns</string>
 \t<key>CFBundleIdentifier</key>
 \t<string>app.boxy.bridge</string>
 \t<key>CFBundleVersion</key>
