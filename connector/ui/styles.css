@@ -1,0 +1,30 @@
+html, body { margin: 0; min-height: 100%; }
+body { background: var(--fluent-bg); color: var(--fluent-text); font: 14px/1.5 var(--fluent-font); }
+.window { box-sizing: border-box; padding: 24px; min-height: 100vh; }
+.header { display: flex; align-items: center; gap: 14px; margin-bottom: 26px; }
+.logo { width: 44px; height: 44px; flex: none; }
+.logo svg { display: block; width: 100%; height: 100%; }
+html[data-fluent-theme="light"] .logo svg path[fill="#f5f5f5"] { fill: #242424; }
+.brand { flex: 1; }
+h1, h2, p { margin: 0; }
+h1 { font-size: 21px; line-height: 1.2; font-weight: 650; }
+.brand p, .description, .disclosure, .remote-label { color: var(--fluent-muted); }
+.brand p { font-size: 12px; }
+h2 { font-size: 17px; line-height: 1.3; font-weight: 620; }
+.description { margin: 10px 0 20px; }
+.fluent-field { display: block; }
+.fluent-field__label { display: block; margin-bottom: 7px; }
+.fluent-field__input { box-sizing: border-box; width: 100%; height: 38px; }
+.actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+.fluent-button { min-height: 34px; }
+.theme-button { min-width: 34px; padding: 0; font-size: 19px; }
+.disclosure { margin-top: 22px; font-size: 12px; line-height: 1.55; }
+.error { color: var(--fluent-danger); margin-top: 10px; }
+.view[hidden], [hidden] { display: none !important; }
+.status-heading { display: flex; align-items: center; gap: 10px; }
+.status-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--fluent-warning); flex: none; }
+.status-dot.ready { background: var(--fluent-success); }
+.status-dot.failed { background: var(--fluent-danger); }
+.remote-label { margin: 8px 0 20px 20px; overflow-wrap: anywhere; font-size: 12px; }
+.status-message { min-height: 56px; }
+.status-actions { margin-top: 20px; justify-content: space-between; }

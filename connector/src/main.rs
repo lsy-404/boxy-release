@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod assets;
+mod device_ids;
 mod device_info;
 mod host_block;
 mod product_database;
@@ -9,7 +9,7 @@ mod session_io;
 
 use std::{
     env,
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -18,8 +18,6 @@ use std::{
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use rand_core::OsRng;
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -33,7 +31,6 @@ const REQUEST_PATH: &str = "/api/v2/connector/operations";
 #[derive(Debug)]
 struct Config {
     server_url: String,
-    server_public_key: VerifyingKey,
     session_path: PathBuf,
 }
 
@@ -41,24 +38,9 @@ struct Config {
 #[serde(rename_all = "camelCase")]
 struct ConnectorStartRequest {
     ciphertext: String,
-    source_sha256: String,
     machine: MachineReport,
-    device_public_key: String,
-    connector_version: String,
-    directory_manifest: Vec<DirectoryEntry>,
     installed_applications: Vec<String>,
     device_info: device_info::DeviceInfo,
-    server_translations: Vec<assets::ServerTranslationCatalog>,
-    cached_product_logos: Vec<assets::CachedProductLogo>,
-    session_path: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DirectoryEntry {
-    path: String,
-    size: u64,
-    sha256: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -68,6 +50,8 @@ struct MachineReport {
     machine_material: String,
     details: DeviceDetails,
     is_virtual_machine: bool,
+    hardware_device_id: String,
+    sv_device_hash: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -90,9 +74,6 @@ struct ConnectorStartResponse {
 struct ConnectorOperationResponse {
     state: String,
     ciphertext: Option<String>,
-    source_sha256: Option<String>,
-    expires_at: Option<String>,
-    server_signature: Option<String>,
     #[serde(default)]
     directory_tasks: Vec<DirectoryTask>,
 }
@@ -122,13 +103,6 @@ struct DirectoryTask {
     product_id: Option<String>,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ConnectorReceipt {
-    source_sha256: String,
-    written_sha256: String,
-}
-
 fn main() {
     if let Some(code) = host_block::run_elevated_host_block_if_requested() {
         std::process::exit(code);
@@ -146,30 +120,14 @@ fn main() {
 }
 
 fn run() -> Result<i32, String> {
-    let Some(config) = Config::from_environment_and_args()? else {
-        return Ok(0);
-    };
-    let status = service_selection::RunningStatus::open(&config.server_url)?;
-    let result = run_connected(&config, &status);
-    if status.cancelled() {
-        return Ok(0);
-    }
-    #[cfg(windows)]
-    {
-        match &result {
-            Ok(()) => {
-                status.finish("The signed session writeback was verified. You can close Boxy.")
-            }
-            Err(error) => status.finish(&format!("Connection failed: {error}")),
-        }
-        status.wait_for_close();
-        Ok(i32::from(result.is_err()))
-    }
-    #[cfg(not(windows))]
-    {
-        result?;
-        Ok(0)
-    }
+    let launch = LaunchOptions::from_environment_and_args()?;
+    service_selection::run_window(&launch.initial_url, move |server_url, status| {
+        let config = Config {
+            server_url,
+            session_path: launch.session_path,
+        };
+        run_connected(&config, &status)
+    })
 }
 
 fn run_connected(config: &Config, status: &service_selection::RunningStatus) -> Result<(), String> {
@@ -177,20 +135,12 @@ fn run_connected(config: &Config, status: &service_selection::RunningStatus) -> 
     let ciphertext = read_session_ciphertext(&config.session_path)?;
     let source_sha256 = sha256_base64url(&ciphertext);
     let machine = machine_report()?;
-    let device_key = load_or_create_device_key()?;
     status.ensure_active()?;
     let request = ConnectorStartRequest {
         ciphertext: URL_SAFE_NO_PAD.encode(&ciphertext),
-        source_sha256: source_sha256.clone(),
         machine,
-        device_public_key: URL_SAFE_NO_PAD.encode(device_key.verifying_key().as_bytes()),
-        connector_version: env!("CARGO_PKG_VERSION").to_string(),
-        directory_manifest: directory_manifest(&sv2_root(&config.session_path)?)?,
         installed_applications: installed_applications(),
         device_info: device_info::collect(),
-        server_translations: assets::server_translations(&config.session_path),
-        cached_product_logos: assets::cached_product_logos(&config.session_path),
-        session_path: config.session_path.to_string_lossy().into_owned(),
     };
     status.update("Connecting to the selected remote...");
     status.ensure_active()?;
@@ -202,42 +152,30 @@ fn run_connected(config: &Config, status: &service_selection::RunningStatus) -> 
     }
     let browser_url = validate_browser_url(&config.server_url, &response.browser_url)?;
     status.ensure_active()?;
-    status.set_editor_url(browser_url.as_str());
+    let mut stable_editor_url = browser_url.clone();
+    stable_editor_url.set_query(None);
     status.update("Opening the remote editor in your browser...");
     webbrowser::open(browser_url.as_str())
         .map_err(|error| format!("cannot open the authorization browser page: {error}"))?;
+    status.set_editor_url(stable_editor_url.as_str());
     status.update("Browser opened. Waiting for the selected remote...");
-    #[cfg(not(windows))]
-    show_message(
-        "Boxy is running",
-        "The selected remote is open in your browser. Keep this app running while you use it; Boxy will verify the signed session writeback when the remote finishes.",
-        MessageLevel::Info,
-    );
-    wait_for_writeback(
-        config,
-        &device_key,
-        &response.operation_id,
-        &source_sha256,
-        status,
-    )?;
-    status.update("The signed session writeback was verified.");
-    #[cfg(not(windows))]
-    show_message(
-        "Boxy",
-        "The selected remote finished, and the signed session writeback was verified.",
-        MessageLevel::Info,
-    );
+    wait_for_writeback(config, &response.operation_id, &source_sha256, status)?;
+    status.update("The remote session was written back.");
     Ok(())
 }
 
-impl Config {
-    fn from_environment_and_args() -> Result<Option<Self>, String> {
+struct LaunchOptions {
+    initial_url: String,
+    session_path: PathBuf,
+}
+
+impl LaunchOptions {
+    fn from_environment_and_args() -> Result<Self, String> {
         let mut server_url = env::var("BOXY_API_URL").ok().or_else(|| {
             env::current_exe()
                 .ok()
                 .and_then(|path| service_selection::inferred_service_url(&path))
         });
-        let mut server_public_key = env::var("BOXY_SERVER_PUBLIC_KEY").ok();
         let mut session_path = None;
         let mut arguments = env::args().skip(1);
         while let Some(argument) = arguments.next() {
@@ -249,13 +187,6 @@ impl Config {
                             .ok_or_else(|| "--server requires a URL".to_string())?,
                     )
                 }
-                "--server-public-key" => {
-                    server_public_key = Some(
-                        arguments
-                            .next()
-                            .ok_or_else(|| "--server-public-key requires a key".to_string())?,
-                    )
-                }
                 "--session" => {
                     session_path = Some(PathBuf::from(
                         arguments
@@ -264,41 +195,20 @@ impl Config {
                     ))
                 }
                 "--help" | "-h" => {
-                    return Err(
-                        "usage: boxy [--server URL] [--server-public-key BASE64] [--session PATH]"
-                            .to_string(),
-                    )
+                    return Err("usage: boxy [--server URL] [--session PATH]".to_string())
                 }
                 _ => return Err(format!("unknown argument: {argument}")),
             }
         }
-        let Some((server_url, server_public_key)) = service_selection::choose_service(
-            server_url.as_deref().unwrap_or_default(),
-            server_public_key.as_deref().unwrap_or_default(),
-        )?
-        else {
-            return Ok(None);
-        };
-        let public_key = URL_SAFE_NO_PAD
-            .decode(service_selection::validate_server_public_key(
-                &server_public_key,
-            )?)
-            .map_err(|_| "server public key is not valid base64url".to_string())?;
-        let public_key: [u8; 32] = public_key
-            .try_into()
-            .map_err(|_| "server public key must be 32 bytes".to_string())?;
-        Ok(Some(Self {
-            server_url,
-            server_public_key: VerifyingKey::from_bytes(&public_key)
-                .map_err(|_| "server public key is invalid".to_string())?,
+        Ok(Self {
+            initial_url: server_url.unwrap_or_default(),
             session_path: session_path.unwrap_or_else(session_io::default_session_path),
-        }))
+        })
     }
 }
 
 fn wait_for_writeback(
     config: &Config,
-    device_key: &SigningKey,
     operation_id: &str,
     expected_source_sha256: &str,
     status: &service_selection::RunningStatus,
@@ -306,14 +216,7 @@ fn wait_for_writeback(
     let path = format!("/api/v2/connector/operations/{operation_id}");
     loop {
         status.ensure_active()?;
-        let nonce = format!("{}-{}", unix_timestamp(), random_suffix());
-        let signature_message = format!("GET\n{path}\n{nonce}");
-        let response = get_signed::<ConnectorOperationResponse>(
-            &config.server_url,
-            &path,
-            &nonce,
-            &URL_SAFE_NO_PAD.encode(device_key.sign(signature_message.as_bytes()).to_bytes()),
-        )?;
+        let response = get_json::<ConnectorOperationResponse>(&config.server_url, &path)?;
         status.ensure_active()?;
         match response.state.as_str() {
             "waiting" | "editor_active" | "temporary_pending_activation" => {
@@ -326,67 +229,30 @@ fn wait_for_writeback(
                 for task in response.directory_tasks {
                     status.ensure_active()?;
                     status.update("Handling a remote operation...");
-                    execute_directory_task(config, device_key, operation_id, &task)?;
+                    execute_directory_task(config, operation_id, &task)?;
                 }
                 status.update(pending_status);
                 thread::sleep(Duration::from_secs(2));
             }
             "ready_for_writeback" => {
-                status.update("Verifying the signed session writeback...");
+                status.update("Writing the updated session...");
                 let ciphertext = response
                     .ciphertext
                     .ok_or_else(|| "writeback response has no ciphertext".to_string())?;
-                let source_sha256 = response
-                    .source_sha256
-                    .ok_or_else(|| "writeback response has no source hash".to_string())?;
-                let expires_at = response
-                    .expires_at
-                    .ok_or_else(|| "writeback response has no expiry".to_string())?;
-                let server_signature = response
-                    .server_signature
-                    .ok_or_else(|| "writeback response has no server signature".to_string())?;
-                if source_sha256 != expected_source_sha256 {
-                    return Err(
-                        "the authorization service response does not match the loaded session"
-                            .to_string(),
-                    );
-                }
-                let signature = Signature::from_slice(
-                    &URL_SAFE_NO_PAD
-                        .decode(server_signature)
-                        .map_err(|_| "writeback signature is invalid".to_string())?,
-                )
-                .map_err(|_| "writeback signature has an invalid length".to_string())?;
-                let signed = format!("{operation_id}\n{source_sha256}\n{ciphertext}\n{expires_at}");
-                config
-                    .server_public_key
-                    .verify(signed.as_bytes(), &signature)
-                    .map_err(|_| "writeback signature verification failed".to_string())?;
                 let ciphertext = URL_SAFE_NO_PAD
                     .decode(ciphertext)
                     .map_err(|_| "writeback ciphertext is invalid".to_string())?;
-                let written_sha256 = replace_session_if_unchanged(
+                replace_session_if_unchanged(
                     &config.session_path,
                     expected_source_sha256,
                     &ciphertext,
                 )?;
-                let receipt = ConnectorReceipt {
-                    source_sha256: expected_source_sha256.to_string(),
-                    written_sha256,
-                };
                 status.update("Reporting completion to the remote...");
-                post_signed_json(
+                let _: serde_json::Value = post_json(
                     &config.server_url,
                     &format!("{path}/receipt"),
-                    device_key,
-                    &receipt,
+                    &serde_json::json!({}),
                 )?;
-                #[cfg(not(windows))]
-                show_message(
-                    "Boxy",
-                    "The authorized session was written back safely.",
-                    MessageLevel::Info,
-                );
                 return Ok(());
             }
             "expired" | "rejected" => {
@@ -419,100 +285,72 @@ fn sv2_root(session_path: &Path) -> Result<PathBuf, String> {
         .ok_or_else(|| "cannot resolve the SV2 data directory".to_string())
 }
 
-fn directory_manifest(root: &Path) -> Result<Vec<DirectoryEntry>, String> {
-    let root = fs::canonicalize(root)
-        .map_err(|error| format!("cannot access SV2 data directory: {error}"))?;
-    let mut entries = Vec::new();
-    collect_directory_entries(&root, &root, &mut entries)?;
-    entries.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok(entries)
-}
-
-fn collect_directory_entries(
-    root: &Path,
-    directory: &Path,
-    entries: &mut Vec<DirectoryEntry>,
-) -> Result<(), String> {
-    for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
-        let file_type = entry.file_type().map_err(|error| error.to_string())?;
-        if file_type.is_symlink() {
-            continue;
-        }
-        let path = entry.path();
-        if file_type.is_dir() {
-            collect_directory_entries(root, &path, entries)?;
-            continue;
-        }
-        if !file_type.is_file() {
-            continue;
-        }
-        let relative = path
-            .strip_prefix(root)
-            .map_err(|_| "SV2 path escaped its root".to_string())?;
-        let size = entry.metadata().map_err(|error| error.to_string())?.len();
-        entries.push(DirectoryEntry {
-            path: relative.to_string_lossy().replace('\\', "/"),
-            size,
-            sha256: sha256_file(&path)?,
-        });
-    }
-    Ok(())
-}
-
-fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut file = File::open(path).map_err(|error| error.to_string())?;
-    let mut hash = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
-        if read == 0 {
-            break;
-        }
-        hash.update(&buffer[..read]);
-    }
-    Ok(URL_SAFE_NO_PAD.encode(hash.finalize()))
-}
-
 fn installed_applications() -> Vec<String> {
     #[cfg(target_os = "macos")]
     {
-        return fs::read_dir("/Applications")
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .filter(|name| name.ends_with(".app"))
-                    .map(str::to_string)
-            })
-            .collect();
+        let mut applications = Vec::new();
+        let locations = [
+            Some(PathBuf::from("/Applications")),
+            dirs::home_dir().map(|path| path.join("Applications")),
+        ];
+        for location in locations.into_iter().flatten() {
+            if let Ok(entries) = fs::read_dir(location) {
+                for entry in entries.flatten() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        if name.ends_with(".app") && is_sv2_application(name) {
+                            applications.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        applications.sort();
+        applications.dedup();
+        return applications;
     }
     #[cfg(windows)]
     {
-        return ["ProgramFiles", "ProgramFiles(x86)"]
-            .iter()
-            .filter_map(|key| env::var_os(key))
-            .flat_map(|path| {
-                fs::read_dir(path)
-                    .ok()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Result::ok)
-                    .filter_map(|entry| entry.file_name().into_string().ok())
-            })
-            .collect();
+        use winreg::{
+            enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE},
+            RegKey,
+        };
+        let mut applications = Vec::new();
+        for hive in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
+            let root = RegKey::predef(hive);
+            for path in [
+                "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+                "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+            ] {
+                if let Ok(uninstall) = root.open_subkey(path) {
+                    for key in uninstall.enum_keys().flatten() {
+                        if let Ok(entry) = uninstall.open_subkey(key) {
+                            if let Ok(name) = entry.get_value::<String, _>("DisplayName") {
+                                if is_sv2_application(&name) {
+                                    applications.push(name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        applications.sort();
+        applications.dedup();
+        return applications;
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     Vec::new()
 }
 
+fn is_sv2_application(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains("synthesizer v studio 2")
+        || name.contains("synthv-studio2")
+        || name.contains("sv2")
+}
+
 fn execute_directory_task(
     config: &Config,
-    key: &SigningKey,
     operation_id: &str,
     task: &DirectoryTask,
 ) -> Result<(), String> {
@@ -531,16 +369,15 @@ fn execute_directory_task(
             )?;
             let bytes = fs::read(&path)
                 .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-            put_task_content(config, key, &format!("{base}/content"), &bytes)?;
+            put_task_content(config, &format!("{base}/content"), &bytes)?;
             complete_task(
                 config,
-                key,
                 &format!("{base}/complete"),
                 serde_json::json!({"sha256": sha256_base64url(&bytes), "size": bytes.len()}),
             )
         }
         "write" => {
-            let bytes = get_task_content(config, key, &format!("{base}/content"))?;
+            let bytes = get_task_content(config, &format!("{base}/content"))?;
             if task
                 .expected_sha256
                 .as_deref()
@@ -559,13 +396,12 @@ fn execute_directory_task(
             )?;
             complete_task(
                 config,
-                key,
                 &format!("{base}/complete"),
                 serde_json::json!({"sha256": sha256_base64url(&bytes), "size": bytes.len()}),
             )
         }
         "download" => {
-            let bytes = get_task_content(config, key, &format!("{base}/content"))?;
+            let bytes = get_task_content(config, &format!("{base}/content"))?;
             let name = task
                 .relative_path
                 .as_deref()
@@ -577,18 +413,16 @@ fn execute_directory_task(
             atomic_write(&target, &bytes)?;
             complete_task(
                 config,
-                key,
                 &format!("{base}/complete"),
                 serde_json::json!({"sha256": sha256_base64url(&bytes), "size": bytes.len()}),
             )
         }
         "machine_material" => complete_task(
             config,
-            key,
             &format!("{base}/complete"),
             serde_json::to_value(machine_report()?).map_err(|error| error.to_string())?,
         ),
-        "command" => execute_command_task(config, key, &base, task),
+        "command" => execute_command_task(config, &base, task),
         "host_block" => {
             let result = match task.blocked {
                 Some(blocked) => host_block::set_blocked(blocked),
@@ -598,7 +432,7 @@ fn execute_directory_task(
                 Ok(status) => serde_json::to_value(status).map_err(|error| error.to_string())?,
                 Err(error) => serde_json::json!({"error": error}),
             };
-            complete_task(config, key, &format!("{base}/complete"), result)
+            complete_task(config, &format!("{base}/complete"), result)
         }
         "sv2_action" => {
             let action = task
@@ -612,7 +446,6 @@ fn execute_directory_task(
             };
             complete_task(
                 config,
-                key,
                 &format!("{base}/complete"),
                 serde_json::to_value(result).map_err(|error| error.to_string())?,
             )
@@ -621,14 +454,12 @@ fn execute_directory_task(
             session_io::open_session_folder(&config.session_path)?;
             complete_task(
                 config,
-                key,
                 &format!("{base}/complete"),
                 serde_json::json!({ "ok": true }),
             )
         }
         "product_inspect" => complete_task(
             config,
-            key,
             &format!("{base}/complete"),
             serde_json::json!({ "databases": product_database::inspect() }),
         ),
@@ -639,7 +470,6 @@ fn execute_directory_task(
             }
             complete_task(
                 config,
-                key,
                 &format!("{base}/complete"),
                 serde_json::json!({ "items": results }),
             )
@@ -652,7 +482,6 @@ fn execute_directory_task(
             product_database::delete(id)?;
             complete_task(
                 config,
-                key,
                 &format!("{base}/complete"),
                 serde_json::json!({ "id": id, "installed": false }),
             )
@@ -661,12 +490,7 @@ fn execute_directory_task(
     }
 }
 
-fn execute_command_task(
-    config: &Config,
-    key: &SigningKey,
-    base: &str,
-    task: &DirectoryTask,
-) -> Result<(), String> {
+fn execute_command_task(config: &Config, base: &str, task: &DirectoryTask) -> Result<(), String> {
     let command = task
         .command
         .as_deref()
@@ -682,7 +506,6 @@ fn execute_command_task(
     if !approve_command(command, shell, &cwd.to_string_lossy()) {
         return complete_task(
             config,
-            key,
             &format!("{base}/complete"),
             serde_json::json!({ "denied": true, "command": command }),
         );
@@ -706,7 +529,7 @@ fn execute_command_task(
             serde_json::json!({ "command": command, "shell": shell, "failed": true, "error": error })
         }
     };
-    complete_task(config, key, &format!("{base}/complete"), body)
+    complete_task(config, &format!("{base}/complete"), body)
 }
 
 struct CommandResult {
@@ -847,7 +670,7 @@ fn replace_session_if_unchanged(
     path: &Path,
     expected_sha256: &str,
     ciphertext: &[u8],
-) -> Result<String, String> {
+) -> Result<(), String> {
     if ciphertext.is_empty()
         || ciphertext.len() > MAX_SESSION_BYTES
         || !ciphertext.len().is_multiple_of(8)
@@ -881,7 +704,7 @@ fn replace_session_if_unchanged(
     if written != ciphertext {
         return Err("written session verification failed".to_string());
     }
-    Ok(sha256_base64url(&written))
+    Ok(())
 }
 
 fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -903,35 +726,6 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn load_or_create_device_key() -> Result<SigningKey, String> {
-    let directory = dirs::data_local_dir()
-        .ok_or_else(|| "cannot resolve the local connector data folder".to_string())?
-        .join("SynthVCopilot")
-        .join("Boxy");
-    fs::create_dir_all(&directory)
-        .map_err(|error| format!("cannot create connector data folder: {error}"))?;
-    let path = directory.join("device-signing-key");
-    if path.exists() {
-        let bytes = URL_SAFE_NO_PAD
-            .decode(
-                fs::read_to_string(&path)
-                    .map_err(|error| format!("cannot read connector device key: {error}"))?
-                    .trim(),
-            )
-            .map_err(|_| "connector device key is invalid".to_string())?;
-        let bytes: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| "connector device key has an invalid length".to_string())?;
-        return Ok(SigningKey::from_bytes(&bytes));
-    }
-    let signing_key = SigningKey::generate(&mut OsRng);
-    write_new_file(
-        &path,
-        URL_SAFE_NO_PAD.encode(signing_key.to_bytes()).as_bytes(),
-    )?;
-    Ok(signing_key)
-}
-
 fn machine_report() -> Result<MachineReport, String> {
     #[cfg(target_os = "macos")]
     {
@@ -946,6 +740,9 @@ fn machine_report() -> Result<MachineReport, String> {
             .map_err(|_| "native device identity is not UTF-8".to_string())?;
         let uuid = ioreg_property(&text, "IOPlatformUUID")
             .ok_or_else(|| "native device UUID is unavailable".to_string())?;
+        let sv_device_hash = ioreg_property(&text, "IOPlatformSerialNumber")
+            .filter(|serial| !serial.is_empty())
+            .unwrap_or(uuid);
         let model = command_output("/usr/sbin/sysctl", &["-n", "hw.model"]);
         let virtual_machine = ["virtual", "vmware", "parallels", "qemu", "virtualbox"]
             .iter()
@@ -959,6 +756,8 @@ fn machine_report() -> Result<MachineReport, String> {
                 model,
             },
             is_virtual_machine: virtual_machine,
+            hardware_device_id: uuid.to_ascii_lowercase(),
+            sv_device_hash: sv_device_hash.to_string(),
         });
     }
     #[cfg(windows)]
@@ -977,6 +776,8 @@ fn machine_report() -> Result<MachineReport, String> {
         .any(|needle| printable.contains(needle));
         return Ok(MachineReport {
             platform: "windows".to_string(),
+            hardware_device_id: device_ids::hardware_uuid(&raw)?,
+            sv_device_hash: device_ids::sv_device_hash()?,
             machine_material: URL_SAFE_NO_PAD.encode(raw),
             details: DeviceDetails {
                 operating_system: "Windows".to_string(),
@@ -1051,52 +852,18 @@ fn post_json<T: Serialize, R: for<'de> Deserialize<'de>>(
     parse_response(response)
 }
 
-fn get_signed<R: for<'de> Deserialize<'de>>(
-    server: &str,
-    path: &str,
-    nonce: &str,
-    signature: &str,
-) -> Result<R, String> {
-    let response = ureq::get(&format!("{server}{path}"))
-        .timeout(Duration::from_secs(30))
-        .set("X-Connector-Nonce", nonce)
-        .set("X-Connector-Signature", signature)
-        .call();
-    parse_response(response)
+fn get_json<R: for<'de> Deserialize<'de>>(server: &str, path: &str) -> Result<R, String> {
+    parse_response(
+        ureq::get(&format!("{server}{path}"))
+            .timeout(Duration::from_secs(30))
+            .call(),
+    )
 }
 
-fn post_signed_json<T: Serialize>(
-    server: &str,
-    path: &str,
-    device_key: &SigningKey,
-    body: &T,
-) -> Result<(), String> {
-    let nonce = format!("{}-{}", unix_timestamp(), random_suffix());
-    let signed = format!("POST\n{path}\n{nonce}");
-    let response = ureq::post(&format!("{server}{path}"))
-        .timeout(Duration::from_secs(30))
-        .set("Content-Type", "application/json")
-        .set("X-Connector-Nonce", &nonce)
-        .set(
-            "X-Connector-Signature",
-            &URL_SAFE_NO_PAD.encode(device_key.sign(signed.as_bytes()).to_bytes()),
-        )
-        .send_json(serde_json::to_value(body).map_err(|error| error.to_string())?);
-    let _: serde_json::Value = parse_response(response)?;
-    Ok(())
-}
-
-fn put_task_content(
-    config: &Config,
-    key: &SigningKey,
-    path: &str,
-    bytes: &[u8],
-) -> Result<(), String> {
-    let (nonce, signature) = request_signature(key, "PUT", path);
+fn put_task_content(config: &Config, path: &str, bytes: &[u8]) -> Result<(), String> {
     match ureq::put(&format!("{}{}", config.server_url, path))
+        .timeout(Duration::from_secs(30))
         .set("Content-Length", &bytes.len().to_string())
-        .set("X-Connector-Nonce", &nonce)
-        .set("X-Connector-Signature", &signature)
         .send_bytes(bytes)
     {
         Ok(_) => Ok(()),
@@ -1104,11 +871,9 @@ fn put_task_content(
     }
 }
 
-fn get_task_content(config: &Config, key: &SigningKey, path: &str) -> Result<Vec<u8>, String> {
-    let (nonce, signature) = request_signature(key, "GET", path);
+fn get_task_content(config: &Config, path: &str) -> Result<Vec<u8>, String> {
     let response = ureq::get(&format!("{}{}", config.server_url, path))
-        .set("X-Connector-Nonce", &nonce)
-        .set("X-Connector-Signature", &signature)
+        .timeout(Duration::from_secs(30))
         .call()
         .map_err(|error| format!("cannot download directory content: {error}"))?;
     let mut bytes = Vec::new();
@@ -1120,22 +885,9 @@ fn get_task_content(config: &Config, key: &SigningKey, path: &str) -> Result<Vec
     Ok(bytes)
 }
 
-fn complete_task(
-    config: &Config,
-    key: &SigningKey,
-    path: &str,
-    body: serde_json::Value,
-) -> Result<(), String> {
-    post_signed_json(&config.server_url, path, key, &body)
-}
-
-fn request_signature(key: &SigningKey, method: &str, path: &str) -> (String, String) {
-    let nonce = format!("{}-{}", unix_timestamp(), random_suffix());
-    let signed = format!("{method}\n{path}\n{nonce}");
-    (
-        nonce,
-        URL_SAFE_NO_PAD.encode(key.sign(signed.as_bytes()).to_bytes()),
-    )
+fn complete_task(config: &Config, path: &str, body: serde_json::Value) -> Result<(), String> {
+    let _: serde_json::Value = post_json(&config.server_url, path, &body)?;
+    Ok(())
 }
 
 fn parse_response<R: for<'de> Deserialize<'de>>(
@@ -1164,12 +916,6 @@ fn unix_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
-}
-
-fn random_suffix() -> String {
-    let mut bytes = [0u8; 16];
-    rand_core::RngCore::fill_bytes(&mut OsRng, &mut bytes);
-    URL_SAFE_NO_PAD.encode(bytes)
 }
 
 fn validate_browser_url(server_url: &str, browser_url: &str) -> Result<Url, String> {

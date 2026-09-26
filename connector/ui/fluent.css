@@ -1,0 +1,885 @@
+/* Fluent material and control tokens, scoped to the suite. */
+.fluent-theme,
+[data-fluent-theme] {
+  color-scheme: light;
+  --fluent-bg: #f3f3f3;
+  --fluent-surface: #fafafa;
+  --fluent-mica: rgba(243, 243, 243, 0.88);
+  --fluent-acrylic: rgba(252, 252, 252, 0.92);
+  --fluent-text: #1b1b1b;
+  --fluent-muted: #5d5d5d;
+  --fluent-accent: #0067c0;
+  --fluent-accent-hover: #005fb8;
+  --fluent-accent-pressed: #00549e;
+  --fluent-accent-text: #ffffff;
+  --fluent-control: #ffffff;
+  --fluent-control-hover: #f6f6f6;
+  --fluent-control-pressed: #ebebeb;
+  --fluent-border: rgba(0, 0, 0, 0.14);
+  --fluent-selection: #e6e6e6;
+  --fluent-danger: #c42b1c;
+  --fluent-danger-hover: #b9271a;
+  --fluent-danger-pressed: #a52116;
+  --fluent-input-invalid: #c42b1c;
+  --fluent-success: #0f7b45;
+  --fluent-warning: #9d5d00;
+  --fluent-radius: 4px;
+  --fluent-panel-radius: 8px;
+  --fluent-shadow: 0 8px 28px rgba(0, 0, 0, 0.16), 0 0 1px rgba(0, 0, 0, 0.2);
+  --fluent-fast: 160ms;
+  --fluent-ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --fluent-font:
+    "Segoe UI Variable Text", "Segoe UI", system-ui, "Noto Sans SC", sans-serif;
+  font: 14px/1.5 var(--fluent-font);
+  color: var(--fluent-text);
+}
+[data-fluent-theme="dark"] {
+  color-scheme: dark;
+  --fluent-bg: #202020;
+  --fluent-surface: #292929;
+  --fluent-mica: rgba(32, 32, 32, 0.88);
+  --fluent-acrylic: rgba(44, 44, 44, 0.92);
+  --fluent-text: #f4f4f4;
+  --fluent-muted: #c4c4c4;
+  --fluent-accent: #4cc2ff;
+  --fluent-accent-hover: #71ceff;
+  --fluent-accent-pressed: #35b8f6;
+  --fluent-accent-text: #003544;
+  --fluent-control: #373737;
+  --fluent-control-hover: #414141;
+  --fluent-control-pressed: #303030;
+  --fluent-border: rgba(255, 255, 255, 0.16);
+  --fluent-selection: #3b3b3b;
+  --fluent-danger: #ff99a4;
+  --fluent-danger-hover: #ffb7bf;
+  --fluent-danger-pressed: #e68b95;
+  --fluent-input-invalid: #ff99a4;
+  --fluent-success: #6ccb5f;
+  --fluent-warning: #fce100;
+  --fluent-shadow:
+    0 8px 28px rgba(0, 0, 0, 0.36), 0 0 1px rgba(255, 255, 255, 0.2);
+}
+.fluent-theme *,
+[data-fluent-theme] * {
+  box-sizing: border-box;
+}
+.fluent-theme :where(button, input, select, textarea),
+[data-fluent-theme] :where(button, input, select, textarea) {
+  font: inherit;
+}
+.fluent-theme :where(button, input, select, textarea, [tabindex]):focus-visible,
+[data-fluent-theme]
+  :where(button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--fluent-accent);
+  outline-offset: 3px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .fluent-theme,
+  [data-fluent-theme] {
+    --fluent-fast: 0ms;
+  }
+  .fluent-theme *,
+  [data-fluent-theme] * {
+    scroll-behavior: auto;
+  }
+}
+
+.fluent-button {
+  min-height: 32px;
+  box-sizing: border-box;
+  padding: 0 14px;
+  border: 1px solid var(--fluent-border);
+  border-radius: var(--fluent-radius);
+  color: var(--fluent-text);
+  background: var(--fluent-control);
+  box-shadow: var(--fluent-shadow);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background var(--fluent-fast) var(--fluent-ease),
+    border-color var(--fluent-fast) var(--fluent-ease),
+    transform var(--fluent-fast) var(--fluent-ease);
+}
+.fluent-button:hover:not(:disabled) {
+  background: var(--fluent-control-hover);
+}
+.fluent-button:active:not(:disabled) {
+  background: var(--fluent-control-pressed);
+  transform: scale(0.99);
+}
+.fluent-button--primary {
+  border-color: var(--fluent-accent);
+  color: var(--fluent-accent-text);
+  background: var(--fluent-accent);
+}
+.fluent-button--primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--fluent-accent) 88%, #000);
+}
+.fluent-button--danger {
+  border-color: var(--fluent-danger);
+  color: var(--fluent-accent-text);
+  background: var(--fluent-danger);
+}
+.fluent-button--subtle {
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+}
+.fluent-button:disabled,
+.fluent-field__input:disabled,
+.fluent-switch:disabled,
+.fluent-slider__input:disabled,
+.fluent-select__control:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.fluent-field,
+.fluent-slider,
+.fluent-select {
+  display: grid;
+  gap: 6px;
+  color: var(--fluent-text);
+  font: inherit;
+}
+.fluent-field__label,
+.fluent-slider__label,
+.fluent-select__label {
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+.fluent-field__input,
+.fluent-select__control {
+  min-height: 32px;
+  box-sizing: border-box;
+  width: 100%;
+  padding: 0 10px;
+  border: 1px solid var(--fluent-border);
+  border-radius: var(--fluent-radius);
+  color: var(--fluent-text);
+  background: var(--fluent-control);
+  font: inherit;
+  transition:
+    background var(--fluent-fast) var(--fluent-ease),
+    border-color var(--fluent-fast) var(--fluent-ease);
+}
+.fluent-field__input:hover:not(:disabled),
+.fluent-select__control:hover:not(:disabled) {
+  background: var(--fluent-control-hover);
+}
+.fluent-select__control {
+  padding-right: 30px;
+}
+
+.fluent-file-picker {
+  display: grid;
+  gap: 8px;
+  color: var(--fluent-text);
+  font: inherit;
+}
+.fluent-file-picker__label {
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+.fluent-file-picker__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.fluent-file-picker__input { display: none; }
+.fluent-file-picker__button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.fluent-file-picker__icon { width: 16px; height: 16px; }
+.fluent-file-picker__status,
+.fluent-file-picker__list {
+  margin: 0;
+  color: var(--fluent-muted);
+  font-size: 0.8125rem;
+}
+.fluent-file-picker__list { padding-inline-start: 20px; }
+.fluent-file-picker__file { overflow-wrap: anywhere; }
+
+.fluent-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 0;
+  border: 0;
+  color: var(--fluent-text);
+  background: transparent;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+.fluent-switch__track {
+  display: inline-flex;
+  align-items: center;
+  width: 32px;
+  height: 18px;
+  padding: 2px;
+  box-sizing: border-box;
+  border: 1px solid var(--fluent-border);
+  border-radius: 999px;
+  background: var(--fluent-control);
+  transition:
+    background var(--fluent-fast) var(--fluent-ease),
+    border-color var(--fluent-fast) var(--fluent-ease);
+}
+.fluent-switch__thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--fluent-muted);
+  transition:
+    transform var(--fluent-fast) var(--fluent-ease),
+    background var(--fluent-fast) var(--fluent-ease);
+}
+.fluent-switch--checked .fluent-switch__track {
+  border-color: var(--fluent-accent);
+  background: var(--fluent-accent);
+}
+.fluent-switch--checked .fluent-switch__thumb {
+  transform: translateX(14px);
+  background: var(--fluent-accent-text);
+}
+
+.fluent-slider__header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.fluent-slider__value {
+  color: var(--fluent-muted);
+  font-variant-numeric: tabular-nums;
+}
+.fluent-slider__input {
+  width: 100%;
+  height: 20px;
+  margin: 0;
+  appearance: none;
+  accent-color: var(--fluent-accent);
+  cursor: pointer;
+}
+.fluent-slider__input::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 999px;
+  background: linear-gradient(
+    to right,
+    var(--fluent-accent) 0 var(--fluent-slider-position),
+    var(--fluent-border) var(--fluent-slider-position) 100%
+  );
+}
+.fluent-slider__input::-webkit-slider-thumb {
+  width: 16px;
+  height: 16px;
+  margin-top: -6px;
+  border: 2px solid var(--fluent-accent-text);
+  border-radius: 50%;
+  background: var(--fluent-accent);
+  box-shadow: var(--fluent-shadow);
+  -webkit-appearance: none;
+}
+.fluent-slider__input::-moz-range-track {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--fluent-border);
+}
+.fluent-slider__input::-moz-range-progress {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--fluent-accent);
+}
+.fluent-slider__input::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--fluent-accent-text);
+  border-radius: 50%;
+  background: var(--fluent-accent);
+  box-shadow: var(--fluent-shadow);
+}
+
+.fluent-notice {
+  padding: 10px 12px;
+  border: 1px solid var(--fluent-border);
+  border-inline-start: 3px solid var(--fluent-accent);
+  border-radius: var(--fluent-radius);
+  color: var(--fluent-text);
+  background: var(--fluent-surface);
+  box-shadow: var(--fluent-shadow);
+}
+.fluent-notice--success {
+  border-inline-start-color: var(--fluent-success);
+}
+.fluent-notice--warning {
+  border-inline-start-color: var(--fluent-warning);
+}
+.fluent-notice--danger {
+  border-inline-start-color: var(--fluent-danger);
+}
+
+.fluent-button:focus-visible,
+.fluent-field__input:focus-visible,
+.fluent-switch:focus-visible,
+.fluent-slider__input:focus-visible,
+.fluent-select__control:focus-visible {
+  outline: 2px solid var(--fluent-accent);
+  outline-offset: 2px;
+}
+
+.fluent-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--fluent-text);
+  font: inherit;
+  cursor: pointer;
+}
+.fluent-checkbox__input {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--fluent-accent);
+  cursor: inherit;
+}
+.fluent-checkbox:has(:disabled) {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.fluent-progress-bar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+}
+.fluent-progress-bar__track {
+  position: relative;
+  display: block;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--fluent-border);
+}
+.fluent-progress-bar__value {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--fluent-accent);
+  transition: width var(--fluent-fast) var(--fluent-ease);
+}
+.fluent-progress-bar--indeterminate .fluent-progress-bar__value {
+  width: 40%;
+  background: linear-gradient(to right, transparent, var(--fluent-accent), transparent);
+  animation: fluent-progress-slide 1.5s linear infinite;
+}
+.fluent-progress-bar--with-indicator { grid-template-columns: minmax(0, 1fr) auto; }
+.fluent-progress-bar__indicator {
+  min-width: 3ch;
+  color: var(--fluent-muted);
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
+  text-align: end;
+}
+.fluent-progress-bar__ticks {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.fluent-progress-bar__tick {
+  position: absolute;
+  top: 0;
+  width: 1px;
+  height: 100%;
+  background: var(--fluent-surface);
+  opacity: 0.9;
+}
+.fluent-progress-ring { display: inline-flex; flex: none; color: var(--fluent-accent); }
+.fluent-progress-ring svg { width: 100%; height: 100%; transform: rotate(-90deg); }
+.fluent-progress-ring circle { fill: none; stroke-width: 2; }
+.fluent-progress-ring__track { stroke: var(--fluent-border); }
+.fluent-progress-ring__value { stroke: currentColor; stroke-linecap: round; }
+.fluent-progress-ring--indeterminate svg { animation: fluent-progress-spin 1s linear infinite; }
+.fluent-scroll-viewer {
+  min-height: 0;
+  min-width: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--fluent-muted) transparent;
+}
+.fluent-scroll-viewer--horizontal { overflow-x: auto; }
+@keyframes fluent-progress-spin { to { transform: rotate(270deg); } }
+@keyframes fluent-progress-slide { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .fluent-progress-ring--indeterminate svg,
+  .fluent-progress-bar--indeterminate .fluent-progress-bar__value { animation: none; }
+}
+
+/* State refinements are scoped to Fluent component classes. */
+.fluent-button {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  box-shadow: inset 0 1px rgb(255 255 255 / 8%), 0 1px 1px rgb(0 0 0 / 5%);
+}
+.fluent-button::after {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  content: "";
+  background: currentColor;
+  opacity: 0;
+  transition: opacity var(--fluent-fast) var(--fluent-ease);
+}
+.fluent-button:hover:not(:disabled)::after { opacity: 0.04; }
+.fluent-button:active:not(:disabled)::after { opacity: 0.12; }
+.fluent-button--primary:hover:not(:disabled) { background: var(--fluent-accent-hover); }
+.fluent-button--primary:active:not(:disabled) { background: var(--fluent-accent-pressed); }
+.fluent-button--danger:hover:not(:disabled) { background: var(--fluent-danger-hover); }
+.fluent-button--danger:active:not(:disabled) { background: var(--fluent-danger-pressed); }
+.fluent-button--subtle:hover:not(:disabled) { background: var(--fluent-control-hover); }
+.fluent-button--subtle:active:not(:disabled) { background: var(--fluent-control-pressed); }
+.fluent-button[aria-pressed="true"] {
+  border-color: var(--fluent-accent);
+  color: var(--fluent-accent);
+  background: color-mix(in srgb, var(--fluent-accent) 14%, var(--fluent-control));
+}
+.fluent-button[data-icon-only] {
+  width: 32px;
+  min-width: 32px;
+  padding: 0;
+}
+.fluent-button:disabled {
+  border-color: var(--fluent-border);
+  color: var(--fluent-muted);
+  background: var(--fluent-control);
+  box-shadow: none;
+}
+
+.fluent-field__input {
+  min-height: 32px;
+  line-height: 20px;
+  box-shadow: inset 0 -1px 0 var(--fluent-border);
+}
+textarea.fluent-field__input {
+  min-height: 80px;
+  padding-block: 6px;
+  resize: vertical;
+}
+.fluent-field__input:focus-visible {
+  border-color: var(--fluent-accent);
+  box-shadow: inset 0 -1px 0 var(--fluent-accent);
+}
+.fluent-field__input[data-invalid],
+.fluent-field__input:invalid {
+  border-color: var(--fluent-input-invalid);
+  box-shadow: inset 0 -1px 0 var(--fluent-input-invalid);
+}
+.fluent-field__input[readonly] {
+  color: var(--fluent-muted);
+  background: color-mix(in srgb, var(--fluent-control) 78%, var(--fluent-bg));
+}
+.fluent-field__input:disabled {
+  color: var(--fluent-muted);
+  background: var(--fluent-bg);
+  box-shadow: none;
+}
+
+.fluent-switch:hover:not(:disabled) .fluent-switch__track {
+  border-color: color-mix(in srgb, var(--fluent-border) 55%, var(--fluent-text));
+  background: var(--fluent-control-hover);
+}
+.fluent-switch:active:not(:disabled) .fluent-switch__track { background: var(--fluent-control-pressed); }
+.fluent-switch--checked:hover:not(:disabled) .fluent-switch__track { background: var(--fluent-accent-hover); }
+.fluent-switch--checked:active:not(:disabled) .fluent-switch__track { background: var(--fluent-accent-pressed); }
+.fluent-switch:disabled .fluent-switch__track { border-color: var(--fluent-border); background: var(--fluent-bg); }
+.fluent-switch:disabled .fluent-switch__thumb { background: var(--fluent-muted); }
+
+.fluent-slider__input:focus-visible::-webkit-slider-thumb { outline: 2px solid var(--fluent-accent); outline-offset: 3px; }
+.fluent-slider__input:hover:not(:disabled)::-webkit-slider-thumb { transform: scale(1.12); }
+.fluent-slider__input:active:not(:disabled)::-webkit-slider-thumb { transform: scale(0.94); }
+.fluent-slider__input:disabled { opacity: 0.45; cursor: not-allowed; }
+.fluent-slider__input:disabled::-webkit-slider-runnable-track {
+  background: linear-gradient(to right, var(--fluent-muted) 0 var(--fluent-slider-position), var(--fluent-border) var(--fluent-slider-position) 100%);
+}
+.fluent-slider__input:disabled::-webkit-slider-thumb { background: var(--fluent-muted); box-shadow: none; }
+
+.fluent-checkbox,
+.fluent-radio { position: relative; min-height: 20px; }
+.fluent-radio { display: inline-flex; align-items: center; gap: 8px; color: var(--fluent-text); font: inherit; cursor: pointer; }
+.fluent-checkbox__input,
+.fluent-radio__input {
+  appearance: none;
+  -webkit-appearance: none;
+  display: grid;
+  place-content: center;
+  width: 20px;
+  height: 20px;
+  margin: 0;
+  border: 1px solid var(--fluent-border);
+  background: var(--fluent-control);
+  color: var(--fluent-accent-text);
+  cursor: inherit;
+  transition: background var(--fluent-fast) var(--fluent-ease), border-color var(--fluent-fast) var(--fluent-ease), transform var(--fluent-fast) var(--fluent-ease);
+}
+.fluent-checkbox__input { border-radius: 3px; }
+.fluent-radio__input { border-radius: 50%; }
+.fluent-checkbox__input::before {
+  width: 9px;
+  height: 5px;
+  content: "";
+  border: solid currentColor;
+  border-width: 0 0 2px 2px;
+  transform: rotate(-45deg) scale(0);
+  transition: transform var(--fluent-fast) var(--fluent-ease);
+}
+.fluent-radio__input::before { width: 8px; height: 8px; content: ""; border-radius: 50%; background: currentColor; transform: scale(0); transition: transform var(--fluent-fast) var(--fluent-ease); }
+.fluent-checkbox__input:checked,
+.fluent-radio__input:checked { border-color: var(--fluent-accent); background: var(--fluent-accent); }
+.fluent-checkbox__input:checked::before,
+.fluent-radio__input:checked::before { transform: rotate(-45deg) scale(1); }
+.fluent-radio__input:checked::before { transform: scale(1); }
+.fluent-checkbox__input:indeterminate { border-color: var(--fluent-accent); background: var(--fluent-accent); }
+.fluent-checkbox__input:indeterminate::before { height: 0; width: 9px; border-width: 0 0 2px; transform: none; }
+.fluent-checkbox:hover .fluent-checkbox__input:not(:disabled),
+.fluent-radio:hover .fluent-radio__input:not(:disabled) { border-color: var(--fluent-accent); background: var(--fluent-control-hover); }
+.fluent-checkbox:hover .fluent-checkbox__input:checked:not(:disabled),
+.fluent-radio:hover .fluent-radio__input:checked:not(:disabled) { background: var(--fluent-accent-hover); }
+.fluent-checkbox__input:active:not(:disabled),
+.fluent-radio__input:active:not(:disabled) { transform: scale(0.9); }
+.fluent-checkbox__input:focus-visible,
+.fluent-radio__input:focus-visible { outline: 2px solid var(--fluent-accent); outline-offset: 2px; }
+.fluent-checkbox:has(:disabled),
+.fluent-radio:has(:disabled) { color: var(--fluent-muted); opacity: 0.55; cursor: not-allowed; }
+
+.fluent-progress-bar:disabled { opacity: 0.45; }
+@media (forced-colors: active) {
+  .fluent-button,
+  .fluent-field__input,
+  .fluent-switch__track,
+  .fluent-checkbox__input,
+  .fluent-radio__input {
+    border-color: ButtonText;
+    forced-color-adjust: none;
+  }
+  .fluent-button { color: ButtonText; background: ButtonFace; }
+  .fluent-button--primary,
+  .fluent-button--danger,
+  .fluent-switch--checked .fluent-switch__track,
+  .fluent-checkbox__input:checked,
+  .fluent-radio__input:checked { color: HighlightText; background: Highlight; }
+  .fluent-field__input[data-invalid],
+  .fluent-field__input:invalid { outline: 2px solid Mark; outline-offset: -3px; }
+  .fluent-slider__input { forced-color-adjust: auto; }
+  .fluent-progress-bar { forced-color-adjust: auto; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .fluent-button,
+  .fluent-button::after,
+  .fluent-switch__track,
+  .fluent-switch__thumb,
+  .fluent-checkbox__input,
+  .fluent-radio__input { transition-duration: 0ms; }
+}
+
+.fluent-button--subtle { box-shadow: none; }
+.fluent-notice { box-shadow: none; }
+.fluent-switch { --fluent-switch-x: 0px; --fluent-switch-pressed-x: 1px; }
+.fluent-switch--checked { --fluent-switch-x: 14px; --fluent-switch-pressed-x: 13px; }
+.fluent-switch:hover:not(:disabled) .fluent-switch__thumb { transform: translateX(var(--fluent-switch-x)) scale(1.12); }
+.fluent-switch:active:not(:disabled) .fluent-switch__thumb { transform: translateX(var(--fluent-switch-pressed-x)) scaleX(1.25) scaleY(.88); }
+.fluent-slider__input:hover:not(:disabled)::-moz-range-thumb { transform: scale(1.12); }
+.fluent-slider__input:active:not(:disabled)::-moz-range-thumb { transform: scale(.94); }
+.fluent-slider__input:focus-visible::-moz-range-thumb { outline: 2px solid var(--fluent-accent); outline-offset: 3px; }
+.fluent-slider__input:disabled::-moz-range-thumb { background: var(--fluent-muted); box-shadow: none; }
+.fluent-slider__input:disabled::-moz-range-progress { background: var(--fluent-muted); }
+
+.fluent-dialog {
+  box-sizing: border-box;
+  display: none;
+  flex-direction: column;
+  width: min(560px, calc(100vw - 32px));
+  max-height: min(720px, calc(100dvh - 32px));
+  padding: 0;
+  color: var(--fluent-text);
+  background: var(--fluent-surface);
+  border: 1px solid var(--fluent-border);
+  border-radius: var(--fluent-panel-radius);
+  box-shadow: var(--fluent-shadow);
+  overflow: hidden;
+}
+.fluent-dialog[open] {
+  display: flex;
+}
+.fluent-dialog::backdrop {
+  background: rgb(0 0 0 / 32%);
+}
+.fluent-dialog__header {
+  flex: none;
+  padding: 20px 24px 0;
+}
+.fluent-dialog__content {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 24px;
+  overflow: auto;
+  outline: none;
+}
+.fluent-dialog__footer {
+  display: flex;
+  flex: none;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 24px 20px;
+  border-top: 1px solid var(--fluent-border);
+}
+.fluent-popover {
+  position: fixed;
+  inset: auto;
+  margin: 0;
+  box-sizing: border-box;
+  min-width: 0;
+  width: 360px;
+  overflow-wrap: anywhere;
+  padding: 6px;
+  overflow: auto;
+  color: var(--fluent-text);
+  background: var(--fluent-surface);
+  border: 1px solid var(--fluent-border);
+  border-radius: var(--fluent-panel-radius);
+  box-shadow: var(--fluent-shadow);
+  animation: fluent-overlay-in var(--fluent-fast) var(--fluent-ease);
+}
+@keyframes fluent-overlay-in {
+  from {
+    opacity: 0;
+    transform: translateY(-2px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .fluent-popover {
+    animation: none;
+  }
+}
+
+.fluent-navigation {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px;
+  gap: 2px;
+  scrollbar-gutter: stable;
+}
+.fluent-navigation__selection {
+  position: absolute;
+  top: 0;
+  z-index: 0;
+  inset-inline: 4px;
+  border-radius: var(--fluent-radius);
+  background: var(--fluent-selection);
+  pointer-events: none;
+  transition:
+    transform var(--fluent-fast) var(--fluent-ease),
+    height var(--fluent-fast) var(--fluent-ease),
+    opacity var(--fluent-fast) var(--fluent-ease);
+}
+.fluent-navigation__item {
+  position: relative;
+  z-index: 1;
+  min-height: 36px;
+  padding: 0 12px;
+  overflow: hidden;
+  color: var(--fluent-text);
+  font: inherit;
+  line-height: 36px;
+  text-align: start;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  background: transparent;
+  border: 0;
+  border-radius: var(--fluent-radius);
+  cursor: pointer;
+}
+.fluent-navigation__item:hover:not(:disabled) {
+  background: var(--fluent-control-hover);
+}
+.fluent-navigation__item:active:not(:disabled) {
+  background: var(--fluent-control-pressed);
+}
+.fluent-navigation__item:focus-visible {
+  outline: 2px solid var(--fluent-accent);
+  outline-offset: -2px;
+}
+.fluent-navigation__item:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+@media (prefers-reduced-motion: reduce) {
+  .fluent-navigation__selection {
+    transition: none;
+  }
+}
+
+.fluent-navigation__selection::before {
+  content: "";
+  position: absolute;
+  inset-inline-start: 0;
+  top: calc(50% - 8px);
+  width: 3px;
+  height: 16px;
+  border-radius: 2px;
+  background: var(--fluent-accent);
+}
+
+.fluent-select {
+  display: grid;
+  gap: 6px;
+  color: var(--fluent-text);
+  font: inherit;
+}
+.fluent-select__label { font-size: 0.875rem; font-weight: 600; }
+.fluent-select__control {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 32px;
+  width: 100%;
+  padding: 5px 10px;
+  border: 1px solid var(--fluent-border);
+  border-radius: var(--fluent-radius);
+  color: var(--fluent-text);
+  background: var(--fluent-control);
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+  transition: background var(--fluent-fast) var(--fluent-ease), border-color var(--fluent-fast) var(--fluent-ease);
+}
+.fluent-select__control:hover:not(:disabled) { background: var(--fluent-control-hover); }
+.fluent-select__control:active:not(:disabled), .fluent-select--open .fluent-select__control { background: var(--fluent-control-pressed); }
+.fluent-select__control:disabled { opacity: 0.55; cursor: not-allowed; }
+.fluent-select__value { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fluent-icon { display: block; flex: none; width: 16px; height: 16px; }
+.fluent-select__chevron { width: 16px; height: 16px; }
+.fluent-popover:has(.fluent-select__listbox), .fluent-popover:has(.fluent-menu) { width: max-content; min-width: min(220px, calc(100vw - 16px)); max-width: min(420px, calc(100vw - 16px)); padding: 4px; overflow: auto; }
+.fluent-select__listbox, .fluent-menu { display: grid; gap: 2px; min-width: 100%; }
+.fluent-select__option, .fluent-menu__item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: var(--fluent-text);
+  background: transparent;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+.fluent-select__option:hover:not(:disabled), .fluent-select__option.is-active, .fluent-menu__item:hover:not(:disabled), .fluent-menu__item.is-active { background: var(--fluent-control-hover); }
+.fluent-select__option:active:not(:disabled), .fluent-menu__item:active:not(:disabled) { background: var(--fluent-control-pressed); }
+.fluent-select__option.is-selected, .fluent-menu__item.is-selected { background: var(--fluent-selection); font-weight: 600; }
+.fluent-select__option.is-active.is-selected, .fluent-menu__item.is-active.is-selected { border-color: color-mix(in srgb, var(--fluent-accent) 42%, transparent); }
+.fluent-select__option:disabled, .fluent-menu__item:disabled { opacity: 0.55; cursor: not-allowed; }
+.fluent-menu__separator { height: 1px; margin: 4px 8px; background: var(--fluent-border); }
+.fluent-menu__check { color: var(--fluent-accent); }
+.fluent-menu__item-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (forced-colors: active) {
+  .fluent-select__control, .fluent-select__option, .fluent-menu__item { forced-color-adjust: auto; }
+  .fluent-select__option.is-selected, .fluent-menu__item.is-selected { outline: 1px solid Highlight; }
+}
+
+:where(.fluent-theme, [data-fluent-theme]) :where(button:not([class*="fluent-"]), input[type="button"], input[type="submit"], input[type="reset"]) {
+  min-height: 32px;
+  padding: 5px 12px;
+  border: 1px solid var(--fluent-border);
+  border-radius: var(--fluent-radius);
+  color: var(--fluent-text);
+  background: var(--fluent-control);
+  box-shadow: 0 1px 1px rgb(0 0 0 / 5%);
+  font: inherit;
+  cursor: pointer;
+  transition: background var(--fluent-fast) var(--fluent-ease), border-color var(--fluent-fast) var(--fluent-ease);
+}
+:where(.fluent-theme, [data-fluent-theme]) :where(button:not([class*="fluent-"]), input[type="button"], input[type="submit"], input[type="reset"]):where(:hover:not(:disabled)) { background: var(--fluent-control-hover); }
+:where(.fluent-theme, [data-fluent-theme]) :where(button:not([class*="fluent-"]), input[type="button"], input[type="submit"], input[type="reset"]):where(:active:not(:disabled)) { background: var(--fluent-control-pressed); }
+:where(.fluent-theme, [data-fluent-theme]) :where(button, input, select, textarea):where(:disabled) { cursor: not-allowed; }
+:where(.fluent-theme, [data-fluent-theme]) :where(button:not([class*="fluent-"]), input[type="button"], input[type="submit"], input[type="reset"]):where(:disabled) { color: var(--fluent-muted); opacity: .5; box-shadow: none; }
+
+:where(.fluent-theme, [data-fluent-theme]) :where(input:not([type="checkbox"], [type="radio"], [type="range"], [type="button"], [type="submit"], [type="reset"], [type="hidden"]), textarea, select):not([class*="fluent-"]) {
+  box-sizing: border-box;
+  min-width: 0;
+  min-height: 32px;
+  padding: 5px 10px;
+  border: 1px solid var(--fluent-border);
+  border-bottom-color: var(--fluent-muted);
+  border-radius: var(--fluent-radius);
+  color: var(--fluent-text);
+  background: var(--fluent-control);
+  font: inherit;
+  transition: background var(--fluent-fast) var(--fluent-ease), border-color var(--fluent-fast) var(--fluent-ease);
+}
+:where(.fluent-theme, [data-fluent-theme]) :where(input, textarea, select):not([class*="fluent-"]):where(:hover:not(:disabled, [readonly])) { border-color: var(--fluent-muted); }
+:where(.fluent-theme, [data-fluent-theme]) :where(input, textarea, select):not([class*="fluent-"]):where(:focus-visible) { border-color: var(--fluent-accent); }
+:where(.fluent-theme, [data-fluent-theme]) :where(input, textarea):not([class*="fluent-"]):where([readonly]) { color: var(--fluent-muted); background: var(--fluent-surface); }
+:where(.fluent-theme, [data-fluent-theme]) :where(input, textarea, select):not([class*="fluent-"]):where(:disabled) { opacity: .5; background: var(--fluent-bg); }
+:where(.fluent-theme, [data-fluent-theme]) :is(input, textarea, select):is([aria-invalid="true"], :user-invalid) { border-color: var(--fluent-danger); }
+:where(.fluent-theme, [data-fluent-theme]) :where(textarea) { resize: vertical; min-height: 80px; }
+:where(.fluent-theme, [data-fluent-theme]) :where(input[type="checkbox"], input[type="radio"], input[type="range"], progress, meter) { accent-color: var(--fluent-accent); }
+:where(.fluent-theme, [data-fluent-theme]) :where(input[type="checkbox"], input[type="radio"]):not([class*="fluent-"]) { width: 18px; height: 18px; vertical-align: middle; }
+:where(.fluent-theme, [data-fluent-theme]) :where(input[type="range"]):not([class*="fluent-"]) { min-width: 80px; cursor: pointer; }
+:where(.fluent-theme, [data-fluent-theme]) :where(input[type="file"])::file-selector-button {
+  padding: 5px 10px;
+  margin-inline-end: 10px;
+  border: 1px solid var(--fluent-border);
+  border-radius: var(--fluent-radius);
+  color: var(--fluent-text);
+  background: var(--fluent-control);
+  font: inherit;
+  cursor: pointer;
+}
+:where(.fluent-theme, [data-fluent-theme]) :where(input[type="file"]):hover::file-selector-button { background: var(--fluent-control-hover); }
+:where(.fluent-theme, [data-fluent-theme]) :where(input[type="file"]):active::file-selector-button { background: var(--fluent-control-pressed); }
+:where(.fluent-theme, [data-fluent-theme]) :where(input[type="color"]) { width: 48px; padding: 4px; cursor: pointer; }
+:where(.fluent-theme, [data-fluent-theme]) :where(input[type="color"])::-webkit-color-swatch-wrapper { padding: 0; }
+:where(.fluent-theme, [data-fluent-theme]) :where(input[type="color"])::-webkit-color-swatch { border: 0; border-radius: 2px; }
+:where(.fluent-theme, [data-fluent-theme]) :where(input[type="date"], input[type="time"], input[type="datetime-local"], input[type="month"], input[type="week"])::-webkit-calendar-picker-indicator { cursor: pointer; opacity: .75; }
+:where(.fluent-theme, [data-fluent-theme]) :where(a[href]) { color: var(--fluent-accent); text-underline-offset: 3px; }
+:where(.fluent-theme, [data-fluent-theme]) :where(a[href]):hover { color: var(--fluent-accent-hover); }
+:where(.fluent-theme, [data-fluent-theme]) :where(a[href]):active { color: var(--fluent-accent-pressed); }
+:where(.fluent-theme, [data-fluent-theme]) :where(a[aria-disabled="true"]) { color: var(--fluent-muted); cursor: not-allowed; }
+:where(.fluent-theme, [data-fluent-theme]) :where(fieldset) { min-width: 0; border: 1px solid var(--fluent-border); border-radius: var(--fluent-panel-radius); }
+:where(.fluent-theme, [data-fluent-theme]) :where(legend) { padding-inline: 6px; color: var(--fluent-muted); }
+:where(.fluent-theme, [data-fluent-theme]) :where(details) { border: 1px solid var(--fluent-border); border-radius: var(--fluent-panel-radius); background: var(--fluent-surface); }
+:where(.fluent-theme, [data-fluent-theme]) :where(summary) { padding: 10px 12px; cursor: pointer; border-radius: inherit; }
+:where(.fluent-theme, [data-fluent-theme]) :where(summary):hover { background: var(--fluent-control-hover); }
+:where(.fluent-theme, [data-fluent-theme]) :where(summary):active { background: var(--fluent-control-pressed); }
+:where(.fluent-theme, [data-fluent-theme]) :where(details[open]) > summary { border-bottom: 1px solid var(--fluent-border); }
+:where(.fluent-theme, [data-fluent-theme]) :where([role="tab"], [role="option"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"]) { border-radius: var(--fluent-radius); }
+:where(.fluent-theme, [data-fluent-theme]) :where([role="tab"], [role="option"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"]):hover:not([aria-disabled="true"]) { background: var(--fluent-control-hover); }
+:where(.fluent-theme, [data-fluent-theme]) :where([role="tab"], [role="option"], [role="menuitemcheckbox"], [role="menuitemradio"]):where([aria-selected="true"], [aria-checked="true"]) { background: var(--fluent-selection); color: var(--fluent-accent); }
+:where(.fluent-theme, [data-fluent-theme]) :where([aria-disabled="true"]) { cursor: not-allowed; }
+:where(.fluent-theme, [data-fluent-theme]) :where(table) { border-collapse: collapse; color: var(--fluent-text); }
+:where(.fluent-theme, [data-fluent-theme]) :where(th, td) { border-bottom: 1px solid var(--fluent-border); padding: 8px 12px; text-align: start; }
+:where(.fluent-theme, [data-fluent-theme]) :where(tbody tr):hover { background: var(--fluent-control-hover); }
+:where(.fluent-theme, [data-fluent-theme]) :where(tr[aria-selected="true"]) { background: var(--fluent-selection); }
+:where(.fluent-theme, [data-fluent-theme]) :where(button, input, select, textarea, a[href], summary, [tabindex]):focus-visible { outline: 2px solid var(--fluent-accent); outline-offset: 2px; }
+@media (forced-colors: active) {
+  :where(.fluent-theme, [data-fluent-theme]) :where(button, input, textarea, select, progress, meter, a, summary) { forced-color-adjust: auto; }
+}

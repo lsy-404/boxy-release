@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en" data-fluent-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Boxy</title>
+  <style>{{FLUENT_CSS}}</style>
+  <style>{{BOXY_CSS}}</style>
+</head>
+<body>
+  <div class="window">
+    <header class="header">
+      <div class="logo" aria-hidden="true">{{BOXY_LOGO}}</div>
+      <div class="brand">
+        <h1>Boxy</h1>
+        <p>Remote bridge</p>
+      </div>
+      <button id="theme" class="fluent-button fluent-button--subtle theme-button" type="button" aria-label="Switch theme">◐</button>
+    </header>
+
+    <main>
+      <section id="setup" class="view">
+        <h2>Choose a remote</h2>
+        <p class="description">The remote you choose provides the browser editor and decides which operations are available.</p>
+        <form id="connect-form">
+          <label class="fluent-field" for="remote">
+            <span class="fluent-field__label">Remote service URL</span>
+            <input id="remote" class="fluent-field__input" type="url" value="{{INITIAL_URL}}" placeholder="https://service.example" autocomplete="url" spellcheck="false" required autofocus>
+          </label>
+          <p id="error" class="error" role="alert" hidden></p>
+          <div class="actions">
+            <button id="connect" class="fluent-button fluent-button--primary" type="submit">Connect</button>
+          </div>
+        </form>
+        <p class="disclosure">Boxy sends the selected remote an encrypted SV2 session, two SV device IDs, device information, and a list of SV2 related applications. Shell commands ask for separate approval.</p>
+      </section>
+
+      <section id="status" class="view" aria-live="polite" hidden>
+        <div class="status-heading"><span id="status-dot" class="status-dot"></span><h2 id="status-title">Connecting</h2></div>
+        <p id="remote-label" class="remote-label"></p>
+        <p id="status-message" class="status-message">Preparing the encrypted local session...</p>
+        <p id="status-error" class="error" role="alert" hidden></p>
+        <div class="actions status-actions">
+          <button id="open-editor" class="fluent-button" type="button" disabled>Open browser editor</button>
+          <button id="stop" class="fluent-button fluent-button--subtle" type="button">Stop Boxy</button>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script>{{BOXY_JS}}</script>
+</body>
+</html>

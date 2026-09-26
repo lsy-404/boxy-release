@@ -8,20 +8,19 @@ publish = false
 [dependencies]
 base64 = "0.22"
 dirs = "6"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
 iana-time-zone = "0.1"
 rand_core = { version = "0.6", features = ["getrandom"] }
 rfd = "0.17"
-tinyfiledialogs = "3.9.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 sysinfo = "0.39"
+tao = "0.37"
 time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
 ureq = { version = "2", features = ["json"] }
 url = "2"
 webbrowser = "1"
-zeroize = "1.9"
+wry = { version = "0.57", default-features = false, features = ["os-webview"] }
 
 [build-dependencies]
 winresource = "0.1.31"
@@ -44,6 +43,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+xxhash-rust = { version = "0.8", features = ["xxh32"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"

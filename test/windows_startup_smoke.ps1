@@ -34,19 +34,6 @@ public static class BoxyWindowProbe
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern int GetWindowTextW(IntPtr window, StringBuilder text, int capacity);
 
-    [DllImport("user32.dll")]
-    private static extern IntPtr GetDlgItem(IntPtr window, int id);
-
-    [DllImport("user32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool IsWindowEnabled(IntPtr window);
-
-    [DllImport("user32.dll", EntryPoint = "SendMessageW")]
-    private static extern IntPtr SendMessageValue(IntPtr window, uint message, IntPtr first, IntPtr second);
-
-    [DllImport("user32.dll", EntryPoint = "SendMessageW", CharSet = CharSet.Unicode)]
-    private static extern IntPtr SendMessageText(IntPtr window, uint message, IntPtr capacity, StringBuilder text);
-
     private static string WindowText(IntPtr window)
     {
         var text = new StringBuilder(GetWindowTextLengthW(window) + 1);
@@ -70,34 +57,6 @@ public static class BoxyWindowProbe
             return true;
         }, IntPtr.Zero);
         return found;
-    }
-
-    public static string ServiceUrl(IntPtr window)
-    {
-        IntPtr edit = GetDlgItem(window, 101);
-        if (edit == IntPtr.Zero)
-            throw new Exception("Service URL field is missing");
-
-        int length = checked((int)SendMessageValue(edit, 0x000E, IntPtr.Zero, IntPtr.Zero));
-        var text = new StringBuilder(length + 1);
-        SendMessageText(edit, 0x000D, (IntPtr)text.Capacity, text);
-        return text.ToString();
-    }
-
-    public static bool EditorButtonEnabled(IntPtr window)
-    {
-        IntPtr button = GetDlgItem(window, 201);
-        if (button == IntPtr.Zero)
-            throw new Exception("Browser editor button is missing");
-        return IsWindowEnabled(button);
-    }
-
-    public static void Click(IntPtr window, int id)
-    {
-        IntPtr button = GetDlgItem(window, id);
-        if (button == IntPtr.Zero)
-            throw new Exception("Boxy button is missing: " + id);
-        SendMessageValue(button, 0x00F5, IntPtr.Zero, IntPtr.Zero);
     }
 }
 
@@ -217,6 +176,32 @@ public static class BoxyTestServer
 }
 '@
 
+Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+
+function Find-Control([IntPtr]$Window, [string]$Name) {
+  $root = [System.Windows.Automation.AutomationElement]::FromHandle($Window)
+  $condition = [System.Windows.Automation.PropertyCondition]::new(
+    [System.Windows.Automation.AutomationElement]::NameProperty, $Name)
+  for ($attempt = 0; $attempt -lt 40; $attempt++) {
+    $control = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+    if ($null -ne $control) { return $control }
+    Start-Sleep -Milliseconds 500
+  }
+  throw "Boxy control did not appear: $Name"
+}
+
+function Read-Value($Control) {
+  $pattern = [System.Windows.Automation.ValuePattern]$Control.GetCurrentPattern(
+    [System.Windows.Automation.ValuePattern]::Pattern)
+  return $pattern.Current.Value
+}
+
+function Click-Control($Control) {
+  $pattern = [System.Windows.Automation.InvokePattern]$Control.GetCurrentPattern(
+    [System.Windows.Automation.InvokePattern]::Pattern)
+  $pattern.Invoke()
+}
+
 $source = (Resolve-Path -LiteralPath $Executable).Path
 $renamed = Join-Path $env:RUNNER_TEMP 'service.example.test.exe'
 Copy-Item -LiteralPath $source -Destination $renamed -Force
@@ -235,18 +220,18 @@ foreach ($case in $cases) {
       if ($child.HasExited) {
         throw "Boxy exited before showing a window: $($case.Path)"
       }
-      $window = [BoxyWindowProbe]::FindWindowForProcess($child.Id, 'Boxy remote service')
+      $window = [BoxyWindowProbe]::FindWindowForProcess($child.Id, 'Boxy')
       if ($window -ne [IntPtr]::Zero) { break }
       Start-Sleep -Milliseconds 500
     }
     if ($window -eq [IntPtr]::Zero) {
       throw "No visible Boxy startup window: $($case.Path)"
     }
-    $actual = [BoxyWindowProbe]::ServiceUrl($window)
+    $actual = Read-Value (Find-Control $window 'Remote service URL')
     if ($actual -cne $case.ExpectedUrl) {
       throw "Unexpected URL for $($case.Path): '$actual'"
     }
-    Write-Output "Visible Boxy window with URL '$actual': $($case.Path)"
+    Write-Output "Visible Fluent Boxy window with URL '$actual': $($case.Path)"
   }
   finally {
     $child.Refresh()
@@ -265,37 +250,27 @@ try {
   $sessionPath = Join-Path $sessionDirectory 'session.bin'
   [IO.File]::WriteAllBytes($sessionPath, [byte[]](1..8))
   $serverUrl = "http://127.0.0.1:$port"
-  $publicKey = 'WGZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmY'
-  $arguments = @('--server', $serverUrl, '--server-public-key', $publicKey, '--session', $sessionPath)
+  $arguments = @('--server', $serverUrl, '--session', $sessionPath)
   $child = Start-Process -FilePath $source -ArgumentList $arguments -PassThru
   try {
-    $setup = [IntPtr]::Zero
+    $window = [IntPtr]::Zero
     for ($attempt = 0; $attempt -lt 40; $attempt++) {
       $child.Refresh()
-      if ($child.HasExited) { throw 'Boxy exited before showing its setup window' }
-      $setup = [BoxyWindowProbe]::FindWindowForProcess($child.Id, 'Boxy remote service')
-      if ($setup -ne [IntPtr]::Zero) { break }
+      if ($child.HasExited) { throw 'Boxy exited before showing its window' }
+      $window = [BoxyWindowProbe]::FindWindowForProcess($child.Id, 'Boxy')
+      if ($window -ne [IntPtr]::Zero) { break }
       Start-Sleep -Milliseconds 500
     }
-    if ($setup -eq [IntPtr]::Zero) { throw 'Boxy setup window did not appear' }
-    if ([BoxyWindowProbe]::ServiceUrl($setup) -cne $serverUrl) {
+    if ($window -eq [IntPtr]::Zero) { throw 'Boxy window did not appear' }
+    if ((Read-Value (Find-Control $window 'Remote service URL')) -cne $serverUrl) {
       throw 'The local service URL was not prefilled'
     }
-    [BoxyWindowProbe]::Click($setup, 103)
+    Click-Control (Find-Control $window 'Connect')
 
-    $status = [IntPtr]::Zero
-    for ($attempt = 0; $attempt -lt 40; $attempt++) {
-      $child.Refresh()
-      if ($child.HasExited) { throw 'Boxy exited before showing connection status' }
-      $status = [BoxyWindowProbe]::FindWindowForProcess($child.Id, 'Boxy connection status')
-      if ($status -ne [IntPtr]::Zero) { break }
-      Start-Sleep -Milliseconds 500
-    }
-    if ($status -eq [IntPtr]::Zero) { throw 'Boxy connection status window did not appear' }
-
+    $editor = Find-Control $window 'Open browser editor'
     $editorReady = $false
     for ($attempt = 0; $attempt -lt 40; $attempt++) {
-      if ([BoxyWindowProbe]::EditorButtonEnabled($status) -and [BoxyTestServer]::BrowserRequests -gt 0) {
+      if ($editor.Current.IsEnabled -and [BoxyTestServer]::BrowserRequests -gt 0) {
         $editorReady = $true
         break
       }
@@ -304,8 +279,8 @@ try {
       Start-Sleep -Milliseconds 500
     }
     if (-not $editorReady) { throw 'Boxy did not open the browser editor or enable its button' }
-    [BoxyWindowProbe]::Click($status, 201)
-    [BoxyWindowProbe]::Click($status, 202)
+    Click-Control $editor
+    Click-Control (Find-Control $window 'Stop Boxy')
     if (-not $child.WaitForExit(10000)) { throw 'Boxy did not stop after closing the status window' }
     if ($child.ExitCode -ne 0) { throw "Boxy stopped with exit code $($child.ExitCode)" }
     Write-Output 'Boxy status window, automatic browser editor, and reopen button are working'

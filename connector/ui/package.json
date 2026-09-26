@@ -1,0 +1,9 @@
+{
+  "private": true,
+  "scripts": {
+    "sync:fluent": "node ../../scripts/sync-fluent.mjs"
+  },
+  "dependencies": {
+    "@lsypkg/fluent": "https://github.com/lsy-404/platform-kit/releases/download/v0.6.4/platform-kit-fluent-0.2.3.tgz"
+  }
+}

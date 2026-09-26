@@ -1,145 +1,175 @@
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
+};
 
+use serde::Deserialize;
+use serde_json::json;
+use tao::{
+    dpi::LogicalSize,
+    event::{Event, WindowEvent},
+    event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
+    window::WindowBuilder,
+};
 use url::Url;
+use wry::{WebView, WebViewBuilder};
 
-#[cfg(windows)]
-#[path = "windows_service_dialog.rs"]
-mod windows_service_dialog;
+enum UiEvent {
+    Command(UiCommand),
+    Status(String),
+    EditorReady(String),
+    Finished(Result<(), String>),
+}
 
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "camelCase")]
+enum UiCommand {
+    Connect { url: String },
+    OpenEditor,
+    Stop,
+}
+
+#[derive(Clone)]
 pub(crate) struct RunningStatus {
-    #[cfg(windows)]
-    inner: windows_service_dialog::RunningStatus,
+    proxy: EventLoopProxy<UiEvent>,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl RunningStatus {
-    pub(crate) fn open(remote: &str) -> Result<Self, String> {
-        #[cfg(windows)]
-        {
-            Ok(Self {
-                inner: windows_service_dialog::RunningStatus::open(remote)?,
-            })
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = remote;
-            Ok(Self {})
-        }
-    }
-
     pub(crate) fn update(&self, message: &str) {
-        #[cfg(windows)]
-        self.inner.update(message);
-        #[cfg(not(windows))]
-        let _ = message;
+        let _ = self.proxy.send_event(UiEvent::Status(message.to_string()));
     }
 
     pub(crate) fn set_editor_url(&self, url: &str) {
-        #[cfg(windows)]
-        self.inner.set_editor_url(url);
-        #[cfg(not(windows))]
-        let _ = url;
-    }
-
-    pub(crate) fn cancelled(&self) -> bool {
-        #[cfg(windows)]
-        {
-            self.inner.cancelled()
-        }
-        #[cfg(not(windows))]
-        {
-            false
-        }
+        let _ = self.proxy.send_event(UiEvent::EditorReady(url.to_string()));
     }
 
     pub(crate) fn ensure_active(&self) -> Result<(), String> {
-        if self.cancelled() {
+        if self.cancelled.load(Ordering::SeqCst) {
             Err("Boxy was stopped".to_string())
         } else {
             Ok(())
         }
     }
-
-    #[cfg(windows)]
-    pub(crate) fn finish(&self, message: &str) {
-        self.inner.finish(message);
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn wait_for_close(self) {
-        self.inner.wait_for_close();
-    }
 }
 
-#[cfg(not(windows))]
-const STARTUP_NOTICE: &str = "Boxy is a local bridge to the remote service you choose. That service controls the browser editor and remote operations it requests. Boxy sends it an encrypted SV2 session and device information, including installed applications and a listing of the SV2 data directory. The selected service sees your public IP. Every shell command asks for separate approval.\n\nEnter the service address and choose OK to continue. Cancel exits. Keep Boxy open while assistance is active.";
-#[cfg(not(windows))]
-const SIGNING_KEY_NOTICE: &str = "Enter the selected service's base64url Ed25519 public key. Boxy uses this key to verify signed session writebacks. Only use a key supplied by the service owner you trust.";
-
-pub(crate) fn choose_service(
-    initial_url: &str,
-    initial_key: &str,
-) -> Result<Option<(String, String)>, String> {
-    #[cfg(windows)]
-    {
-        windows_service_dialog::choose_service(initial_url, initial_key)
-    }
-    #[cfg(not(windows))]
-    {
-        let Some(url) = choose_service_url(initial_url) else {
-            return Ok(None);
-        };
-        let Some(key) = choose_server_public_key(initial_key) else {
-            return Ok(None);
-        };
-        Ok(Some((url, key)))
-    }
-}
-
-#[cfg(not(windows))]
-fn choose_service_url(initial: &str) -> Option<String> {
-    if initial.contains('\0') {
-        tinyfiledialogs::message_box_ok(
-            "Boxy service address",
-            "The initial service address contains an invalid character.",
-            tinyfiledialogs::MessageBoxIcon::Error,
-        );
-        return None;
-    }
-    let mut value = initial.to_string();
-    loop {
-        let chosen = tinyfiledialogs::input_box("Boxy remote service", STARTUP_NOTICE, &value)?;
-        match validate_service_url(&chosen) {
-            Ok(url) => return Some(url),
-            Err(error) => {
-                tinyfiledialogs::message_box_ok(
-                    "Invalid service address",
-                    &error,
-                    tinyfiledialogs::MessageBoxIcon::Error,
-                );
-                value = chosen;
+pub(crate) fn run_window<F>(initial_url: &str, start: F) -> Result<i32, String>
+where
+    F: FnOnce(String, RunningStatus) -> Result<(), String> + Send + 'static,
+{
+    let event_loop = EventLoopBuilder::<UiEvent>::with_user_event().build();
+    let proxy = event_loop.create_proxy();
+    let window = WindowBuilder::new()
+        .with_title("Boxy")
+        .with_inner_size(LogicalSize::new(560.0, 410.0))
+        .with_resizable(false)
+        .build(&event_loop)
+        .map_err(|error| format!("cannot create Boxy window: {error}"))?;
+    let ipc_proxy = proxy.clone();
+    let webview = WebViewBuilder::new()
+        .with_html(render_html(initial_url))
+        .with_ipc_handler(move |request| {
+            if let Ok(command) = serde_json::from_str::<UiCommand>(request.body()) {
+                let _ = ipc_proxy.send_event(UiEvent::Command(command));
             }
+        })
+        .build(&window)
+        .map_err(|error| format!("cannot load Boxy interface: {error}"))?;
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut start = Some(start);
+    let mut running = false;
+    let mut finished = false;
+    let mut editor_url: Option<String> = None;
+    event_loop.run(move |event, _, control_flow| {
+        *control_flow = ControlFlow::Wait;
+        match event {
+            Event::UserEvent(UiEvent::Command(UiCommand::Connect { url })) if !running => {
+                match validate_service_url(&url) {
+                    Ok(remote) => {
+                        let Some(start) = start.take() else { return };
+                        running = true;
+                        window.set_inner_size(LogicalSize::new(520.0, 310.0));
+                        send_ui(&webview, json!({ "kind": "connected", "remote": remote }));
+                        let worker_proxy = proxy.clone();
+                        let status = RunningStatus {
+                            proxy: worker_proxy.clone(),
+                            cancelled: Arc::clone(&cancelled),
+                        };
+                        thread::spawn(move || {
+                            let result = start(remote, status);
+                            let _ = worker_proxy.send_event(UiEvent::Finished(result));
+                        });
+                    }
+                    Err(error) => send_ui(&webview, json!({ "kind": "error", "message": error })),
+                }
+            }
+            Event::UserEvent(UiEvent::Command(UiCommand::OpenEditor)) => {
+                if let Some(url) = &editor_url {
+                    if let Err(error) = webbrowser::open(url) {
+                        send_ui(&webview, json!({ "kind": "error", "message": format!("Cannot open browser editor: {error}") }));
+                    }
+                }
+            }
+            Event::UserEvent(UiEvent::Command(UiCommand::Stop)) => {
+                if finished || !running {
+                    *control_flow = ControlFlow::Exit;
+                } else {
+                    cancelled.store(true, Ordering::SeqCst);
+                    send_ui(&webview, json!({ "kind": "status", "message": "Stopping Boxy after the current operation..." }));
+                }
+            }
+            Event::UserEvent(UiEvent::Status(message)) => {
+                send_ui(&webview, json!({ "kind": "status", "message": message }));
+            }
+            Event::UserEvent(UiEvent::EditorReady(url)) => {
+                editor_url = Some(url);
+                send_ui(&webview, json!({ "kind": "editorReady" }));
+            }
+            Event::UserEvent(UiEvent::Finished(result)) => {
+                finished = true;
+                if cancelled.load(Ordering::SeqCst) {
+                    *control_flow = ControlFlow::Exit;
+                    return;
+                }
+                match result {
+                    Ok(()) => send_ui(&webview, json!({ "kind": "finished", "message": "The remote session was written back. You can close Boxy." })),
+                    Err(error) => send_ui(&webview, json!({ "kind": "failed", "message": format!("Connection failed: {error}") })),
+                }
+            }
+            Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
+                cancelled.store(true, Ordering::SeqCst);
+                *control_flow = ControlFlow::Exit;
+            }
+            _ => {}
         }
-    }
+    })
 }
 
-#[cfg(not(windows))]
-fn choose_server_public_key(initial: &str) -> Option<String> {
-    let mut value = initial.to_string();
-    loop {
-        let chosen =
-            tinyfiledialogs::input_box("Remote service signing key", SIGNING_KEY_NOTICE, &value)?;
-        match validate_server_public_key(&chosen) {
-            Ok(key) => return Some(key.to_string()),
-            Err(error) => {
-                tinyfiledialogs::message_box_ok(
-                    "Invalid signing key",
-                    &error,
-                    tinyfiledialogs::MessageBoxIcon::Error,
-                );
-                value = chosen;
-            }
-        }
-    }
+fn send_ui(webview: &WebView, payload: serde_json::Value) {
+    let _ = webview.evaluate_script(&format!("window.boxyUpdate({payload})"));
+}
+
+fn render_html(initial_url: &str) -> String {
+    include_str!("../ui/index.html")
+        .replace("{{FLUENT_CSS}}", include_str!("../ui/fluent.css"))
+        .replace("{{BOXY_CSS}}", include_str!("../ui/styles.css"))
+        .replace("{{BOXY_JS}}", include_str!("../ui/app.js"))
+        .replace("{{BOXY_LOGO}}", include_str!("../../assets/boxy-pen.svg"))
+        .replace("{{INITIAL_URL}}", &escape_html(initial_url))
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 pub(crate) fn inferred_service_url(executable: &Path) -> Option<String> {
@@ -185,19 +215,6 @@ fn valid_hostname(candidate: &str) -> bool {
         && labels.last().is_some_and(|suffix| {
             suffix.len() >= 2 && suffix.bytes().all(|byte| byte.is_ascii_alphabetic())
         })
-}
-
-pub(crate) fn validate_server_public_key(value: &str) -> Result<&str, String> {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-
-    let value = value.trim();
-    let decoded = URL_SAFE_NO_PAD
-        .decode(value)
-        .map_err(|_| "Enter a valid base64url service signing key.".to_string())?;
-    if decoded.len() != 32 {
-        return Err("The service signing key must decode to 32 bytes.".to_string());
-    }
-    Ok(value)
 }
 
 pub(crate) fn validate_service_url(value: &str) -> Result<String, String> {
