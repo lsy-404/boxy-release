@@ -109,8 +109,8 @@ pub(crate) fn sv_device_hash() -> Result<String, String> {
     });
     unsafe { LocalFree(sid_text.cast()) };
     let sid_hash = result.ok_or_else(|| "Windows user SID is invalid".to_string())?;
-    let cpu = if unsafe { std::arch::x86_64::__cpuid(0) }.eax >= 1 {
-        unsafe { std::arch::x86_64::__cpuid(1) }.eax
+    let cpu = if std::arch::x86_64::__cpuid(0).eax >= 1 {
+        std::arch::x86_64::__cpuid(1).eax
     } else {
         0
     };

@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, process::Command};
+use std::process::Command;
+
+#[cfg(target_os = "macos")]
+use std::collections::BTreeSet;
 
 use serde::Serialize;
 use sysinfo::{Disks, Networks, System};

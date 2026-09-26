@@ -178,10 +178,15 @@ public static class BoxyTestServer
 
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
 
-function Find-Control([IntPtr]$Window, [string]$Name) {
+function Find-Control([IntPtr]$Window, [string]$Name, $Type = $null) {
   $root = [System.Windows.Automation.AutomationElement]::FromHandle($Window)
   $condition = [System.Windows.Automation.PropertyCondition]::new(
     [System.Windows.Automation.AutomationElement]::NameProperty, $Name)
+  if ($null -ne $Type) {
+    $typeCondition = [System.Windows.Automation.PropertyCondition]::new(
+      [System.Windows.Automation.AutomationElement]::ControlTypeProperty, $Type)
+    $condition = [System.Windows.Automation.AndCondition]::new($condition, $typeCondition)
+  }
   for ($attempt = 0; $attempt -lt 40; $attempt++) {
     $control = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
     if ($null -ne $control) { return $control }
@@ -227,7 +232,7 @@ foreach ($case in $cases) {
     if ($window -eq [IntPtr]::Zero) {
       throw "No visible Boxy startup window: $($case.Path)"
     }
-    $actual = Read-Value (Find-Control $window 'Remote service URL')
+    $actual = Read-Value (Find-Control $window 'Remote service URL' ([System.Windows.Automation.ControlType]::Edit))
     if ($actual -cne $case.ExpectedUrl) {
       throw "Unexpected URL for $($case.Path): '$actual'"
     }
@@ -262,7 +267,7 @@ try {
       Start-Sleep -Milliseconds 500
     }
     if ($window -eq [IntPtr]::Zero) { throw 'Boxy window did not appear' }
-    if ((Read-Value (Find-Control $window 'Remote service URL')) -cne $serverUrl) {
+    if ((Read-Value (Find-Control $window 'Remote service URL' ([System.Windows.Automation.ControlType]::Edit))) -cne $serverUrl) {
       throw 'The local service URL was not prefilled'
     }
     Click-Control (Find-Control $window 'Connect')
