@@ -133,21 +133,52 @@ fn main() {
     if let Some(code) = host_block::run_elevated_host_block_if_requested() {
         std::process::exit(code);
     }
-    if let Err(error) = run() {
-        show_message("Boxy", &error, MessageLevel::Error);
-        std::process::exit(1);
+    let exit_code = match run() {
+        Ok(code) => code,
+        Err(error) => {
+            show_message("Boxy", &error, MessageLevel::Error);
+            1
+        }
+    };
+    if exit_code != 0 {
+        std::process::exit(exit_code);
     }
 }
 
-fn run() -> Result<(), String> {
+fn run() -> Result<i32, String> {
     let Some(config) = Config::from_environment_and_args()? else {
-        return Ok(());
+        return Ok(0);
     };
+    let status = service_selection::RunningStatus::open(&config.server_url)?;
+    let result = run_connected(&config, &status);
+    if status.cancelled() {
+        return Ok(0);
+    }
+    #[cfg(windows)]
+    {
+        match &result {
+            Ok(()) => {
+                status.finish("The signed session writeback was verified. You can close Boxy.")
+            }
+            Err(error) => status.finish(&format!("Connection failed: {error}")),
+        }
+        status.wait_for_close();
+        Ok(i32::from(result.is_err()))
+    }
+    #[cfg(not(windows))]
+    {
+        result?;
+        Ok(0)
+    }
+}
 
+fn run_connected(config: &Config, status: &service_selection::RunningStatus) -> Result<(), String> {
+    status.update("Preparing the encrypted local session...");
     let ciphertext = read_session_ciphertext(&config.session_path)?;
     let source_sha256 = sha256_base64url(&ciphertext);
     let machine = machine_report()?;
     let device_key = load_or_create_device_key()?;
+    status.ensure_active()?;
     let request = ConnectorStartRequest {
         ciphertext: URL_SAFE_NO_PAD.encode(&ciphertext),
         source_sha256: source_sha256.clone(),
@@ -161,20 +192,36 @@ fn run() -> Result<(), String> {
         cached_product_logos: assets::cached_product_logos(&config.session_path),
         session_path: config.session_path.to_string_lossy().into_owned(),
     };
+    status.update("Connecting to the selected remote...");
+    status.ensure_active()?;
     let response =
         post_json::<_, ConnectorStartResponse>(&config.server_url, REQUEST_PATH, &request)?;
+    status.ensure_active()?;
     if response.operation_id.is_empty() || response.browser_url.is_empty() {
         return Err("authorization service returned an incomplete pairing response".to_string());
     }
     let browser_url = validate_browser_url(&config.server_url, &response.browser_url)?;
+    status.ensure_active()?;
+    status.set_editor_url(browser_url.as_str());
+    status.update("Opening the remote editor in your browser...");
     webbrowser::open(browser_url.as_str())
         .map_err(|error| format!("cannot open the authorization browser page: {error}"))?;
+    status.update("Browser opened. Waiting for the selected remote...");
+    #[cfg(not(windows))]
     show_message(
         "Boxy is running",
         "The selected remote is open in your browser. Keep this app running while you use it; Boxy will verify the signed session writeback when the remote finishes.",
         MessageLevel::Info,
     );
-    wait_for_writeback(&config, &device_key, &response.operation_id, &source_sha256)?;
+    wait_for_writeback(
+        config,
+        &device_key,
+        &response.operation_id,
+        &source_sha256,
+        status,
+    )?;
+    status.update("The signed session writeback was verified.");
+    #[cfg(not(windows))]
     show_message(
         "Boxy",
         "The selected remote finished, and the signed session writeback was verified.",
@@ -185,7 +232,11 @@ fn run() -> Result<(), String> {
 
 impl Config {
     fn from_environment_and_args() -> Result<Option<Self>, String> {
-        let mut server_url = env::var("BOXY_API_URL").ok();
+        let mut server_url = env::var("BOXY_API_URL").ok().or_else(|| {
+            env::current_exe()
+                .ok()
+                .and_then(|path| service_selection::inferred_service_url(&path))
+        });
         let mut server_public_key = env::var("BOXY_SERVER_PUBLIC_KEY").ok();
         let mut session_path = None;
         let mut arguments = env::args().skip(1);
@@ -198,8 +249,20 @@ impl Config {
                             .ok_or_else(|| "--server requires a URL".to_string())?,
                     )
                 }
-                "--server-public-key" => server_public_key = arguments.next(),
-                "--session" => session_path = arguments.next().map(PathBuf::from),
+                "--server-public-key" => {
+                    server_public_key = Some(
+                        arguments
+                            .next()
+                            .ok_or_else(|| "--server-public-key requires a key".to_string())?,
+                    )
+                }
+                "--session" => {
+                    session_path = Some(PathBuf::from(
+                        arguments
+                            .next()
+                            .ok_or_else(|| "--session requires a path".to_string())?,
+                    ))
+                }
                 "--help" | "-h" => {
                     return Err(
                         "usage: boxy [--server URL] [--server-public-key BASE64] [--session PATH]"
@@ -209,14 +272,11 @@ impl Config {
                 _ => return Err(format!("unknown argument: {argument}")),
             }
         }
-        let Some(server_url) =
-            service_selection::choose_service_url(server_url.as_deref().unwrap_or_default())
-        else {
-            return Ok(None);
-        };
-        let Some(server_public_key) = service_selection::choose_server_public_key(
+        let Some((server_url, server_public_key)) = service_selection::choose_service(
+            server_url.as_deref().unwrap_or_default(),
             server_public_key.as_deref().unwrap_or_default(),
-        ) else {
+        )?
+        else {
             return Ok(None);
         };
         let public_key = URL_SAFE_NO_PAD
@@ -241,9 +301,11 @@ fn wait_for_writeback(
     device_key: &SigningKey,
     operation_id: &str,
     expected_source_sha256: &str,
+    status: &service_selection::RunningStatus,
 ) -> Result<(), String> {
     let path = format!("/api/v2/connector/operations/{operation_id}");
     loop {
+        status.ensure_active()?;
         let nonce = format!("{}-{}", unix_timestamp(), random_suffix());
         let signature_message = format!("GET\n{path}\n{nonce}");
         let response = get_signed::<ConnectorOperationResponse>(
@@ -252,14 +314,25 @@ fn wait_for_writeback(
             &nonce,
             &URL_SAFE_NO_PAD.encode(device_key.sign(signature_message.as_bytes()).to_bytes()),
         )?;
+        status.ensure_active()?;
         match response.state.as_str() {
             "waiting" | "editor_active" | "temporary_pending_activation" => {
+                let pending_status = match response.state.as_str() {
+                    "editor_active" => "Remote editor is active. Waiting for changes...",
+                    "temporary_pending_activation" => "Remote activation is pending...",
+                    _ => "Connected. Waiting for the remote...",
+                };
+                status.update(pending_status);
                 for task in response.directory_tasks {
+                    status.ensure_active()?;
+                    status.update("Handling a remote operation...");
                     execute_directory_task(config, device_key, operation_id, &task)?;
                 }
+                status.update(pending_status);
                 thread::sleep(Duration::from_secs(2));
             }
             "ready_for_writeback" => {
+                status.update("Verifying the signed session writeback...");
                 let ciphertext = response
                     .ciphertext
                     .ok_or_else(|| "writeback response has no ciphertext".to_string())?;
@@ -301,12 +374,14 @@ fn wait_for_writeback(
                     source_sha256: expected_source_sha256.to_string(),
                     written_sha256,
                 };
+                status.update("Reporting completion to the remote...");
                 post_signed_json(
                     &config.server_url,
                     &format!("{path}/receipt"),
                     device_key,
                     &receipt,
                 )?;
+                #[cfg(not(windows))]
                 show_message(
                     "Boxy",
                     "The authorized session was written back safely.",
@@ -970,6 +1045,7 @@ fn post_json<T: Serialize, R: for<'de> Deserialize<'de>>(
     body: &T,
 ) -> Result<R, String> {
     let response = ureq::post(&format!("{server}{path}"))
+        .timeout(Duration::from_secs(30))
         .set("Content-Type", "application/json")
         .send_json(serde_json::to_value(body).map_err(|error| error.to_string())?);
     parse_response(response)
@@ -982,6 +1058,7 @@ fn get_signed<R: for<'de> Deserialize<'de>>(
     signature: &str,
 ) -> Result<R, String> {
     let response = ureq::get(&format!("{server}{path}"))
+        .timeout(Duration::from_secs(30))
         .set("X-Connector-Nonce", nonce)
         .set("X-Connector-Signature", signature)
         .call();
@@ -997,6 +1074,7 @@ fn post_signed_json<T: Serialize>(
     let nonce = format!("{}-{}", unix_timestamp(), random_suffix());
     let signed = format!("POST\n{path}\n{nonce}");
     let response = ureq::post(&format!("{server}{path}"))
+        .timeout(Duration::from_secs(30))
         .set("Content-Type", "application/json")
         .set("X-Connector-Nonce", &nonce)
         .set(

@@ -36,6 +36,11 @@ if (!isWindows && !isMac) {
   fail(`Unsupported target triple: ${targetTriple}`);
 }
 
+const isUniversalMac = isMac && targetTriple.startsWith("universal-");
+if (isUniversalMac && !binaryOverride) {
+  fail("Universal macOS packaging requires --binary with a merged arm64 and x86_64 executable.");
+}
+
 const binaryName = isWindows ? "boxy.exe" : "boxy";
 const defaultBinary = resolve(repositoryRoot, "target", targetTriple, "release", binaryName);
 const binaryPath = binaryOverride
@@ -68,7 +73,13 @@ function packageMac() {
   mkdirSync(resourcesDir, { recursive: true });
 
   const appBinary = join(macosDir, "boxy");
+  if (isUniversalMac) {
+    execFileSync("lipo", [binaryPath, "-verify_arch", "arm64", "x86_64"]);
+  }
   copyFileSync(binaryPath, appBinary);
+  if (isUniversalMac) {
+    execFileSync("lipo", [appBinary, "-verify_arch", "arm64", "x86_64"]);
+  }
   chmodSync(appBinary, 0o755);
   writeFileSync(join(contentsDir, "Info.plist"), infoPlist(version));
 
@@ -80,7 +91,7 @@ function packageMac() {
     console.warn("Ad-hoc codesign skipped or failed; continuing.");
   }
 
-  const arch = targetTriple.startsWith("aarch64") ? "arm64" : "x64";
+  const arch = isUniversalMac ? "universal" : targetTriple.startsWith("aarch64") ? "arm64" : "x64";
   const zipPath = join(outputDir, `boxy-macos-${arch}.zip`);
   rmSync(zipPath, { force: true });
   try {

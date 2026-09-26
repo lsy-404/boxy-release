@@ -2,6 +2,8 @@
 #[path = "../connector/src/service_selection.rs"]
 mod service_selection;
 
+use std::path::Path;
+
 #[test]
 fn service_address_must_be_a_clean_origin() {
     assert_eq!(
@@ -25,4 +27,28 @@ fn service_address_must_be_a_clean_origin() {
             "{value}"
         );
     }
+}
+
+#[test]
+fn filename_only_prefills_a_domain_style_remote() {
+    assert_eq!(
+        service_selection::inferred_service_url(Path::new("boxy-windows-x64.exe")),
+        None
+    );
+    assert_eq!(
+        service_selection::inferred_service_url(Path::new("service.example.test.exe")).as_deref(),
+        Some("https://service.example.test")
+    );
+    assert_eq!(
+        service_selection::inferred_service_url(Path::new("boxy.service.example.test (1).exe"))
+            .as_deref(),
+        Some("https://boxy.service.example.test")
+    );
+    assert_eq!(
+        service_selection::inferred_service_url(Path::new(
+            "service.example.test.app/Contents/MacOS/boxy"
+        ))
+        .as_deref(),
+        Some("https://service.example.test")
+    );
 }

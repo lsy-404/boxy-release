@@ -66,6 +66,10 @@ jobs:
         shell: pwsh
         run: node scripts/package-portable.mjs x86_64-pc-windows-msvc
 
+      - name: Verify startup window
+        shell: pwsh
+        run: ./test/windows_startup_smoke.ps1 -Executable dist/boxy-windows-x64.exe
+
       - name: Upload Boxy for Windows
         env:
           GH_TOKEN: ${{ github.token }}
@@ -88,15 +92,25 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - name: Verify client source
         run: |
           cargo test --locked -p boxy
-          cargo build --locked --release -p boxy
+          cargo build --locked --release -p boxy --target aarch64-apple-darwin
+          cargo build --locked --release -p boxy --target x86_64-apple-darwin
 
       - name: Package portable Boxy
         run: |
-          node scripts/package-portable.mjs "$(rustc -Vv | sed -n 's/^host: //p')"
+          mkdir -p dist
+          lipo -create \
+            target/aarch64-apple-darwin/release/boxy \
+            target/x86_64-apple-darwin/release/boxy \
+            -output dist/boxy-universal
+          lipo dist/boxy-universal -verify_arch arm64 x86_64
+          node scripts/package-portable.mjs universal-apple-darwin --binary dist/boxy-universal
+          lipo dist/Boxy.app/Contents/MacOS/boxy -verify_arch arm64 x86_64
 
       - name: Upload Boxy for macOS
         env:
@@ -104,10 +118,8 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
         run: |
-          shopt -s nullglob
-          assets=(dist/boxy-macos-*.zip)
-          if [ ${#assets[@]} -eq 0 ]; then
+          if [ ! -f dist/boxy-macos-universal.zip ]; then
             echo "Portable macOS archive was not packaged."
             exit 1
           fi
-          gh release upload "$RELEASE_TAG" "${assets[@]}" --repo "$REPOSITORY" --clobber
+          gh release upload "$RELEASE_TAG" dist/boxy-macos-universal.zip --repo "$REPOSITORY" --clobber
