@@ -31,6 +31,7 @@ const MAX_TOOLBAR_BUTTONS: usize = 512;
 const SEND_TIMEOUT_MS: u32 = 1000;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct ToolbarButton {
     _bitmap: i32,
     _command: i32,
@@ -41,6 +42,7 @@ struct ToolbarButton {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct TrayData {
     window: HWND,
     _id: u32,
