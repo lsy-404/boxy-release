@@ -275,7 +275,7 @@ fn tray_applications() -> Vec<String> {
     }
     #[cfg(windows)]
     {
-        Vec::new()
+        crate::windows_tray::collect()
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {
@@ -335,7 +335,11 @@ fn defaults_array(arguments: &[&str]) -> Vec<String> {
 }
 
 fn command_output(program: &str, arguments: &[&str]) -> Option<String> {
-    let output = Command::new(program).args(arguments).output().ok()?;
+    let mut command = Command::new(program);
+    command.args(arguments);
+    #[cfg(windows)]
+    crate::windows_process::configure_background(&mut command);
+    let output = command.output().ok()?;
     if !output.status.success() || output.stdout.len() > MAX_COMMAND_BYTES {
         return None;
     }

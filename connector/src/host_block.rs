@@ -1162,10 +1162,10 @@ fn ensure_fixed_webview_runtime() -> Result<(), String> {
         let extract = staging.join("extract");
         fs::create_dir(&extract)
             .map_err(|error| format!("cannot create WebView2 extraction directory: {error}"))?;
-        let status = std::process::Command::new("expand.exe")
-            .arg(&cab)
-            .arg("-F:*")
-            .arg(&extract)
+        let mut command = std::process::Command::new("expand.exe");
+        command.arg(&cab).arg("-F:*").arg(&extract);
+        crate::windows_process::configure_background(&mut command);
+        let status = command
             .status()
             .map_err(|error| format!("cannot start Windows CAB extraction: {error}"))?;
         if !status.success() {
@@ -1516,14 +1516,17 @@ fn rollback_committed_wfp_block(engine: &WfpEngine) -> Result<(), String> {
 
 #[cfg(windows)]
 fn sv2_is_running(executable: &Path) -> Result<bool, String> {
-    let status = std::process::Command::new("powershell.exe")
+    let mut command = std::process::Command::new("powershell.exe");
+    command
         .env("BOXY_SV2_EXECUTABLE", executable)
         .args([
             "-NoProfile",
             "-NonInteractive",
             "-Command",
             "$target = [IO.Path]::GetFullPath($env:BOXY_SV2_EXECUTABLE).TrimEnd('\\'); foreach ($process in @(Get-Process -Name 'synthv-studio' -ErrorAction SilentlyContinue)) { try { $path = $process.Path } catch { exit 0 }; if (-not $path) { exit 0 }; if ([IO.Path]::GetFullPath($path).TrimEnd('\\') -ieq $target) { exit 0 } }; exit 1",
-        ])
+        ]);
+    crate::windows_process::configure_background(&mut command);
+    let status = command
         .status()
         .map_err(|error| format!("cannot check whether SV2 is running: {error}"))?;
     Ok(status.success())
@@ -1668,15 +1671,16 @@ enum PolicyChange {
 
 #[cfg(windows)]
 fn ensure_webview_runtime_access(runtime: &Path) -> Result<(), String> {
-    let output = std::process::Command::new("icacls.exe")
-        .arg(runtime)
-        .args([
-            "/grant",
-            "*S-1-15-2-2:(OI)(CI)(RX)",
-            "/grant",
-            "*S-1-15-2-1:(OI)(CI)(RX)",
-            "/T",
-        ])
+    let mut command = std::process::Command::new("icacls.exe");
+    command.arg(runtime).args([
+        "/grant",
+        "*S-1-15-2-2:(OI)(CI)(RX)",
+        "/grant",
+        "*S-1-15-2-1:(OI)(CI)(RX)",
+        "/T",
+    ]);
+    crate::windows_process::configure_background(&mut command);
+    let output = command
         .output()
         .map_err(|error| {
             format!(

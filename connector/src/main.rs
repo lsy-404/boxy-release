@@ -6,6 +6,10 @@ mod host_block;
 mod product_database;
 mod service_selection;
 mod session_io;
+#[cfg(windows)]
+mod windows_process;
+#[cfg(windows)]
+mod windows_tray;
 
 use std::{
     env,
@@ -311,17 +315,19 @@ fn installed_applications() -> Vec<String> {
     #[cfg(windows)]
     {
         use winreg::{
-            enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE},
+            enums::{
+                HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY,
+            },
             RegKey,
         };
         let mut applications = Vec::new();
         for hive in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
             let root = RegKey::predef(hive);
-            for path in [
-                "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
-                "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
-            ] {
-                if let Ok(uninstall) = root.open_subkey(path) {
+            for view in [KEY_READ | KEY_WOW64_64KEY, KEY_READ | KEY_WOW64_32KEY] {
+                if let Ok(uninstall) = root.open_subkey_with_flags(
+                    "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+                    view,
+                ) {
                     for key in uninstall.enum_keys().flatten() {
                         if let Ok(entry) = uninstall.open_subkey(key) {
                             if let Ok(name) = entry.get_value::<String, _>("DisplayName") {
@@ -581,7 +587,7 @@ fn run_shell_command(
 fn shell_process(shell: &str, command: &str) -> Command {
     #[cfg(windows)]
     {
-        match shell {
+        let mut process = match shell {
             "powershell" => {
                 let mut process = Command::new("powershell");
                 process.args(["-NoProfile", "-NonInteractive", "-Command", command]);
@@ -592,7 +598,9 @@ fn shell_process(shell: &str, command: &str) -> Command {
                 process.args(["/C", command]);
                 process
             }
-        }
+        };
+        windows_process::configure_background(&mut process);
+        process
     }
     #[cfg(not(windows))]
     {

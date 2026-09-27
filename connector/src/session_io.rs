@@ -37,13 +37,15 @@ pub fn launch_sv2() -> Result<Sv2ControlResult, String> {
 pub fn close_sv2() -> Result<Sv2ControlResult, String> {
     #[cfg(windows)]
     {
-        let output = std::process::Command::new("powershell.exe")
-            .args([
+        let mut command = std::process::Command::new("powershell.exe");
+        command.args([
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
                 "$items = @(Get-Process -Name 'synthv-studio' -ErrorAction SilentlyContinue); if ($items.Count -eq 0) { exit 2 }; $accepted = $false; foreach ($item in $items) { if ($item.CloseMainWindow()) { $accepted = $true } }; if (-not $accepted) { exit 3 }; $deadline = (Get-Date).AddSeconds(12); do { Start-Sleep -Milliseconds 250; $remaining = @(Get-Process -Name 'synthv-studio' -ErrorAction SilentlyContinue) } while ($remaining.Count -gt 0 -and (Get-Date) -lt $deadline); if ($remaining.Count -gt 0) { exit 4 }; exit 0",
-            ])
+            ]);
+        crate::windows_process::configure_background(&mut command);
+        let output = command
             .output()
             .map_err(|error| format!("cannot request SV2 to close: {error}"))?;
         return match output.status.code() {
