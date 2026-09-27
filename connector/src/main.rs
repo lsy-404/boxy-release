@@ -1,11 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod assets;
 mod device_ids;
 mod device_info;
 mod host_block;
+mod network_block;
 mod product_database;
 mod service_selection;
 mod session_io;
+#[cfg(windows)]
+mod windows_firewall;
 #[cfg(windows)]
 mod windows_process;
 #[cfg(windows)]
@@ -13,7 +17,7 @@ mod windows_tray;
 
 use std::{
     env,
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -22,12 +26,17 @@ use std::{
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use ed25519_dalek::{Signer, SigningKey};
+use rand_core::{OsRng, RngCore};
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
+use zeroize::{Zeroize, Zeroizing};
 
 const MAX_SESSION_BYTES: usize = 1024 * 1024;
+const MAX_DIRECTORY_ENTRIES: usize = 100_000;
+const MAX_START_REQUEST_BYTES: usize = (4 * 1024 * 1024 + 2) / 3 + 16 * 1024;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_COMMAND_SECONDS: u64 = 3600;
 const REQUEST_PATH: &str = "/api/v2/connector/operations";
@@ -42,9 +51,31 @@ struct Config {
 #[serde(rename_all = "camelCase")]
 struct ConnectorStartRequest {
     ciphertext: String,
+    source_sha256: String,
     machine: MachineReport,
+    device_public_key: String,
+    connector_version: String,
+    directory_manifest: Vec<DirectoryEntry>,
     installed_applications: Vec<String>,
     device_info: device_info::DeviceInfo,
+    server_translations: Vec<assets::ServerTranslationCatalog>,
+    cached_product_logos: Vec<assets::CachedProductLogo>,
+    session_path: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DirectoryEntry {
+    path: String,
+    size: u64,
+    sha256: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectorReceipt {
+    source_sha256: String,
+    written_sha256: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -78,6 +109,8 @@ struct ConnectorStartResponse {
 struct ConnectorOperationResponse {
     state: String,
     ciphertext: Option<String>,
+    source_sha256: Option<String>,
+    expires_at: Option<String>,
     #[serde(default)]
     directory_tasks: Vec<DirectoryTask>,
 }
@@ -100,6 +133,8 @@ struct DirectoryTask {
     #[serde(default)]
     blocked: Option<bool>,
     #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
     action: Option<String>,
     #[serde(default)]
     items: Vec<product_database::FetchItem>,
@@ -109,6 +144,14 @@ struct DirectoryTask {
 
 fn main() {
     if let Some(code) = host_block::run_elevated_host_block_if_requested() {
+        std::process::exit(code);
+    }
+    #[cfg(windows)]
+    if let Some(code) = windows_firewall::run_elevated_if_requested() {
+        std::process::exit(code);
+    }
+    #[cfg(windows)]
+    if let Some(code) = network_block::run_elevated_if_requested() {
         std::process::exit(code);
     }
     let exit_code = match run() {
@@ -139,13 +182,36 @@ fn run_connected(config: &Config, status: &service_selection::RunningStatus) -> 
     let ciphertext = read_session_ciphertext(&config.session_path)?;
     let source_sha256 = sha256_base64url(&ciphertext);
     let machine = machine_report()?;
+    let device_key = load_or_create_device_key()?;
     status.ensure_active()?;
-    let request = ConnectorStartRequest {
+    let mut request = ConnectorStartRequest {
         ciphertext: URL_SAFE_NO_PAD.encode(&ciphertext),
+        source_sha256: source_sha256.clone(),
         machine,
+        device_public_key: URL_SAFE_NO_PAD.encode(device_key.verifying_key().as_bytes()),
+        connector_version: env!("CARGO_PKG_VERSION").to_string(),
+        directory_manifest: directory_manifest(&sv2_root(&config.session_path)?)?,
         installed_applications: installed_applications(),
         device_info: device_info::collect(),
+        server_translations: assets::server_translations(&config.session_path),
+        cached_product_logos: assets::cached_product_logos(&config.session_path),
+        session_path: config.session_path.to_string_lossy().into_owned(),
     };
+    let mut request_bytes = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
+    if request_bytes.len() > MAX_START_REQUEST_BYTES && !request.server_translations.is_empty() {
+        request.server_translations.clear();
+        request_bytes = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
+    }
+    if request_bytes.len() > MAX_START_REQUEST_BYTES && !request.cached_product_logos.is_empty() {
+        request.cached_product_logos.clear();
+        request_bytes = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
+    }
+    if request_bytes.len() > MAX_START_REQUEST_BYTES {
+        return Err(
+            "SV2 data directory metadata exceeds the authorization service request limit; no partial directory manifest was sent"
+                .to_string(),
+        );
+    }
     status.update("Connecting to the selected remote...");
     status.ensure_active()?;
     let response =
@@ -163,7 +229,13 @@ fn run_connected(config: &Config, status: &service_selection::RunningStatus) -> 
         .map_err(|error| format!("cannot open the authorization browser page: {error}"))?;
     status.set_editor_url(stable_editor_url.as_str());
     status.update("Browser opened. Waiting for the selected remote...");
-    wait_for_writeback(config, &response.operation_id, &source_sha256, status)?;
+    wait_for_writeback(
+        config,
+        &device_key,
+        &response.operation_id,
+        &source_sha256,
+        status,
+    )?;
     status.update("The remote session was written back.");
     Ok(())
 }
@@ -213,6 +285,7 @@ impl LaunchOptions {
 
 fn wait_for_writeback(
     config: &Config,
+    device_key: &SigningKey,
     operation_id: &str,
     expected_source_sha256: &str,
     status: &service_selection::RunningStatus,
@@ -220,7 +293,13 @@ fn wait_for_writeback(
     let path = format!("/api/v2/connector/operations/{operation_id}");
     loop {
         status.ensure_active()?;
-        let response = get_json::<ConnectorOperationResponse>(&config.server_url, &path)?;
+        let (nonce, signature) = request_signature(device_key, "GET", &path);
+        let response = get_signed::<ConnectorOperationResponse>(
+            &config.server_url,
+            &path,
+            &nonce,
+            &signature,
+        )?;
         status.ensure_active()?;
         match response.state.as_str() {
             "waiting" | "editor_active" | "temporary_pending_activation" => {
@@ -233,7 +312,7 @@ fn wait_for_writeback(
                 for task in response.directory_tasks {
                     status.ensure_active()?;
                     status.update("Handling a remote operation...");
-                    execute_directory_task(config, operation_id, &task)?;
+                    execute_directory_task(config, device_key, operation_id, &task)?;
                 }
                 status.update(pending_status);
                 thread::sleep(Duration::from_secs(2));
@@ -243,19 +322,41 @@ fn wait_for_writeback(
                 let ciphertext = response
                     .ciphertext
                     .ok_or_else(|| "writeback response has no ciphertext".to_string())?;
+                let source_sha256 = response
+                    .source_sha256
+                    .ok_or_else(|| "writeback response has no source hash".to_string())?;
+                let expires_at = response
+                    .expires_at
+                    .ok_or_else(|| "writeback response has no expiry".to_string())?
+                    .parse::<u128>()
+                    .map_err(|_| "writeback expiry is invalid".to_string())?;
+                if source_sha256 != expected_source_sha256 {
+                    return Err(
+                        "the authorization service response does not match the loaded session"
+                            .to_string(),
+                    );
+                }
+                if expires_at <= unix_timestamp_millis() {
+                    return Err("writeback response has expired".to_string());
+                }
                 let ciphertext = URL_SAFE_NO_PAD
                     .decode(ciphertext)
                     .map_err(|_| "writeback ciphertext is invalid".to_string())?;
-                replace_session_if_unchanged(
+                let written_sha256 = replace_session_if_unchanged(
                     &config.session_path,
                     expected_source_sha256,
                     &ciphertext,
                 )?;
                 status.update("Reporting completion to the remote...");
-                let _: serde_json::Value = post_json(
+                let receipt = ConnectorReceipt {
+                    source_sha256: expected_source_sha256.to_string(),
+                    written_sha256,
+                };
+                post_signed_json(
                     &config.server_url,
                     &format!("{path}/receipt"),
-                    &serde_json::json!({}),
+                    device_key,
+                    &receipt,
                 )?;
                 return Ok(());
             }
@@ -287,6 +388,64 @@ fn sv2_root(session_path: &Path) -> Result<PathBuf, String> {
         .and_then(Path::parent)
         .map(Path::to_path_buf)
         .ok_or_else(|| "cannot resolve the SV2 data directory".to_string())
+}
+
+fn directory_manifest(root: &Path) -> Result<Vec<DirectoryEntry>, String> {
+    let root = fs::canonicalize(root)
+        .map_err(|error| format!("cannot access SV2 data directory: {error}"))?;
+    let mut entries = Vec::new();
+    collect_directory_entries(&root, &root, &mut entries)?;
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(entries)
+}
+
+fn collect_directory_entries(
+    root: &Path,
+    directory: &Path,
+    entries: &mut Vec<DirectoryEntry>,
+) -> Result<(), String> {
+    for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let file_type = entry.file_type().map_err(|error| error.to_string())?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            collect_directory_entries(root, &path, entries)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        if entries.len() >= MAX_DIRECTORY_ENTRIES {
+            return Err("SV2 data directory contains too many files to report".to_string());
+        }
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| "SV2 path escaped its root".to_string())?;
+        let size = entry.metadata().map_err(|error| error.to_string())?.len();
+        entries.push(DirectoryEntry {
+            path: relative.to_string_lossy().replace('\\', "/"),
+            size,
+            sha256: sha256_file(&path)?,
+        });
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|error| error.to_string())?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+    }
+    Ok(URL_SAFE_NO_PAD.encode(hash.finalize()))
 }
 
 fn installed_applications() -> Vec<String> {
@@ -357,6 +516,7 @@ fn is_sv2_application(name: &str) -> bool {
 
 fn execute_directory_task(
     config: &Config,
+    key: &SigningKey,
     operation_id: &str,
     task: &DirectoryTask,
 ) -> Result<(), String> {
@@ -375,15 +535,16 @@ fn execute_directory_task(
             )?;
             let bytes = fs::read(&path)
                 .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-            put_task_content(config, &format!("{base}/content"), &bytes)?;
+            put_task_content(config, key, &format!("{base}/content"), &bytes)?;
             complete_task(
                 config,
+                key,
                 &format!("{base}/complete"),
                 serde_json::json!({"sha256": sha256_base64url(&bytes), "size": bytes.len()}),
             )
         }
         "write" => {
-            let bytes = get_task_content(config, &format!("{base}/content"))?;
+            let bytes = get_task_content(config, key, &format!("{base}/content"))?;
             if task
                 .expected_sha256
                 .as_deref()
@@ -402,12 +563,13 @@ fn execute_directory_task(
             )?;
             complete_task(
                 config,
+                key,
                 &format!("{base}/complete"),
                 serde_json::json!({"sha256": sha256_base64url(&bytes), "size": bytes.len()}),
             )
         }
         "download" => {
-            let bytes = get_task_content(config, &format!("{base}/content"))?;
+            let bytes = get_task_content(config, key, &format!("{base}/content"))?;
             let name = task
                 .relative_path
                 .as_deref()
@@ -419,26 +581,39 @@ fn execute_directory_task(
             atomic_write(&target, &bytes)?;
             complete_task(
                 config,
+                key,
                 &format!("{base}/complete"),
                 serde_json::json!({"sha256": sha256_base64url(&bytes), "size": bytes.len()}),
             )
         }
         "machine_material" => complete_task(
             config,
+            key,
             &format!("{base}/complete"),
             serde_json::to_value(machine_report()?).map_err(|error| error.to_string())?,
         ),
-        "command" => execute_command_task(config, &base, task),
+        "command" => execute_command_task(config, key, &base, task),
         "host_block" => {
-            let result = match task.blocked {
-                Some(blocked) => host_block::set_blocked(blocked),
-                None => host_block::status(),
+            let result = match task.mode.as_deref() {
+                Some("status") => Ok(network_block::status()),
+                Some(mode) => task
+                    .blocked
+                    .ok_or_else(|| "network block task has no blocked state".to_string())
+                    .and_then(|blocked| {
+                        network_block::BlockMode::parse(mode)
+                            .and_then(|mode| network_block::set_blocked(blocked, mode))
+                    }),
+                None => Err("network block task has no mode".to_string()),
             };
             let result = match result {
                 Ok(status) => serde_json::to_value(status).map_err(|error| error.to_string())?,
-                Err(error) => serde_json::json!({"error": error}),
+                Err(error) => serde_json::json!({
+                    "failed": true,
+                    "error": error,
+                    "status": network_block::status(),
+                }),
             };
-            complete_task(config, &format!("{base}/complete"), result)
+            complete_task(config, key, &format!("{base}/complete"), result)
         }
         "sv2_action" => {
             let action = task
@@ -452,6 +627,7 @@ fn execute_directory_task(
             };
             complete_task(
                 config,
+                key,
                 &format!("{base}/complete"),
                 serde_json::to_value(result).map_err(|error| error.to_string())?,
             )
@@ -460,12 +636,14 @@ fn execute_directory_task(
             session_io::open_session_folder(&config.session_path)?;
             complete_task(
                 config,
+                key,
                 &format!("{base}/complete"),
                 serde_json::json!({ "ok": true }),
             )
         }
         "product_inspect" => complete_task(
             config,
+            key,
             &format!("{base}/complete"),
             serde_json::json!({ "databases": product_database::inspect() }),
         ),
@@ -476,8 +654,13 @@ fn execute_directory_task(
             }
             complete_task(
                 config,
+                key,
                 &format!("{base}/complete"),
-                serde_json::json!({ "items": results }),
+                serde_json::json!({
+                    "action": task.action,
+                    "productId": task.product_id,
+                    "items": results,
+                }),
             )
         }
         "product_delete" => {
@@ -488,6 +671,7 @@ fn execute_directory_task(
             product_database::delete(id)?;
             complete_task(
                 config,
+                key,
                 &format!("{base}/complete"),
                 serde_json::json!({ "id": id, "installed": false }),
             )
@@ -496,7 +680,12 @@ fn execute_directory_task(
     }
 }
 
-fn execute_command_task(config: &Config, base: &str, task: &DirectoryTask) -> Result<(), String> {
+fn execute_command_task(
+    config: &Config,
+    key: &SigningKey,
+    base: &str,
+    task: &DirectoryTask,
+) -> Result<(), String> {
     let command = task
         .command
         .as_deref()
@@ -512,6 +701,7 @@ fn execute_command_task(config: &Config, base: &str, task: &DirectoryTask) -> Re
     if !approve_command(command, shell, &cwd.to_string_lossy()) {
         return complete_task(
             config,
+            key,
             &format!("{base}/complete"),
             serde_json::json!({ "denied": true, "command": command }),
         );
@@ -535,7 +725,7 @@ fn execute_command_task(config: &Config, base: &str, task: &DirectoryTask) -> Re
             serde_json::json!({ "command": command, "shell": shell, "failed": true, "error": error })
         }
     };
-    complete_task(config, &format!("{base}/complete"), body)
+    complete_task(config, key, &format!("{base}/complete"), body)
 }
 
 struct CommandResult {
@@ -678,7 +868,7 @@ fn replace_session_if_unchanged(
     path: &Path,
     expected_sha256: &str,
     ciphertext: &[u8],
-) -> Result<(), String> {
+) -> Result<String, String> {
     if ciphertext.is_empty()
         || ciphertext.len() > MAX_SESSION_BYTES
         || !ciphertext.len().is_multiple_of(8)
@@ -712,7 +902,7 @@ fn replace_session_if_unchanged(
     if written != ciphertext {
         return Err("written session verification failed".to_string());
     }
-    Ok(())
+    Ok(sha256_base64url(&written))
 }
 
 fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -732,6 +922,61 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
         return Err(format!("cannot write {}: {error}", path.display()));
     }
     Ok(())
+}
+
+fn load_or_create_device_key() -> Result<SigningKey, String> {
+    let directory = dirs::data_local_dir()
+        .ok_or_else(|| "cannot resolve the local connector data folder".to_string())?
+        .join("SynthVCopilot")
+        .join("Boxy");
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("cannot create connector data folder: {error}"))?;
+    let path = directory.join("device-signing-key");
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err("connector device key is not a regular file".to_string());
+        }
+        Ok(_) => return read_device_key(&path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("cannot inspect connector device key: {error}")),
+    }
+
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let mut secret = signing_key.to_bytes();
+    let encoded = Zeroizing::new(URL_SAFE_NO_PAD.encode(secret));
+    secret.zeroize();
+    match write_new_file(&path, encoded.as_bytes()) {
+        Ok(()) => Ok(signing_key),
+        Err(_error) if path.is_file() => read_device_key(&path),
+        Err(error) => Err(error),
+    }
+}
+
+fn read_device_key(path: &Path) -> Result<SigningKey, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect connector device key: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("connector device key is not a regular file".to_string());
+    }
+    if metadata.len() > 128 {
+        return Err("connector device key has an invalid length".to_string());
+    }
+    let encoded = Zeroizing::new(
+        fs::read_to_string(path)
+            .map_err(|error| format!("cannot read connector device key: {error}"))?,
+    );
+    let bytes = Zeroizing::new(
+        URL_SAFE_NO_PAD
+            .decode(encoded.trim())
+            .map_err(|_| "connector device key is invalid".to_string())?,
+    );
+    let mut secret: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "connector device key has an invalid length".to_string())?;
+    let signing_key = SigningKey::from_bytes(&secret);
+    secret.zeroize();
+    Ok(signing_key)
 }
 
 fn machine_report() -> Result<MachineReport, String> {
@@ -860,18 +1105,50 @@ fn post_json<T: Serialize, R: for<'de> Deserialize<'de>>(
     parse_response(response)
 }
 
-fn get_json<R: for<'de> Deserialize<'de>>(server: &str, path: &str) -> Result<R, String> {
+fn get_signed<R: for<'de> Deserialize<'de>>(
+    server: &str,
+    path: &str,
+    nonce: &str,
+    signature: &str,
+) -> Result<R, String> {
     parse_response(
         ureq::get(&format!("{server}{path}"))
             .timeout(Duration::from_secs(30))
+            .set("X-Connector-Nonce", nonce)
+            .set("X-Connector-Signature", signature)
             .call(),
     )
 }
 
-fn put_task_content(config: &Config, path: &str, bytes: &[u8]) -> Result<(), String> {
+fn post_signed_json<T: Serialize>(
+    server: &str,
+    path: &str,
+    key: &SigningKey,
+    body: &T,
+) -> Result<(), String> {
+    let (nonce, signature) = request_signature(key, "POST", path);
+    let response = ureq::post(&format!("{server}{path}"))
+        .timeout(Duration::from_secs(30))
+        .set("Content-Type", "application/json")
+        .set("X-Connector-Nonce", &nonce)
+        .set("X-Connector-Signature", &signature)
+        .send_json(serde_json::to_value(body).map_err(|error| error.to_string())?);
+    let _: serde_json::Value = parse_response(response)?;
+    Ok(())
+}
+
+fn put_task_content(
+    config: &Config,
+    key: &SigningKey,
+    path: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let (nonce, signature) = request_signature(key, "PUT", path);
     match ureq::put(&format!("{}{}", config.server_url, path))
         .timeout(Duration::from_secs(30))
         .set("Content-Length", &bytes.len().to_string())
+        .set("X-Connector-Nonce", &nonce)
+        .set("X-Connector-Signature", &signature)
         .send_bytes(bytes)
     {
         Ok(_) => Ok(()),
@@ -879,9 +1156,12 @@ fn put_task_content(config: &Config, path: &str, bytes: &[u8]) -> Result<(), Str
     }
 }
 
-fn get_task_content(config: &Config, path: &str) -> Result<Vec<u8>, String> {
+fn get_task_content(config: &Config, key: &SigningKey, path: &str) -> Result<Vec<u8>, String> {
+    let (nonce, signature) = request_signature(key, "GET", path);
     let response = ureq::get(&format!("{}{}", config.server_url, path))
         .timeout(Duration::from_secs(30))
+        .set("X-Connector-Nonce", &nonce)
+        .set("X-Connector-Signature", &signature)
         .call()
         .map_err(|error| format!("cannot download directory content: {error}"))?;
     let mut bytes = Vec::new();
@@ -893,9 +1173,29 @@ fn get_task_content(config: &Config, path: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn complete_task(config: &Config, path: &str, body: serde_json::Value) -> Result<(), String> {
-    let _: serde_json::Value = post_json(&config.server_url, path, &body)?;
-    Ok(())
+fn complete_task(
+    config: &Config,
+    key: &SigningKey,
+    path: &str,
+    body: serde_json::Value,
+) -> Result<(), String> {
+    post_signed_json(&config.server_url, path, key, &body)
+}
+
+fn request_signature(key: &SigningKey, method: &str, path: &str) -> (String, String) {
+    let nonce = format!("{}-{}", unix_timestamp(), random_suffix());
+    let signed = format!("{method}\n{path}\n{nonce}");
+    (
+        nonce,
+        URL_SAFE_NO_PAD.encode(key.sign(signed.as_bytes()).to_bytes()),
+    )
+}
+
+fn random_suffix() -> String {
+    let mut bytes = [0u8; 16];
+    let mut rng = OsRng;
+    rng.fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
 }
 
 fn parse_response<R: for<'de> Deserialize<'de>>(
@@ -923,6 +1223,13 @@ fn unix_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn unix_timestamp_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
         .unwrap_or(0)
 }
 

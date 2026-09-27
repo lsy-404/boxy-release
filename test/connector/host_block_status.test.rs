@@ -1,4 +1,3 @@
-#[cfg(windows)]
 #[path = "../../connector/src/session_io.rs"]
 mod session_io;
 
@@ -6,127 +5,103 @@ mod session_io;
 #[path = "../../connector/src/host_block.rs"]
 mod host_block;
 
+#[path = "../../connector/src/network_block.rs"]
+mod network_block;
+
+#[cfg(windows)]
+#[path = "../../connector/src/windows_firewall.rs"]
+mod windows_firewall;
+
+#[cfg(windows)]
+#[path = "../../connector/src/windows_process.rs"]
+mod windows_process;
+
+fn status_value(mode: &'static str) -> serde_json::Value {
+    let firewall_rule_present = cfg!(windows) && mode == "firewall";
+    let status = network_block::NetworkBlockStatus {
+        blocked: true,
+        mode,
+        managed: true,
+        blocked_hosts: 10,
+        total_hosts: 10,
+        hosts_path: "hosts".to_string(),
+        firewall_blocked: firewall_rule_present,
+        firewall_rule_present,
+        firewall_available: cfg!(windows),
+        firewall_manual: cfg!(target_os = "macos"),
+        firewall_provider: if cfg!(windows) {
+            "Windows Firewall"
+        } else {
+            "LuLu"
+        },
+        firewall_error: if cfg!(windows) {
+            None
+        } else {
+            Some("firewall status is unavailable".to_string())
+        },
+        program_path: None,
+        #[cfg(windows)]
+        firewall_profiles_enabled: Some(true),
+        #[cfg(not(windows))]
+        firewall_profiles_enabled: None,
+    };
+    serde_json::to_value(status).expect("status should serialize")
+}
+
 #[test]
 fn status_serializes_the_platform_rule_contract() {
-    let status = host_block::HostBlockStatus {
-        method: "wfp",
-        blocked: false,
-        configured: false,
-        verified: false,
-        managed: false,
-        legacy_hosts: false,
-        warning: None,
-        blocked_rules: 0,
-        total_rules: 4,
-        artifact_path: None,
-        installer_path: None,
-        target_path: None,
-        manual_import_required: None,
-        instructions: None,
+    let modes: &[&str] = if cfg!(windows) {
+        &["hosts", "firewall"]
+    } else {
+        &["hosts"]
     };
-    let value = serde_json::to_value(status).expect("status should serialize");
+    for mode in modes {
+        let value = status_value(*mode);
 
-    assert_eq!(value["method"], "wfp");
-    assert!(value.get("configured").is_some());
-    assert!(value.get("verified").is_some());
-    assert!(value.get("legacyHosts").is_some());
-    assert!(value.get("blockedRules").is_some());
-    assert!(value.get("totalRules").is_some());
-    assert!(value.get("hostsPath").is_none());
-    assert!(value.get("blockedHosts").is_none());
+        assert_eq!(value["mode"], *mode);
+        assert_eq!(value["blocked"], true);
+        assert_eq!(value["managed"], true);
+        assert_eq!(value["blockedHosts"], 10);
+        assert_eq!(value["totalHosts"], 10);
+        assert_eq!(value["hostsPath"], "hosts");
+        assert_eq!(
+            value["firewallBlocked"],
+            cfg!(windows) && *mode == "firewall"
+        );
+        assert_eq!(
+            value["firewallRulePresent"],
+            cfg!(windows) && *mode == "firewall"
+        );
+        assert_eq!(value["firewallAvailable"], cfg!(windows));
+        assert!(value.get("firewallManual").is_some());
+        assert!(value.get("firewallProvider").is_some());
+        assert!(value.get("firewallError").is_some());
+        assert!(value.get("programPath").is_some());
+        assert!(value.get("firewallProfilesEnabled").is_some());
+        assert!(value.get("method").is_none());
+        assert!(value.get("blockedRules").is_none());
+    }
 }
 
 #[test]
-fn fixed_webview_runtime_manifest_pins_the_microsoft_x64_cab() {
-    let manifest =
-        host_block::webview_runtime_manifest().expect("runtime manifest should validate");
-    assert_eq!(manifest.version, "153.0.4234.48");
-    assert_eq!(manifest.size_bytes, 308_509_880);
-    assert_eq!(manifest.sha256.len(), 64);
-    assert!(manifest
-        .url
-        .starts_with("https://msedge.sf.dl.delivery.mp.microsoft.com/"));
-    assert!(manifest.url.ends_with(".x64.cab"));
-}
-
-#[test]
-fn lulu_import_rule_scopes_sv2_and_its_children() {
-    let executable = std::path::Path::new(
-        "/Applications/Synthesizer V Studio 2.app/Contents/MacOS/Synthesizer V Studio 2",
-    );
-    let document =
-        host_block::lulu_import_document(executable, "Synthesizer V Studio 2 (Boxy block)")
-            .expect("LuLu JSON should be generated");
-    let rules = document[executable.to_str().expect("UTF-8 path")]
-        .as_array()
-        .expect("path key should contain a rule array");
-    assert_eq!(rules.len(), 1);
-    let rule = &rules[0];
-    assert_eq!(rule["path"], executable.to_str().unwrap());
-    assert_eq!(rule["key"], executable.to_str().unwrap());
-    assert_eq!(rule["name"], "Synthesizer V Studio 2 (Boxy block)");
-    assert_eq!(rule["endpointAddr"], "*");
-    assert_eq!(rule["endpointPort"], "*");
-    assert_eq!(rule["isEndpointAddrRegex"], 0);
-    assert_eq!(rule["type"], 3);
-    assert_eq!(rule["scope"], 2);
-    assert_eq!(rule["action"], 0);
-    let uuid = rule["uuid"].as_str().expect("UUID string");
-    assert_eq!(uuid.len(), 36);
-    assert_eq!(&uuid[14..15], "4");
-    assert!(rule["creation"]
-        .as_str()
-        .expect("creation timestamp")
-        .ends_with("+0000"));
-}
-
-#[test]
-#[cfg(windows)]
-fn normalizes_case_and_trailing_separators_for_windows_policy_paths() {
-    assert!(host_block::same_windows_path(
-        r"C:\Boxy\WebView2Runtime\\",
-        r"c:\boxy\webview2runtime"
-    ));
-}
-
-#[test]
-#[cfg(windows)]
-fn strips_extended_length_prefix_before_writing_the_webview_policy() {
-    let directory =
-        host_block::browser_executable_folder(std::path::Path::new(r"\\?\C:\Boxy\WebView2Runtime"))
-            .expect("a local extended-length path should be normalized");
-    assert_eq!(directory, r"C:\Boxy\WebView2Runtime");
-}
-
-#[test]
-#[cfg(windows)]
-fn creates_wfp_app_blobs_over_caller_owned_bytes() {
-    let mut bytes = [1u8, 2, 3, 4];
-    let blob = host_block::wfp_byte_blob(&mut bytes).expect("the app id should fit in a WFP blob");
-
-    assert_eq!(blob.size, bytes.len() as u32);
-    assert_eq!(blob.data, bytes.as_mut_ptr());
-    assert_eq!(
-        unsafe { std::slice::from_raw_parts(blob.data, blob.size as usize) },
-        &bytes
-    );
-}
-
-#[test]
-#[cfg(windows)]
-fn derives_and_releases_a_wfp_app_id() {
-    let executable = std::env::current_exe().expect("test executable path");
-    let app_id = host_block::wfp_app_id(&executable, "test executable").expect("WFP app ID");
-    assert!(!app_id.is_empty());
-}
-
-#[test]
-#[cfg(windows)]
 fn removes_only_boxy_marked_legacy_hosts_rules() {
     let original = "0.0.0.0 keep.example # user mapping\n";
     let marked =
         format!("{original}0.0.0.0 old.example # Synthesizer V Studio 2 Boxy network block\n");
-    assert_eq!(host_block::remove_legacy_hosts_rules(&marked), original);
+
+    assert_eq!(host_block::rewrite_managed_rules(&marked, false), original);
+}
+
+#[test]
+fn removes_only_exact_boxy_hosts_markers() {
+    let original = "0.0.0.0 keep.example # user mapping\n";
+    let managed = format!(
+        "{original}0.0.0.0 old.example # Synthesizer V Studio 2 Boxy network block\n::1 old.example # SV2 Session Editor update block\n"
+    );
+    assert_eq!(host_block::rewrite_managed_rules(&managed, false), original);
+
+    let similar = format!("{original}0.0.0.0 keep.example # Boxy network block\n");
+    assert_eq!(host_block::rewrite_managed_rules(&similar, false), similar);
 }
 
 #[test]
@@ -138,35 +113,4 @@ fn parses_quoted_display_icons_with_indexes() {
             r"C:\Program Files\SV2\synthv-studio.exe"
         ))
     );
-}
-
-#[test]
-#[cfg(windows)]
-fn accepts_only_runtime_paths_under_the_canonical_boxy_root() {
-    let root = std::path::Path::new(r"D:\Apps\Boxy");
-    assert!(host_block::is_path_within(
-        root,
-        std::path::Path::new(r"d:\apps\boxy\WebView2Runtime\msedgewebview2.exe")
-    ));
-    assert!(!host_block::is_path_within(
-        root,
-        std::path::Path::new(r"D:\Apps\BoxyShared\msedgewebview2.exe")
-    ));
-    assert!(!host_block::is_path_within(
-        root,
-        std::path::Path::new(
-            r"C:\Program Files (x86)\Microsoft\EdgeWebView\Application\msedgewebview2.exe"
-        )
-    ));
-}
-
-#[test]
-fn removes_only_exact_boxy_hosts_markers() {
-    let original = "0.0.0.0 keep.example # user mapping\n";
-    let managed = format!(
-        "{original}0.0.0.0 old.example # Synthesizer V Studio 2 Boxy network block\n::1 old.example # SV2 Session Editor update block\n"
-    );
-    assert_eq!(host_block::remove_legacy_hosts_rules(&managed), original);
-    let similar = format!("{original}0.0.0.0 keep.example # Boxy network block\n");
-    assert_eq!(host_block::remove_legacy_hosts_rules(&similar), similar);
 }

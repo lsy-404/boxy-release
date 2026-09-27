@@ -216,7 +216,7 @@ pub(crate) fn display_icon_path(value: &str) -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_application() -> Result<PathBuf, String> {
+pub(crate) fn macos_application() -> Result<PathBuf, String> {
     [
         "/Applications/Synthesizer V Studio 2.app",
         "/Applications/Synthesizer V Studio 2 Pro.app",

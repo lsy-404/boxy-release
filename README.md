@@ -20,7 +20,7 @@ This creates a universal macOS app and `boxy-macos-universal.zip` in `dist/`. Wi
 node scripts/package-portable.mjs x86_64-pc-windows-msvc
 ```
 
-Windows users download and run `boxy-windows-x64.exe` directly. When network blocking is first enabled, the client downloads the pinned Microsoft WebView2 Fixed Runtime, checks its size and SHA-256, then installs it beside Boxy. The macOS client downloads the pinned LuLu installer only when a rule is requested and LuLu is absent. The manual GitHub Actions workflow uploads the Windows executable and macOS app archive; it does not build or publish the cloud service.
+Windows users download and run `boxy-windows-x64.exe` directly. Windows Firewall mode creates a rule for the installed SV2 executable and manages the configured Dreamtonics host list. On macOS, Boxy manages the known-host list but cannot apply or verify LuLu rules. The manual GitHub Actions workflow uploads the Windows executable and macOS app archive; it does not build or publish the cloud service.
 
 ## Start and choose a service
 
@@ -34,6 +34,6 @@ After pairing, Boxy automatically opens the validated browser editor URL. On bot
 
 ## Local operations
 
-The client reports both SV device IDs, the encrypted session, SV2 related installed applications, and the previously specified device information. It does not scan or hash the SV2 directory before connecting. Bounded tasks include session and directory I/O, network block status or changes, SV2 launch or close, opening the session folder, and voice database inspection, download, installation, or removal. Windows network blocking uses WFP rules for SV2 and its private WebView2 runtime; macOS exports a LuLu rule for manual import into a dedicated profile. See docs/network-blocking.md for the verification boundary. Every arbitrary shell command requires separate approval. Close the client to stop the assistance session.
+Before pairing, the client hashes files in the SV2 data directory and sends the encrypted session, source hash, device public key, complete bounded directory manifest, SV2-related installed applications, device information, available translation catalogs and product logos, and session path to the selected service. If the complete manifest and request do not fit the Worker request limit, the client stops before sending a partial manifest. Bounded tasks include session and directory I/O, network block status or changes, SV2 launch or close, opening the session folder, and voice database inspection, download, installation, or removal. Known-host mode blocks the configured Dreamtonics host list. Windows Firewall mode adds a rule for the exact SV2 executable and also manages that host list; neither mode claims to cover every network target. Boxy cannot apply or verify LuLu rules on macOS. See docs/network-blocking.md for the platform limits. Every arbitrary shell command requires separate approval. Close the client to stop the assistance session.
 
 The HTTP JSON task and writeback protocol is implemented by the cloud service; changes to task fields must be verified against its Worker tests before a client release.
