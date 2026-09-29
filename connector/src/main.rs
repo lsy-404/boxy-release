@@ -596,14 +596,12 @@ fn execute_directory_task(
         "host_block" => {
             let result = match task.mode.as_deref() {
                 Some("status") => Ok(network_block::status()),
-                Some(mode) => task
+                Some("firewall") => task
                     .blocked
                     .ok_or_else(|| "network block task has no blocked state".to_string())
-                    .and_then(|blocked| {
-                        network_block::BlockMode::parse(mode)
-                            .and_then(|mode| network_block::set_blocked(blocked, mode))
-                    }),
-                None => Err("network block task has no mode".to_string()),
+                    .and_then(network_block::set_blocked),
+                Some("cleanup") if task.blocked == Some(false) => network_block::cleanup_hosts(),
+                _ => Err("network block mode is invalid".to_string()),
             };
             let result = match result {
                 Ok(status) => serde_json::to_value(status).map_err(|error| error.to_string())?,

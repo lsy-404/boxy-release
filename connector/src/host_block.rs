@@ -12,68 +12,50 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 #[cfg(target_os = "macos")]
 use std::process::Stdio;
 
-const BLOCKED_HOSTS: &[&str] = &[
-    "authr3.dreamtonics.com",
-    "account.dreamtonics.com",
-    "authr3-media.r2.dreamtonics.com",
-    "authr3-models.r2.dreamtonics.com",
-    "resource.dreamtonics.com",
-    "store.dreamtonics.com",
-    "my.dreamtonics.com",
-    "svdocs.dreamtonics.com",
-    "dreamtonics.com",
-    "dreamtonics.com.cn",
-];
 const MARKER: &str = "# Synthesizer V Studio 2 Boxy network block";
 const PREVIOUS_MARKER: &str = "# Synthesizer V Studio 2 Boxy update block";
 const LEGACY_MARKER: &str = "# SV2 Smooth update block";
 const OLDER_MARKER: &str = "# SV2 Session Editor update block";
 const MAX_HOSTS_BYTES: usize = 1024 * 1024;
 #[cfg(windows)]
-const ELEVATED_ARGUMENT: &str = "--sv2-host-block";
+const ELEVATED_ARGUMENT: &str = "--sv2-host-cleanup";
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct HostBlockStatus {
-    pub blocked: bool,
+pub struct HostCleanupStatus {
     pub managed: bool,
-    pub blocked_hosts: usize,
-    pub total_hosts: usize,
     pub hosts_path: String,
 }
 
-pub fn status() -> HostBlockStatus {
+pub fn status() -> HostCleanupStatus {
     let path = hosts_path();
     let text = read_hosts(&path).unwrap_or_default();
     status_for(&path, &text)
 }
 
-pub fn set_blocked(blocked: bool) -> Result<HostBlockStatus, String> {
+pub fn cleanup() -> Result<HostCleanupStatus, String> {
     #[cfg(windows)]
     {
         if !is_elevated() {
-            elevate_and_wait_windows(ELEVATED_ARGUMENT, blocked)?;
+            elevate_and_wait_windows(ELEVATED_ARGUMENT, false)?;
             return Ok(status());
         }
-        return set_blocked_direct(blocked);
+        return cleanup_direct();
     }
     #[cfg(target_os = "macos")]
     {
-        elevate_and_wait(blocked)?;
+        elevate_and_wait()?;
         return Ok(status());
     }
     #[cfg(not(any(windows, target_os = "macos")))]
-    set_blocked_direct(blocked)
+    Err("host cleanup is unavailable on this platform".to_string())
 }
 
-#[cfg(not(target_os = "macos"))]
-fn set_blocked_direct(blocked: bool) -> Result<HostBlockStatus, String> {
-    #[cfg(windows)]
+#[cfg(windows)]
+fn cleanup_direct() -> Result<HostCleanupStatus, String> {
     let path = windows_system_directory()?.join("drivers/etc/hosts");
-    #[cfg(not(windows))]
-    let path = hosts_path();
     let current = read_hosts(&path)?;
-    let next = rewrite_managed_rules(&current, blocked);
+    let next = remove_managed_rules(&current);
     if next != current {
         write_hosts(&path, &next)?;
         #[cfg(windows)]
@@ -124,12 +106,10 @@ pub fn run_elevated_host_block_if_requested() -> Option<i32> {
         if args.next()?.to_string_lossy() != ELEVATED_ARGUMENT {
             return None;
         }
-        let blocked = match args.next()?.to_string_lossy().as_ref() {
-            "enable" => true,
-            "disable" => false,
-            _ => return Some(1),
-        };
-        return Some(match set_blocked_direct(blocked) {
+        if args.next()?.to_string_lossy() != "disable" || args.next().is_some() {
+            return Some(1);
+        }
+        return Some(match cleanup_direct() {
             Ok(_) => 0,
             Err(_) => 1,
         });
@@ -141,10 +121,10 @@ pub fn run_elevated_host_block_if_requested() -> Option<i32> {
 }
 
 #[cfg(target_os = "macos")]
-fn elevate_and_wait(blocked: bool) -> Result<(), String> {
+fn elevate_and_wait() -> Result<(), String> {
     let path = hosts_path();
     let current = read_hosts(&path)?;
-    let next = rewrite_managed_rules(&current, blocked);
+    let next = remove_managed_rules(&current);
     if next == current {
         return Ok(());
     }
@@ -285,17 +265,10 @@ fn wide(value: &OsStr) -> Vec<u16> {
     value.encode_wide().chain(std::iter::once(0)).collect()
 }
 
-fn status_for(path: &Path, text: &str) -> HostBlockStatus {
-    let blocked_hosts = BLOCKED_HOSTS
-        .iter()
-        .filter(|host| is_host_fully_blocked(text, host))
-        .count();
+fn status_for(path: &Path, text: &str) -> HostCleanupStatus {
     let managed = text.lines().any(is_managed_line);
-    HostBlockStatus {
-        blocked: blocked_hosts == BLOCKED_HOSTS.len(),
+    HostCleanupStatus {
         managed,
-        blocked_hosts,
-        total_hosts: BLOCKED_HOSTS.len(),
         hosts_path: path.to_string_lossy().into_owned(),
     }
 }
@@ -311,34 +284,7 @@ fn is_managed_line(line: &str) -> bool {
     )
 }
 
-pub fn is_host_blocked(host: &str) -> bool {
-    read_hosts(&hosts_path()).is_ok_and(|text| is_host_fully_blocked(&text, host))
-}
-
-fn is_host_fully_blocked(text: &str, host: &str) -> bool {
-    has_host_mapping(text, host, &["0.0.0.0", "127.0.0.1"])
-        && has_host_mapping(text, host, &["::", "::1"])
-}
-
-fn has_host_mapping(text: &str, host: &str, addresses: &[&str]) -> bool {
-    text.lines().any(|line| {
-        let fields = line
-            .split('#')
-            .next()
-            .unwrap_or_default()
-            .split_whitespace()
-            .collect::<Vec<_>>();
-        fields
-            .first()
-            .is_some_and(|address| addresses.contains(address))
-            && fields
-                .iter()
-                .skip(1)
-                .any(|value| value.eq_ignore_ascii_case(host))
-    })
-}
-
-pub(super) fn rewrite_managed_rules(current: &str, blocked: bool) -> String {
+pub(super) fn remove_managed_rules(current: &str) -> String {
     let newline = if current.contains("\r\n") {
         "\r\n"
     } else {
@@ -350,15 +296,7 @@ pub(super) fn rewrite_managed_rules(current: &str, blocked: bool) -> String {
         .filter(|line| !is_managed_line(line))
         .collect::<Vec<_>>()
         .join(newline);
-    if blocked {
-        if !next.is_empty() {
-            next.push_str(newline);
-        }
-        for host in BLOCKED_HOSTS {
-            next.push_str(&format!("0.0.0.0 {host} {MARKER}{newline}"));
-            next.push_str(&format!("::1 {host} {MARKER}{newline}"));
-        }
-    } else if ends_with_newline && !next.is_empty() {
+    if ends_with_newline && !next.is_empty() {
         next.push_str(newline);
     }
     next
@@ -454,55 +392,23 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn enables_every_known_host_over_both_address_families() {
-        let original = "127.0.0.1 localhost\r\n# preserved\r\n";
-        let enabled = rewrite_managed_rules(original, true);
-        let current = status_for(Path::new("hosts"), &enabled);
-
-        assert!(current.blocked);
-        assert!(current.managed);
-        assert_eq!(current.blocked_hosts, BLOCKED_HOSTS.len());
-        assert_eq!(current.total_hosts, BLOCKED_HOSTS.len());
-        assert_eq!(
-            enabled.lines().filter(|line| is_managed_line(line)).count(),
-            BLOCKED_HOSTS.len() * 2
-        );
-        assert_eq!(rewrite_managed_rules(&enabled, true), enabled);
-        assert_eq!(rewrite_managed_rules(&enabled, false), original);
-    }
-
-    #[test]
-    fn upgrades_legacy_rules_without_touching_user_mappings() {
+    fn removes_legacy_rules_without_touching_user_mappings() {
         let legacy = format!(
             "0.0.0.0 authr3.dreamtonics.com {OLDER_MARKER}\n::1 authr3.dreamtonics.com {PREVIOUS_MARKER}\n127.0.0.1 keep.example # user mapping\n"
         );
-        let enabled = rewrite_managed_rules(&legacy, true);
+        let cleaned = remove_managed_rules(&legacy);
 
-        assert!(!enabled.contains(OLDER_MARKER));
-        assert!(!enabled.contains(PREVIOUS_MARKER));
-        assert!(enabled.contains("127.0.0.1 keep.example # user mapping"));
-        assert!(status_for(Path::new("hosts"), &enabled).blocked);
+        assert!(!cleaned.contains(OLDER_MARKER));
+        assert!(!cleaned.contains(PREVIOUS_MARKER));
+        assert_eq!(cleaned, "127.0.0.1 keep.example # user mapping\n");
+        assert!(!status_for(Path::new("hosts"), &cleaned).managed);
     }
 
     #[test]
-    fn incomplete_or_aliased_rules_have_precise_status() {
-        let host = BLOCKED_HOSTS[0];
-        let partial = format!("0.0.0.0 localhost {host}\n");
-        assert!(!is_host_fully_blocked(&partial, host));
-
-        let complete = format!("0.0.0.0 localhost {host}\n::1 localhost {host}\n");
-        assert!(is_host_fully_blocked(&complete, host));
-        let current = status_for(Path::new("hosts"), &complete);
-        assert!(!current.blocked);
-        assert_eq!(current.blocked_hosts, 1);
-    }
-
-    #[test]
-    fn disable_only_removes_exact_managed_rules() {
-        let managed = rewrite_managed_rules("0.0.0.0 keep.example # user mapping\n", true);
-        let disabled = rewrite_managed_rules(&managed, false);
-
-        assert_eq!(disabled, "0.0.0.0 keep.example # user mapping\n");
-        assert!(!disabled.lines().any(is_managed_line));
+    fn cleanup_only_removes_exact_managed_rules() {
+        let original = "0.0.0.0 keep.example # user mapping\n";
+        let managed = format!("{original}0.0.0.0 old.example {MARKER}\n");
+        assert_eq!(remove_managed_rules(&managed), original);
+        assert_eq!(remove_managed_rules(original), original);
     }
 }

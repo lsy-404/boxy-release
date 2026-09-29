@@ -1,28 +1,5 @@
 use serde::Serialize;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BlockMode {
-    Hosts,
-    Firewall,
-}
-
-impl BlockMode {
-    pub fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "hosts" => Ok(Self::Hosts),
-            "firewall" => Ok(Self::Firewall),
-            _ => Err("network block mode is invalid".to_string()),
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Hosts => "hosts",
-            Self::Firewall => "firewall",
-        }
-    }
-}
-
 #[cfg(windows)]
 const ELEVATED_ARGUMENT: &str = "--sv2-network-block";
 
@@ -31,10 +8,8 @@ const ELEVATED_ARGUMENT: &str = "--sv2-network-block";
 pub struct NetworkBlockStatus {
     pub blocked: bool,
     pub mode: &'static str,
-    pub managed: bool,
-    pub blocked_hosts: usize,
-    pub total_hosts: usize,
-    pub hosts_path: String,
+    pub hostless: bool,
+    pub legacy_hosts: bool,
     pub firewall_blocked: bool,
     pub firewall_rule_present: bool,
     pub firewall_available: bool,
@@ -46,7 +21,7 @@ pub struct NetworkBlockStatus {
 }
 
 pub fn status() -> NetworkBlockStatus {
-    let hosts = crate::host_block::status();
+    let legacy_hosts = crate::host_block::status().managed;
     #[cfg(windows)]
     let firewall = crate::windows_firewall::status();
     #[cfg(not(windows))]
@@ -66,20 +41,10 @@ pub fn status() -> NetworkBlockStatus {
     let firewall_profiles_enabled = firewall.as_ref().ok().map(|value| value.profiles_enabled);
 
     NetworkBlockStatus {
-        blocked: if firewall_rule_present {
-            firewall_blocked && hosts.blocked
-        } else {
-            hosts.blocked
-        },
-        mode: if firewall_rule_present {
-            "firewall"
-        } else {
-            "hosts"
-        },
-        managed: hosts.managed,
-        blocked_hosts: hosts.blocked_hosts,
-        total_hosts: hosts.total_hosts,
-        hosts_path: hosts.hosts_path,
+        blocked: firewall_blocked,
+        mode: "firewall",
+        hostless: true,
+        legacy_hosts,
         firewall_blocked,
         firewall_rule_present,
         firewall_available: firewall.is_ok(),
@@ -110,56 +75,46 @@ fn program_path() -> Option<String> {
     Some(path.to_string_lossy().into_owned())
 }
 
-pub fn set_blocked(blocked: bool, mode: BlockMode) -> Result<NetworkBlockStatus, String> {
+pub fn set_blocked(blocked: bool) -> Result<NetworkBlockStatus, String> {
     #[cfg(windows)]
     {
         if !crate::host_block::is_elevated() {
-            let argument = format!("{ELEVATED_ARGUMENT} {}", mode.as_str());
-            crate::host_block::elevate_and_wait_windows(&argument, blocked)?;
-            return verify_status(status(), blocked, mode);
+            crate::host_block::elevate_and_wait_windows(ELEVATED_ARGUMENT, blocked)?;
+            return verify_status(status(), blocked);
         }
-        if blocked {
-            match mode {
-                BlockMode::Hosts => {
-                    crate::host_block::set_blocked(true)?;
-                    crate::windows_firewall::set_blocked(false)?;
-                }
-                BlockMode::Firewall => {
-                    crate::host_block::set_blocked(true)?;
-                    crate::windows_firewall::set_blocked(true)?;
-                }
-            }
-        } else {
-            crate::windows_firewall::set_blocked(false)?;
-            crate::host_block::set_blocked(false)?;
-        }
+        crate::windows_firewall::set_blocked(blocked)?;
+        crate::host_block::cleanup()?;
+        return verify_status(status(), blocked);
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     {
-        if mode == BlockMode::Firewall {
+        if blocked {
             return Err(
                 "LuLu cannot be switched from Boxy through a supported interface".to_string(),
             );
         }
-        crate::host_block::set_blocked(blocked)?;
+        crate::host_block::cleanup()?;
+        return Ok(status());
     }
-    verify_status(status(), blocked, mode)
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = blocked;
+        Err("network blocking is unavailable on this platform".to_string())
+    }
 }
 
-fn verify_status(
-    result: NetworkBlockStatus,
-    blocked: bool,
-    mode: BlockMode,
-) -> Result<NetworkBlockStatus, String> {
-    #[cfg(windows)]
+pub fn cleanup_hosts() -> Result<NetworkBlockStatus, String> {
+    crate::host_block::cleanup()?;
+    Ok(status())
+}
+
+#[cfg(windows)]
+fn verify_status(result: NetworkBlockStatus, blocked: bool) -> Result<NetworkBlockStatus, String> {
     if !blocked && !result.firewall_available {
         return Err("Windows Firewall status could not be verified after the change".to_string());
     }
-    if blocked && (!result.blocked || result.mode != mode.as_str()) {
+    if result.blocked != blocked || result.legacy_hosts {
         return Err("network rules are incomplete after the change".to_string());
-    }
-    if !blocked && (result.firewall_rule_present || result.managed || result.blocked_hosts > 0) {
-        return Err("network rules still block known hosts after the change".to_string());
     }
     Ok(result)
 }
@@ -171,15 +126,13 @@ pub fn run_elevated_if_requested() -> Option<i32> {
     if args.next()?.to_string_lossy() != ELEVATED_ARGUMENT {
         return None;
     }
-    let mode = BlockMode::parse(&args.next()?.to_string_lossy()).ok()?;
     let blocked = match args.next()?.to_string_lossy().as_ref() {
         "enable" => true,
         "disable" => false,
         _ => return Some(1),
     };
-    Some(if set_blocked(blocked, mode).is_ok() {
-        0
-    } else {
-        1
-    })
+    if args.next().is_some() {
+        return Some(1);
+    }
+    Some(if set_blocked(blocked).is_ok() { 0 } else { 1 })
 }

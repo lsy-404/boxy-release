@@ -16,15 +16,13 @@ mod windows_firewall;
 #[path = "../../connector/src/windows_process.rs"]
 mod windows_process;
 
-fn status_value(mode: &'static str) -> serde_json::Value {
-    let firewall_rule_present = cfg!(windows) && mode == "firewall";
+fn status_value() -> serde_json::Value {
+    let firewall_rule_present = cfg!(windows);
     let status = network_block::NetworkBlockStatus {
-        blocked: true,
-        mode,
-        managed: true,
-        blocked_hosts: 10,
-        total_hosts: 10,
-        hosts_path: "hosts".to_string(),
+        blocked: firewall_rule_present,
+        mode: "firewall",
+        hostless: true,
+        legacy_hosts: false,
         firewall_blocked: firewall_rule_present,
         firewall_rule_present,
         firewall_available: cfg!(windows),
@@ -50,37 +48,21 @@ fn status_value(mode: &'static str) -> serde_json::Value {
 
 #[test]
 fn status_serializes_the_platform_rule_contract() {
-    let modes: &[&str] = if cfg!(windows) {
-        &["hosts", "firewall"]
-    } else {
-        &["hosts"]
-    };
-    for mode in modes {
-        let value = status_value(*mode);
-
-        assert_eq!(value["mode"], *mode);
-        assert_eq!(value["blocked"], true);
-        assert_eq!(value["managed"], true);
-        assert_eq!(value["blockedHosts"], 10);
-        assert_eq!(value["totalHosts"], 10);
-        assert_eq!(value["hostsPath"], "hosts");
-        assert_eq!(
-            value["firewallBlocked"],
-            cfg!(windows) && *mode == "firewall"
-        );
-        assert_eq!(
-            value["firewallRulePresent"],
-            cfg!(windows) && *mode == "firewall"
-        );
-        assert_eq!(value["firewallAvailable"], cfg!(windows));
-        assert!(value.get("firewallManual").is_some());
-        assert!(value.get("firewallProvider").is_some());
-        assert!(value.get("firewallError").is_some());
-        assert!(value.get("programPath").is_some());
-        assert!(value.get("firewallProfilesEnabled").is_some());
-        assert!(value.get("method").is_none());
-        assert!(value.get("blockedRules").is_none());
-    }
+    let value = status_value();
+    assert_eq!(value["mode"], "firewall");
+    assert_eq!(value["hostless"], true);
+    assert_eq!(value["legacyHosts"], false);
+    assert_eq!(value["blocked"], cfg!(windows));
+    assert_eq!(value["firewallBlocked"], cfg!(windows));
+    assert_eq!(value["firewallRulePresent"], cfg!(windows));
+    assert_eq!(value["firewallAvailable"], cfg!(windows));
+    assert!(value.get("firewallManual").is_some());
+    assert!(value.get("firewallProvider").is_some());
+    assert!(value.get("firewallError").is_some());
+    assert!(value.get("programPath").is_some());
+    assert!(value.get("firewallProfilesEnabled").is_some());
+    assert!(value.get("managed").is_none());
+    assert!(value.get("blockedHosts").is_none());
 }
 
 #[test]
@@ -89,7 +71,7 @@ fn removes_only_boxy_marked_legacy_hosts_rules() {
     let marked =
         format!("{original}0.0.0.0 old.example # Synthesizer V Studio 2 Boxy network block\n");
 
-    assert_eq!(host_block::rewrite_managed_rules(&marked, false), original);
+    assert_eq!(host_block::remove_managed_rules(&marked), original);
 }
 
 #[test]
@@ -98,10 +80,10 @@ fn removes_only_exact_boxy_hosts_markers() {
     let managed = format!(
         "{original}0.0.0.0 old.example # Synthesizer V Studio 2 Boxy network block\n::1 old.example # SV2 Session Editor update block\n"
     );
-    assert_eq!(host_block::rewrite_managed_rules(&managed, false), original);
+    assert_eq!(host_block::remove_managed_rules(&managed), original);
 
     let similar = format!("{original}0.0.0.0 keep.example # Boxy network block\n");
-    assert_eq!(host_block::rewrite_managed_rules(&similar, false), similar);
+    assert_eq!(host_block::remove_managed_rules(&similar), similar);
 }
 
 #[test]
