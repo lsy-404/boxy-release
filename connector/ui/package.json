@@ -1,5 +1,6 @@
 {
   "private": true,
+  "packageManager": "pnpm@10.34.6",
   "scripts": {
     "sync:fluent": "node ../../scripts/sync-fluent.mjs"
   },

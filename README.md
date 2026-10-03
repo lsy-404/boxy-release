@@ -30,7 +30,7 @@ For example, `service.example.test.exe` or `service.example.test.app` suggests `
 
 `BOXY_API_URL` or `--server URL` can prefill the service address. The selected service controls the browser editor and the remote operations it requests. `--session PATH` selects a non-default SV2 session. The service observes the public IP from the connection, so the client does not contact a separate IP lookup site.
 
-After pairing, Boxy automatically opens the validated browser editor URL. On both Windows and macOS, the same small window shows connection status through remote activity, writeback, completion, or error. Its `Open browser editor` button reopens that page; `Stop Boxy` stops after the current operation. The static frontend and `@lsypkg/fluent` stylesheet are embedded in the Rust executable. To refresh the stylesheet, run `npm ci && npm run sync:fluent` in `connector/ui/`.
+After pairing, Boxy automatically opens the validated browser editor URL. On both Windows and macOS, the same small window shows connection status through remote activity, writeback, completion, or error. Its `Open browser editor` button reopens that page; `Stop Boxy` stops after the current operation. The static frontend and `@lsypkg/fluent` stylesheet are embedded in the Rust executable. To refresh the stylesheet, run `pnpm install --frozen-lockfile && pnpm run sync:fluent` in `connector/ui/`.
 
 ## Local operations
 

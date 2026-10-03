@@ -11,3 +11,4 @@
 | 004 | [Feature] 按需依赖与网络屏蔽迁移 | 移植运行时下载及后续网络屏蔽修复，保留独立客户端的服务选择 | Windows/macOS 依赖仅在启用时获取 | ✅ 已完成 |
 | 005 | [Feature] 文件名直取服务地址 | 用有效 exe/app 文件名直接预填服务域名 | 用户取消文件名自动补全 boxy 前缀 | ✅ 已完成 |
 | 008 | [BugFix] 移除 hosts 阻断方案 | 停止客户端写入系统 hosts 并保留受支持的进程级阻断 | 用户要求删除 host 阻断方案 | 🔄 进行中 |
+| 009 | [PackageManagement] pnpm CLI migration | Migrate connector UI package to pnpm | Keep supported Node.js workflows consistently on pnpm | ✅ 已完成 |
