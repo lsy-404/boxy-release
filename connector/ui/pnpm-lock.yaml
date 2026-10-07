@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@lsypkg/fluent':
-        specifier: https://github.com/lsy-404/platform-kit/releases/download/v0.6.4/platform-kit-fluent-0.2.3.tgz
-        version: '@platform-kit/fluent@https://github.com/lsy-404/platform-kit/releases/download/v0.6.4/platform-kit-fluent-0.2.3.tgz(vue@3.5.43)'
+        specifier: https://github.com/lsy-404/platform-kit/releases/download/fluent-v0.2.10/platform-kit-fluent-0.2.10.tgz
+        version: '@platform-kit/fluent@https://github.com/lsy-404/platform-kit/releases/download/fluent-v0.2.10/platform-kit-fluent-0.2.10.tgz(vue@3.5.43)'
 
 packages:
 
@@ -34,9 +34,9 @@ packages:
   '@jridgewell/sourcemap-codec@1.6.0':
     resolution: {integrity: sha512-T7jf+5zgsZHwNJ4lvQ7/aezbyk0nNX+zJVWpmHA7VYsEx7a7qr5Rg5IbtJFqkgze5Y2sruq1RUY8Q837Od7iFw==}
 
-  '@platform-kit/fluent@https://github.com/lsy-404/platform-kit/releases/download/v0.6.4/platform-kit-fluent-0.2.3.tgz':
-    resolution: {integrity: sha512-DyTO/qbl4Fc1RcboRLx+TEWnkRE6inKTbD81yn02vH4lM4ydBi+hMFrzgchzmT9NWEi3UQTkhWHVo+KRTdr58Q==, tarball: https://github.com/lsy-404/platform-kit/releases/download/v0.6.4/platform-kit-fluent-0.2.3.tgz}
-    version: 0.2.3
+  '@platform-kit/fluent@https://github.com/lsy-404/platform-kit/releases/download/fluent-v0.2.10/platform-kit-fluent-0.2.10.tgz':
+    resolution: {tarball: https://github.com/lsy-404/platform-kit/releases/download/fluent-v0.2.10/platform-kit-fluent-0.2.10.tgz}
+    version: 0.2.10
     peerDependencies:
       vue: ^3.5.0
 
@@ -121,7 +121,7 @@ snapshots:
 
   '@jridgewell/sourcemap-codec@1.6.0': {}
 
-  '@platform-kit/fluent@https://github.com/lsy-404/platform-kit/releases/download/v0.6.4/platform-kit-fluent-0.2.3.tgz(vue@3.5.43)':
+  '@platform-kit/fluent@https://github.com/lsy-404/platform-kit/releases/download/fluent-v0.2.10/platform-kit-fluent-0.2.10.tgz(vue@3.5.43)':
     dependencies:
       vue: 3.5.43
 

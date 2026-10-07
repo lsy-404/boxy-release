@@ -12,3 +12,5 @@
 | 005 | [Feature] 文件名直取服务地址 | 用有效 exe/app 文件名直接预填服务域名 | 用户取消文件名自动补全 boxy 前缀 | ✅ 已完成 |
 | 008 | [BugFix] 移除 hosts 阻断方案 | 停止客户端写入系统 hosts 并保留受支持的进程级阻断 | 用户要求删除 host 阻断方案 | 🔄 进行中 |
 | 009 | [PackageManagement] pnpm CLI migration | Migrate connector UI package to pnpm | Keep supported Node.js workflows consistently on pnpm | ✅ 已完成 |
+
+| 010 | [Maintenance] Kit依赖升级 | 更新已使用的公共 kit 包和锁文件 | 使用最新已发布的共享组件 | 🔄 进行中 |
