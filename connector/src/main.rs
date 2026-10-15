@@ -92,7 +92,12 @@ struct DirectoryEntry {
 #[serde(rename_all = "camelCase")]
 struct ConnectorReceipt {
     source_sha256: String,
-    written_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    written_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_sha256: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -160,6 +165,8 @@ struct DirectoryTask {
     #[serde(default)]
     access_token: Option<String>,
     #[serde(default)]
+    expected_session_sha256: Option<String>,
+    #[serde(default)]
     refresh_token: Option<String>,
     #[serde(default)]
     method: Option<String>,
@@ -169,6 +176,13 @@ struct DirectoryTask {
     body: Option<String>,
     #[serde(default)]
     model_version: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionSnapshotAck {
+    state: String,
+    source_sha256: Option<String>,
 }
 
 impl Drop for DirectoryTask {
@@ -331,8 +345,20 @@ fn wait_for_writeback(
     status: &service_selection::RunningStatus,
 ) -> Result<(), String> {
     let path = format!("/api/v2/connector/operations/{operation_id}");
+    let mut last_reported_sha256 = expected_source_sha256.to_string();
     loop {
         status.ensure_active()?;
+        match report_session_change(config, device_key, operation_id, &last_reported_sha256) {
+            Ok(SessionWatchResult::Unchanged) | Ok(SessionWatchResult::WritebackPending) => {}
+            Ok(SessionWatchResult::Accepted(source_sha256)) => {
+                last_reported_sha256 = source_sha256;
+            }
+            Err(_) => {
+                status.update("Waiting to synchronize the local session...");
+                thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+        }
         let (nonce, signature) = request_signature(device_key, "GET", &path);
         let response = get_signed::<ConnectorOperationResponse>(
             &config.server_url,
@@ -352,7 +378,13 @@ fn wait_for_writeback(
                 for task in response.directory_tasks {
                     status.ensure_active()?;
                     status.update("Handling a remote operation...");
-                    execute_directory_task(config, device_key, operation_id, &task)?;
+                    execute_directory_task(
+                        config,
+                        device_key,
+                        operation_id,
+                        &task,
+                        &mut last_reported_sha256,
+                    )?;
                 }
                 status.update(pending_status);
                 thread::sleep(Duration::from_secs(2));
@@ -370,35 +402,115 @@ fn wait_for_writeback(
                     .ok_or_else(|| "writeback response has no expiry".to_string())?
                     .parse::<u128>()
                     .map_err(|_| "writeback expiry is invalid".to_string())?;
-                if source_sha256 != expected_source_sha256 {
-                    return Err(
-                        "the authorization service response does not match the loaded session"
-                            .to_string(),
-                    );
-                }
                 if expires_at <= unix_timestamp_millis() {
                     return Err("writeback response has expired".to_string());
                 }
                 let ciphertext = URL_SAFE_NO_PAD
                     .decode(ciphertext)
                     .map_err(|_| "writeback ciphertext is invalid".to_string())?;
-                let written_sha256 = replace_session_if_unchanged(
+                let current = read_session_ciphertext(&config.session_path)?;
+                if sha256_base64url(&current) != source_sha256 {
+                    let observed_sha256 = sha256_base64url(&current);
+                    let conflict = ConnectorReceipt {
+                        source_sha256,
+                        written_sha256: None,
+                        error: Some("source_changed"),
+                        observed_sha256: Some(observed_sha256.clone()),
+                    };
+                    let (receipt_status, body) = post_signed_json_status(
+                        &config.server_url,
+                        &format!("{path}/receipt"),
+                        device_key,
+                        &conflict,
+                    )?;
+                    let ack: SessionSnapshotAck = serde_json::from_value(body)
+                        .map_err(|_| "writeback conflict acknowledgement is invalid".to_string())?;
+                    if receipt_status != 200
+                        || ack.state != "writeback_conflict"
+                        || ack.source_sha256.as_deref() != Some(observed_sha256.as_str())
+                    {
+                        return Err("writeback conflict was not accepted".to_string());
+                    }
+                    match submit_session_snapshot(config, device_key, operation_id, &current)? {
+                        SessionWatchResult::Accepted(source_sha256) => {
+                            last_reported_sha256 = source_sha256;
+                        }
+                        _ => {}
+                    }
+                    status
+                        .update("The local session changed; the latest version was synchronized.");
+                    continue;
+                }
+                let written_sha256 = match replace_session_if_unchanged(
                     &config.session_path,
-                    expected_source_sha256,
+                    &source_sha256,
                     &ciphertext,
-                )?;
+                ) {
+                    Ok(hash) => hash,
+                    Err(_) => {
+                        let current = read_session_ciphertext(&config.session_path)?;
+                        let observed_sha256 = sha256_base64url(&current);
+                        if observed_sha256 == source_sha256 {
+                            return Err("the updated session could not be written".to_string());
+                        }
+                        let conflict = ConnectorReceipt {
+                            source_sha256,
+                            written_sha256: None,
+                            error: Some("source_changed"),
+                            observed_sha256: Some(observed_sha256.clone()),
+                        };
+                        let (receipt_status, body) = post_signed_json_status(
+                            &config.server_url,
+                            &format!("{path}/receipt"),
+                            device_key,
+                            &conflict,
+                        )?;
+                        let ack: SessionSnapshotAck =
+                            serde_json::from_value(body).map_err(|_| {
+                                "writeback conflict acknowledgement is invalid".to_string()
+                            })?;
+                        if receipt_status != 200
+                            || ack.state != "writeback_conflict"
+                            || ack.source_sha256.as_deref() != Some(observed_sha256.as_str())
+                        {
+                            return Err("writeback conflict was not accepted".to_string());
+                        }
+                        match submit_session_snapshot(config, device_key, operation_id, &current)? {
+                            SessionWatchResult::Accepted(source_sha256) => {
+                                last_reported_sha256 = source_sha256;
+                            }
+                            _ => {}
+                        }
+                        status.update(
+                            "The local session changed; the latest version was synchronized.",
+                        );
+                        continue;
+                    }
+                };
                 status.update("Reporting completion to the remote...");
                 let receipt = ConnectorReceipt {
-                    source_sha256: expected_source_sha256.to_string(),
-                    written_sha256,
+                    source_sha256,
+                    written_sha256: Some(written_sha256.clone()),
+                    error: None,
+                    observed_sha256: None,
                 };
-                post_signed_json(
+                let (receipt_status, body) = post_signed_json_status(
                     &config.server_url,
                     &format!("{path}/receipt"),
                     device_key,
                     &receipt,
                 )?;
-                return Ok(());
+                let ack: SessionSnapshotAck = serde_json::from_value(body)
+                    .map_err(|_| "writeback acknowledgement is invalid".to_string())?;
+                if receipt_status != 200
+                    || ack.state != "writeback_completed"
+                    || ack.source_sha256.as_deref() != Some(written_sha256.as_str())
+                {
+                    return Err("writeback completion was not accepted".to_string());
+                }
+                last_reported_sha256 = written_sha256;
+                status.update("Updated session written. Monitoring for more changes...");
+                continue;
             }
             "expired" | "rejected" => {
                 return Err("the authorization operation is no longer available".to_string())
@@ -408,6 +520,50 @@ fn wait_for_writeback(
             }
         }
     }
+}
+
+enum SessionWatchResult {
+    Unchanged,
+    Accepted(String),
+    WritebackPending,
+}
+
+fn report_session_change(
+    config: &Config,
+    device_key: &SigningKey,
+    operation_id: &str,
+    last_reported_sha256: &str,
+) -> Result<SessionWatchResult, String> {
+    let ciphertext = read_session_ciphertext(&config.session_path)?;
+    let source_sha256 = sha256_base64url(&ciphertext);
+    if source_sha256 == last_reported_sha256 {
+        return Ok(SessionWatchResult::Unchanged);
+    }
+    submit_session_snapshot(config, device_key, operation_id, &ciphertext)
+}
+
+fn submit_session_snapshot(
+    config: &Config,
+    device_key: &SigningKey,
+    operation_id: &str,
+    ciphertext: &[u8],
+) -> Result<SessionWatchResult, String> {
+    let source_sha256 = sha256_base64url(ciphertext);
+    let body = serde_json::json!({
+        "ciphertext": URL_SAFE_NO_PAD.encode(ciphertext),
+        "sourceSha256": source_sha256,
+    });
+    let path = format!("/api/v2/connector/operations/{operation_id}/session-snapshot");
+    let (status, value) = post_signed_json_status(&config.server_url, &path, device_key, &body)?;
+    if status == 409 {
+        return Ok(SessionWatchResult::WritebackPending);
+    }
+    let ack: SessionSnapshotAck = serde_json::from_value(value)
+        .map_err(|_| "session snapshot acknowledgement is invalid".to_string())?;
+    if status == 200 && ack.state == "accepted" && ack.source_sha256.as_deref() == Some(source_sha256.as_str()) {
+        return Ok(SessionWatchResult::Accepted(source_sha256));
+    }
+    Err("session snapshot was not accepted".to_string())
 }
 
 fn read_session_ciphertext(path: &Path) -> Result<Vec<u8>, String> {
@@ -559,6 +715,7 @@ fn execute_directory_task(
     key: &SigningKey,
     operation_id: &str,
     task: &DirectoryTask,
+    last_reported_sha256: &mut String,
 ) -> Result<(), String> {
     let root = sv2_root(&config.session_path)?;
     let base = format!(
@@ -715,6 +872,25 @@ fn execute_directory_task(
             )
         }
         "dreamtonics_request" => {
+            let action = task.action.as_deref().unwrap_or_default();
+            let expected = task.expected_session_sha256.as_deref();
+            let current = read_session_ciphertext(&config.session_path)?;
+            let current_sha256 = sha256_base64url(&current);
+            if expected != Some(current_sha256.as_str()) {
+                match submit_session_snapshot(config, key, operation_id, &current) {
+                    Ok(SessionWatchResult::Accepted(source_sha256)) => {
+                        *last_reported_sha256 = source_sha256;
+                    }
+                    _ => return Ok(()),
+                }
+                let result = DreamtonicsRequestResult::with_status(action, 409, "session_changed");
+                return complete_task(
+                    config,
+                    key,
+                    &format!("{base}/complete"),
+                    serde_json::to_value(result).map_err(|error| error.to_string())?,
+                );
+            }
             let result = dreamtonics_request(task);
             complete_task(
                 config,
@@ -771,6 +947,12 @@ impl DreamtonicsRequestResult {
             access_expiry: None,
             expires_in: None,
         }
+    }
+
+    fn with_status(action: &str, status: u16, error: &'static str) -> Self {
+        let mut result = Self::failed(action, error);
+        result.status = status;
+        result
     }
 }
 
@@ -1580,6 +1762,30 @@ fn post_signed_json<T: Serialize>(
         .send_json(serde_json::to_value(body).map_err(|error| error.to_string())?);
     let _: serde_json::Value = parse_response(response)?;
     Ok(())
+}
+
+fn post_signed_json_status<T: Serialize>(
+    server: &str,
+    path: &str,
+    key: &SigningKey,
+    body: &T,
+) -> Result<(u16, serde_json::Value), String> {
+    let (nonce, signature) = request_signature(key, "POST", path);
+    let response = ureq::post(&format!("{server}{path}"))
+        .timeout(Duration::from_secs(30))
+        .set("Content-Type", "application/json")
+        .set("X-Connector-Nonce", &nonce)
+        .set("X-Connector-Signature", &signature)
+        .send_json(serde_json::to_value(body).map_err(|error| error.to_string())?);
+    let (status, response) = match response {
+        Ok(response) => (response.status(), response),
+        Err(ureq::Error::Status(status, response)) => (status, response),
+        Err(_) => return Err("authorization service request failed".to_string()),
+    };
+    let value = response
+        .into_json()
+        .map_err(|_| "authorization service returned invalid JSON".to_string())?;
+    Ok((status, value))
 }
 
 fn put_task_content(
