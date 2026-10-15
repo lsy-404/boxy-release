@@ -192,7 +192,15 @@ function Find-Control([IntPtr]$Window, [string]$Name, $Type = $null) {
     if ($null -ne $control) { return $control }
     Start-Sleep -Milliseconds 500
   }
-  throw "Boxy control did not appear: $Name"
+  $controls = $root.FindAll(
+    [System.Windows.Automation.TreeScope]::Descendants,
+    [System.Windows.Automation.Condition]::TrueCondition)
+  $names = @(
+    for ($index = 0; $index -lt $controls.Count; $index++) {
+      $value = $controls.Item($index).Current.Name
+      if (-not [string]::IsNullOrWhiteSpace($value)) { $value }
+    })
+  throw "Boxy control did not appear: $Name. UIA names: $($names -join ' | '). Browser requests: $([BoxyTestServer]::BrowserRequests)"
 }
 
 function Read-Value($Control) {

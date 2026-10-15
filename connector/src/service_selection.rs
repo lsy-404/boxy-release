@@ -27,7 +27,11 @@ enum UiEvent {
 }
 
 #[derive(Deserialize)]
-#[serde(tag = "action", rename_all = "camelCase")]
+#[serde(
+    tag = "action",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 enum UiCommand {
     Connect { url: String, session_path: String },
     ChooseSessionPath,

@@ -10,3 +10,6 @@
 - [x] Restore the v1 bounded product-logo fetch action without exposing session plaintext or editing Worker code.
 - [x] Add root `/test` coverage for metadata matching, image URL trust, image formats/size bounds, licenses fallback, and non-overwriting cache behavior.
 - [x] Run formatting, locked Cargo tests/check/build, portable packaging tests, update audit evidence, and commit the follow-up.
+- [x] Diagnose the packaged Windows startup smoke failure after the local session-path IPC change.
+- [x] Preserve the smoke assertion while making its failure include visible UI/status diagnostics; add direct IPC decoding regression.
+- [x] Run formatting and locked Cargo tests, record evidence, and commit the repair.

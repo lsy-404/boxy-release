@@ -47,6 +47,19 @@ fn setup_escapes_a_session_path_before_inserting_it_into_html() {
 }
 
 #[test]
+fn connect_ipc_decodes_the_camel_case_session_path_field() {
+    let command: UiCommand = serde_json::from_str(
+        r#"{"action":"connect","url":"http://127.0.0.1:43123","sessionPath":"C:\\session.bin"}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        command,
+        UiCommand::Connect { url, session_path }
+            if url == "http://127.0.0.1:43123" && session_path == "C:\\session.bin"
+    ));
+}
+
+#[test]
 fn connect_rejects_empty_missing_and_directory_session_paths() {
     assert!(validate_session_path("").is_err());
     assert!(validate_session_path("   ").is_err());
