@@ -41,7 +41,7 @@ const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_COMMAND_SECONDS: u64 = 3600;
 const MAX_DREAMTONICS_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const REQUEST_PATH: &str = "/api/v2/connector/operations";
-const DREAMTONICS_LICENSES_ENDPOINT: &str =
+pub(crate) const DREAMTONICS_LICENSES_ENDPOINT: &str =
     "https://authr3.dreamtonics.com/api/v1/client/my_licenses";
 const DREAMTONICS_ACTIVATE_ENDPOINT: &str =
     "https://authr3.dreamtonics.com/api/v1/client/activate_offline_license";
@@ -160,6 +160,8 @@ struct DirectoryTask {
     action: Option<String>,
     #[serde(default)]
     items: Vec<product_database::FetchItem>,
+    #[serde(default)]
+    keys: Vec<String>,
     #[serde(default)]
     product_id: Option<String>,
     #[serde(default)]
@@ -902,7 +904,11 @@ fn execute_directory_task(
                     serde_json::to_value(result).map_err(|error| error.to_string())?,
                 );
             }
-            let result = dreamtonics_request(task);
+            let result = if action == "product_logos" {
+                dreamtonics_product_logos(task, &config.session_path)
+            } else {
+                dreamtonics_request(task)
+            };
             complete_task(
                 config,
                 key,
@@ -1173,7 +1179,37 @@ fn dreamtonics_request(task: &DirectoryTask) -> DreamtonicsRequestResult {
     }
 }
 
-fn dreamtonics_http(
+fn dreamtonics_product_logos(
+    task: &DirectoryTask,
+    session_path: &Path,
+) -> DreamtonicsRequestResult {
+    let action = task.action.as_deref().unwrap_or_default();
+    let Some(access_token) = task.access_token.as_deref() else {
+        return DreamtonicsRequestResult::failed(action, "access token is missing");
+    };
+    match assets::fetch_product_logos(session_path, &task.keys, access_token).and_then(|logos| {
+        let response = serde_json::json!({ "logos": logos }).to_string();
+        if response.len() > 512 * 1024 {
+            Err("product logo response exceeds the size limit".to_string())
+        } else {
+            Ok(response)
+        }
+    }) {
+        Ok(response_body) => DreamtonicsRequestResult {
+            action: action.to_string(),
+            status: 200,
+            response_body,
+            error: None,
+            refreshed_access_token: None,
+            refreshed_refresh_token: None,
+            access_expiry: None,
+            expires_in: None,
+        },
+        Err(_) => DreamtonicsRequestResult::failed(action, "product logos could not be fetched"),
+    }
+}
+
+pub(crate) fn dreamtonics_http(
     method: &str,
     endpoint: &str,
     access_token: Option<&str>,

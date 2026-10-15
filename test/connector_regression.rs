@@ -150,6 +150,128 @@ fn quick_login_uses_the_current_device_id_and_current_computer_name() {
 }
 
 #[test]
+fn product_logo_action_matches_local_metadata_then_falls_back_to_licenses() {
+    let directory = TestDirectory::new();
+    let app_root = directory.0.join("app");
+    let session_path = app_root.join("sessions").join("session");
+    let metadata_directory = app_root.join("databases").join("meta");
+    fs::create_dir_all(&metadata_directory).unwrap();
+    fs::create_dir_all(session_path.parent().unwrap()).unwrap();
+    fs::write(
+        metadata_directory.join("local-product.json"),
+        r#"{"name":"Synth One","profile":{"imageUrl":"https://cdn.dreamtonics.com/local.png"}}"#,
+    )
+    .unwrap();
+
+    let keys = vec!["  synth   one ".to_string(), "license-only".to_string()];
+    let mut license_reads = 0;
+    let logos = assets::fetch_product_logos_with(
+        &session_path,
+        &keys,
+        || {
+            license_reads += 1;
+            Ok(serde_json::json!({"data":[{
+                "id":"license-cache-id",
+                "productId":"license-only",
+                "image":{"url":"https://dreamtonics.com/license.gif"}
+            }]}))
+        },
+        |url, _| match url {
+            "https://cdn.dreamtonics.com/local.png" => Some(b"\x89PNG\r\n\x1a\nlocal".to_vec()),
+            "https://dreamtonics.com/license.gif" => Some(b"GIF89a-license".to_vec()),
+            _ => None,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(license_reads, 1);
+    assert_eq!(logos.len(), 2);
+    assert_eq!(logos[0].id, "local-product");
+    assert_eq!(logos[0].name, "Synth One");
+    assert!(logos[0].data_url.starts_with("data:image/png;base64,"));
+    assert_eq!(logos[1].id, "license-only");
+    assert!(logos[1].data_url.starts_with("data:image/gif;base64,"));
+    assert!(metadata_directory.join("local-product.png").exists());
+    assert!(metadata_directory.join("license-cache-id.gif").exists());
+    let cached = assets::cached_product_logos(&session_path);
+    assert!(cached.iter().any(|logo| logo.id == "local-product"));
+    assert!(cached.iter().any(|logo| {
+        logo.id == "license-cache-id" && logo.data_url.starts_with("data:image/gif;base64,")
+    }));
+}
+
+#[test]
+fn product_logo_fetch_skips_license_request_when_local_metadata_covers_keys() {
+    let directory = TestDirectory::new();
+    let app_root = directory.0.join("app");
+    let session_path = app_root.join("sessions").join("session");
+    let metadata_directory = app_root.join("databases").join("meta");
+    fs::create_dir_all(&metadata_directory).unwrap();
+    fs::write(
+        metadata_directory.join("local-product.json"),
+        r#"{"name":"Synth One","icon":"https://assets.dreamtonics.com/icon.webp"}"#,
+    )
+    .unwrap();
+    let logos = assets::fetch_product_logos_with(
+        &session_path,
+        &["synth one".to_string()],
+        || panic!("licenses should not be fetched when local metadata matches"),
+        |_, _| Some(b"RIFF1234WEBPimage".to_vec()),
+    )
+    .unwrap();
+    assert_eq!(logos.len(), 1);
+    assert!(logos[0].data_url.starts_with("data:image/webp;base64,"));
+}
+
+#[test]
+fn product_logo_urls_formats_and_cache_are_bounded_and_trusted() {
+    let directory = TestDirectory::new();
+    let app_root = directory.0.join("app");
+    let session_path = app_root.join("sessions").join("session");
+    let metadata_directory = app_root.join("databases").join("meta");
+    fs::create_dir_all(&metadata_directory).unwrap();
+    fs::write(
+        metadata_directory.join("untrusted.json"),
+        r#"{"name":"untrusted","imageUrl":"https://evil.example.test/p.png"}"#,
+    )
+    .unwrap();
+    let mut download_count = 0;
+    let logos = assets::fetch_product_logos_with(
+        &session_path,
+        &["untrusted".to_string()],
+        || Ok(serde_json::json!({"data":[{"id":"x","productId":"untrusted","logo":"http://dreamtonics.com/image.png"}]})),
+        |_, _| {
+            download_count += 1;
+            Some(b"not an image".to_vec())
+        },
+    )
+    .unwrap();
+    assert!(logos.is_empty());
+    assert_eq!(download_count, 0);
+
+    let mut too_large = b"\x89PNG\r\n\x1a\n".to_vec();
+    too_large.resize(512 * 1024 + 1, b'x');
+    let logos = assets::fetch_product_logos_with(
+        &session_path,
+        &["oversized".to_string()],
+        || Ok(serde_json::json!({"data":[{"id":"oversized-cache","productId":"oversized","imageUrl":"https://img.dreamtonics.com/a.png"}]})),
+        |_, _| Some(too_large.clone()),
+    )
+    .unwrap();
+    assert!(logos.is_empty());
+    assert!(!metadata_directory.join("oversized-cache.png").exists());
+
+    let invalid_keys = vec!["key".to_string(); 513];
+    assert!(assets::fetch_product_logos_with(
+        &session_path,
+        &invalid_keys,
+        || panic!("invalid key count must fail before network access"),
+        |_, _| None,
+    )
+    .is_err());
+}
+
+#[test]
 fn latest_operation_protocol_decodes_directory_tasks_and_snapshot_fields() {
     let response: ConnectorOperationResponse = serde_json::from_value(serde_json::json!({
         "state": "editor_active",
@@ -159,6 +281,7 @@ fn latest_operation_protocol_decodes_directory_tasks_and_snapshot_fields() {
             "action": "licenses",
             "expectedSessionSha256": "source-hash",
             "deviceId": "device-42",
+            "keys": ["product-a", "Synth One"],
             "accessToken": "access",
             "refreshToken": "refresh"
         }]
@@ -171,6 +294,7 @@ fn latest_operation_protocol_decodes_directory_tasks_and_snapshot_fields() {
     assert_eq!(task.action.as_deref(), Some("licenses"));
     assert_eq!(task.expected_session_sha256.as_deref(), Some("source-hash"));
     assert_eq!(task.device_id.as_deref(), Some("device-42"));
+    assert_eq!(task.keys, ["product-a", "Synth One"]);
 
     let ack: SessionSnapshotAck = serde_json::from_value(serde_json::json!({
         "state": "accepted",
@@ -272,6 +396,7 @@ fn directory_task(action: &str) -> DirectoryTask {
         mode: None,
         action: Some(action.into()),
         items: Vec::new(),
+        keys: Vec::new(),
         product_id: None,
         device_id: None,
         access_token: None,

@@ -159,10 +159,15 @@ pub fn cached_product_logos(session_path: &Path) -> Vec<CachedProductLogo> {
             })
             .filter(|name| within_schema_limit(name))
             .unwrap_or_default();
-        let Some((data_url, image_bytes)) = read_image(
-            &metadata_path.with_extension("png"),
-            MAX_TOTAL_IMAGE_BYTES.saturating_sub(total_image_bytes),
-        ) else {
+        let Some((data_url, image_bytes)) = ["png", "jpg", "jpeg", "gif", "webp"]
+            .into_iter()
+            .find_map(|extension| {
+                read_image(
+                    &metadata_path.with_extension(extension),
+                    MAX_TOTAL_IMAGE_BYTES.saturating_sub(total_image_bytes),
+                )
+            })
+        else {
             continue;
         };
         let logo = CachedProductLogo {
@@ -195,10 +200,11 @@ pub fn cached_product_logos(session_path: &Path) -> Vec<CachedProductLogo> {
         if logos.len() >= MAX_LOGOS || total_image_bytes >= MAX_TOTAL_IMAGE_BYTES {
             break;
         }
-        if !image_path
-            .extension()
-            .is_some_and(|value| value.eq_ignore_ascii_case("png"))
-        {
+        if !image_path.extension().is_some_and(|value| {
+            ["png", "jpg", "jpeg", "gif", "webp"]
+                .iter()
+                .any(|extension| value.eq_ignore_ascii_case(extension))
+        }) {
             continue;
         }
         let Some(id) = image_path.file_stem().and_then(|value| value.to_str()) else {
@@ -245,13 +251,347 @@ fn relative_root(session_path: &Path) -> Option<std::path::PathBuf> {
 fn read_image(path: &Path, remaining_bytes: usize) -> Option<(String, usize)> {
     let max_bytes = MAX_IMAGE_BYTES.min(remaining_bytes);
     let bytes = read_bounded_file(path, max_bytes)?;
-    if bytes.is_empty() || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+    let data_url = image_data_url(&bytes)?;
+    Some((data_url, bytes.len()))
+}
+
+pub(super) fn fetch_product_logos(
+    session_path: &Path,
+    keys: &[String],
+    access_token: &str,
+) -> Result<Vec<CachedProductLogo>, String> {
+    fetch_product_logos_with(
+        session_path,
+        keys,
+        || {
+            let (status, response_body) = crate::dreamtonics_http(
+                "GET",
+                crate::DREAMTONICS_LICENSES_ENDPOINT,
+                Some(access_token),
+                None,
+                "application/json",
+            )
+            .map_err(str::to_string)?;
+            if !(200..300).contains(&status) {
+                return Err("license request failed".to_string());
+            }
+            serde_json::from_str(&response_body)
+                .map_err(|_| "license response is invalid".to_string())
+        },
+        download_product_image,
+    )
+}
+
+pub(super) fn fetch_product_logos_with<F, G>(
+    session_path: &Path,
+    keys: &[String],
+    load_licenses: F,
+    mut download: G,
+) -> Result<Vec<CachedProductLogo>, String>
+where
+    F: FnOnce() -> Result<serde_json::Value, String>,
+    G: FnMut(&str, usize) -> Option<Vec<u8>>,
+{
+    if keys.len() > MAX_LOGOS {
+        return Err("too many product logo keys".to_string());
+    }
+    let wanted = keys
+        .iter()
+        .filter(|key| within_schema_limit(key) && !key.chars().any(char::is_control))
+        .map(|key| normalize_product_key(key))
+        .filter(|key| !key.is_empty())
+        .collect::<HashSet<_>>();
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let directory = relative_root(session_path)
+        .map(|root| root.join("databases").join("meta"))
+        .ok_or_else(|| "cannot determine product metadata directory".to_string())?;
+    let mut logos = Vec::new();
+    let mut covered = HashSet::new();
+    let mut total_image_bytes = 0usize;
+    let mut total_json_bytes = 0usize;
+    if let Ok(entries) = fs::read_dir(&directory) {
+        let mut files = entries
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                entry.file_type().ok()?.is_file().then(|| entry.path())
+            })
+            .take(MAX_LOGOS)
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+            })
+            .collect::<Vec<_>>();
+        files.sort();
+        for metadata_path in files.into_iter().take(MAX_LOGOS) {
+            if logos.len() == MAX_LOGOS || total_image_bytes >= MAX_TOTAL_IMAGE_BYTES {
+                break;
+            }
+            let Some(id) = metadata_path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if !valid_product_cache_id(id) {
+                continue;
+            }
+            let Some(bytes) = read_bounded_file(&metadata_path, MAX_METADATA_BYTES) else {
+                continue;
+            };
+            let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue;
+            };
+            let name = metadata
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let id_key = normalize_product_key(id);
+            let name_key = normalize_product_key(name);
+            if !wanted.contains(&id_key) && !wanted.contains(&name_key) {
+                continue;
+            }
+            let Some(url) = find_product_image_url(&metadata) else {
+                continue;
+            };
+            let remaining = MAX_TOTAL_IMAGE_BYTES.saturating_sub(total_image_bytes);
+            let Some(image) = download(&url, remaining) else {
+                continue;
+            };
+            let Some(data_url) = image_data_url_bounded(&image, remaining) else {
+                continue;
+            };
+            let logo = CachedProductLogo {
+                id: id.to_string(),
+                name: name.to_string(),
+                data_url,
+            };
+            let Ok(size) = serde_json::to_vec(&logo).map(|value| value.len()) else {
+                continue;
+            };
+            if size > MAX_TOTAL_LOGO_JSON_BYTES.saturating_sub(total_json_bytes) {
+                continue;
+            }
+            cache_remote_product_image(&directory, id, &image);
+            total_image_bytes += image.len();
+            total_json_bytes += size;
+            covered.insert(id_key);
+            if !name_key.is_empty() {
+                covered.insert(name_key);
+            }
+            logos.push(logo);
+        }
+    }
+    if wanted.difference(&covered).next().is_none() || logos.len() >= MAX_LOGOS {
+        return Ok(logos);
+    }
+    let Ok(licenses) = load_licenses() else {
+        return Ok(logos);
+    };
+    let licenses = licenses.get("data").unwrap_or(&licenses);
+    if let Some(rows) = licenses.as_array() {
+        for license in rows {
+            if logos.len() >= MAX_LOGOS || total_image_bytes >= MAX_TOTAL_IMAGE_BYTES {
+                break;
+            }
+            let remaining_keys = wanted.difference(&covered).cloned().collect::<HashSet<_>>();
+            let Some(identity) = matching_license_identity(license, &remaining_keys) else {
+                continue;
+            };
+            let Some(url) = find_product_image_url(license) else {
+                continue;
+            };
+            let remaining = MAX_TOTAL_IMAGE_BYTES.saturating_sub(total_image_bytes);
+            let Some(image) = download(&url, remaining) else {
+                continue;
+            };
+            let Some(data_url) = image_data_url_bounded(&image, remaining) else {
+                continue;
+            };
+            let logo = CachedProductLogo {
+                id: identity.to_string(),
+                name: String::new(),
+                data_url,
+            };
+            let Ok(size) = serde_json::to_vec(&logo).map(|value| value.len()) else {
+                continue;
+            };
+            if size > MAX_TOTAL_LOGO_JSON_BYTES.saturating_sub(total_json_bytes) {
+                continue;
+            }
+            if let Some(cache_id) = license.get("id").and_then(serde_json::Value::as_str) {
+                cache_remote_product_image(&directory, cache_id, &image);
+            }
+            total_image_bytes += image.len();
+            total_json_bytes += size;
+            covered.insert(normalize_product_key(identity));
+            logos.push(logo);
+        }
+    }
+    Ok(logos)
+}
+
+fn matching_license_identity<'a>(
+    value: &'a serde_json::Value,
+    wanted: &HashSet<String>,
+) -> Option<&'a str> {
+    match value {
+        serde_json::Value::Object(fields) => fields.iter().find_map(|(key, value)| {
+            let field = normalized_field_name(key);
+            if matches!(field.as_str(), "id" | "productid" | "databaseid" | "name") {
+                if let Some(value) = value.as_str() {
+                    if wanted.contains(&normalize_product_key(value)) {
+                        return Some(value);
+                    }
+                }
+            }
+            matching_license_identity(value, wanted)
+        }),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .find_map(|value| matching_license_identity(value, wanted)),
+        _ => None,
+    }
+}
+
+fn find_product_image_url(value: &serde_json::Value) -> Option<String> {
+    fn scan(value: &serde_json::Value, context: bool) -> Option<String> {
+        match value {
+            serde_json::Value::Object(fields) => fields.iter().find_map(|(key, value)| {
+                let image_context = context || is_image_field(key);
+                if is_image_field(key) || (image_context && is_url_field(key)) {
+                    if let Some(url) = value.as_str().and_then(trusted_product_image_url) {
+                        return Some(url);
+                    }
+                }
+                scan(value, image_context)
+            }),
+            serde_json::Value::Array(values) => {
+                values.iter().find_map(|value| scan(value, context))
+            }
+            serde_json::Value::String(value) if context => trusted_product_image_url(value),
+            _ => None,
+        }
+    }
+    scan(value, false)
+}
+
+fn is_image_field(key: &str) -> bool {
+    let field = normalized_field_name(key);
+    ["image", "icon", "logo", "profile"]
+        .iter()
+        .any(|needle| field.contains(needle))
+}
+
+fn is_url_field(key: &str) -> bool {
+    normalized_field_name(key).ends_with("url")
+}
+
+fn normalized_field_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+fn trusted_product_image_url(value: &str) -> Option<String> {
+    if value.len() > 2048 {
         return None;
     }
-    Some((
-        format!("data:image/png;base64,{}", STANDARD.encode(&bytes)),
-        bytes.len(),
-    ))
+    let url = url::Url::parse(value).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    let trusted = host == "dreamtonics.com"
+        || host.ends_with(".dreamtonics.com")
+        || host == "dreamtonics.com.cn"
+        || host.ends_with(".dreamtonics.com.cn");
+    (url.scheme() == "https"
+        && trusted
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none())
+    .then(|| url.to_string())
+}
+
+fn download_product_image(url: &str, max_bytes: usize) -> Option<Vec<u8>> {
+    trusted_product_image_url(url)?;
+    let agent = ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout(std::time::Duration::from_secs(15))
+        .build();
+    let response = agent.get(url).call().ok()?;
+    if !(200..300).contains(&response.status()) {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= max_bytes).then_some(bytes)
+}
+
+fn image_data_url_bounded(bytes: &[u8], max_bytes: usize) -> Option<String> {
+    (bytes.len() <= MAX_IMAGE_BYTES.min(max_bytes))
+        .then(|| image_data_url(bytes))
+        .flatten()
+}
+
+fn image_data_url(bytes: &[u8]) -> Option<String> {
+    let mime = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        "image/jpeg"
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        "image/gif"
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "image/webp"
+    } else {
+        return None;
+    };
+    Some(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
+}
+
+fn cache_remote_product_image(directory: &Path, id: &str, bytes: &[u8]) {
+    if !valid_product_cache_id(id)
+        || bytes.len() > MAX_IMAGE_BYTES
+        || image_data_url(bytes).is_none()
+    {
+        return;
+    }
+    if fs::create_dir_all(directory).is_err() {
+        return;
+    }
+    let extension = match image_data_url(bytes).as_deref() {
+        Some(value) if value.starts_with("data:image/png;") => "png",
+        Some(value) if value.starts_with("data:image/jpeg;") => "jpg",
+        Some(value) if value.starts_with("data:image/gif;") => "gif",
+        Some(value) if value.starts_with("data:image/webp;") => "webp",
+        _ => return,
+    };
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(directory.join(format!("{id}.{extension}")))
+    {
+        use std::io::Write;
+        let _ = file.write_all(bytes);
+    }
+}
+
+fn valid_product_cache_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn normalize_product_key(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 fn read_bounded_file(path: &Path, max_bytes: usize) -> Option<Vec<u8>> {
