@@ -8,3 +8,4 @@
 - [x] 同步 connector package 与 Cargo.lock 至 v2.0.5
 - [x] 运行连接器回归、release build 并复核 diff
 - [x] 提交本地分支；不推送、不部署
+- [x] 协调阶段合并推送主线，通过跨平台发行流水线并公开 v2.0.5
