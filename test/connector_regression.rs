@@ -412,3 +412,58 @@ fn directory_task(action: &str) -> DirectoryTask {
 fn test_signing_key() -> ed25519_dalek::SigningKey {
     ed25519_dalek::SigningKey::from_bytes(&[7; 32])
 }
+
+#[test]
+fn refresh_authority_selects_only_the_exact_trusted_regional_issuer() {
+    let international = refresh_token_claims(super::DREAMTONICS_ISSUER, Some("test-client"));
+    assert_eq!(
+        refresh_authority(&international),
+        Some(("test-client".to_string(), super::DREAMTONICS_TOKEN_ENDPOINT))
+    );
+
+    let regional = refresh_token_claims(super::DREAMTONICS_CN_ISSUER, Some("test-client"));
+    assert_eq!(
+        refresh_authority(&regional),
+        Some((
+            "test-client".to_string(),
+            super::DREAMTONICS_CN_TOKEN_ENDPOINT
+        ))
+    );
+
+    for (issuer, client_id) in [
+        (
+            "https://account.dreamtonics.com.cn.evil.example/realms/Dreamtonics",
+            Some("test-client"),
+        ),
+        (
+            "https://account.dreamtonics.example/realms/Dreamtonics",
+            Some("test-client"),
+        ),
+        (
+            "http://account.dreamtonics.com.cn/realms/Dreamtonics",
+            Some("test-client"),
+        ),
+        (
+            "https://account.dreamtonics.com.cn/realms/Other",
+            Some("test-client"),
+        ),
+        (super::DREAMTONICS_CN_ISSUER, None),
+        (super::DREAMTONICS_CN_ISSUER, Some("invalid client")),
+    ] {
+        assert_eq!(
+            refresh_authority(&refresh_token_claims(issuer, client_id)),
+            None
+        );
+    }
+}
+
+fn refresh_token_claims(issuer: &str, client_id: Option<&str>) -> String {
+    let mut claims = serde_json::json!({ "iss": issuer });
+    if let Some(client_id) = client_id {
+        claims["azp"] = serde_json::Value::String(client_id.to_string());
+    }
+    format!(
+        "e30.{}.signature",
+        URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes())
+    )
+}

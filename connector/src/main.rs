@@ -51,8 +51,12 @@ const DREAMTONICS_DEVICES_ENDPOINT: &str =
     "https://authr3.dreamtonics.com/api/v1/client/my_devices?native_product=Synthesizer+V+Studio+2+Pro";
 const DREAMTONICS_ENROLL_ENDPOINT: &str =
     "https://authr3.dreamtonics.com/api/v1/client/enroll_device";
+const DREAMTONICS_ISSUER: &str = "https://account.dreamtonics.com/realms/Dreamtonics";
+const DREAMTONICS_CN_ISSUER: &str = "https://account.dreamtonics.com.cn/realms/Dreamtonics";
 const DREAMTONICS_TOKEN_ENDPOINT: &str =
     "https://account.dreamtonics.com/realms/Dreamtonics/protocol/openid-connect/token";
+const DREAMTONICS_CN_TOKEN_ENDPOINT: &str =
+    "https://account.dreamtonics.com.cn/realms/Dreamtonics/protocol/openid-connect/token";
 const DREAMTONICS_DOWNLOAD_ENDPOINT: &str =
     "https://authr3.dreamtonics.com/api/v1/update/get_download_url";
 const DREAMTONICS_MODEL_ENDPOINT: &str =
@@ -990,7 +994,7 @@ fn dreamtonics_request(task: &DirectoryTask) -> DreamtonicsRequestResult {
     let mut method = "GET";
     let mut body: Option<String> = None;
     let mut token: Option<&str> = task.access_token.as_deref();
-    let mut content_type = "application/json";
+    let content_type = "application/json";
     match action {
         "licenses" | "quick_licenses" => endpoint.push_str(DREAMTONICS_LICENSES_ENDPOINT),
         "quick_devices" => endpoint.push_str(DREAMTONICS_DEVICES_ENDPOINT),
@@ -1010,11 +1014,7 @@ fn dreamtonics_request(task: &DirectoryTask) -> DreamtonicsRequestResult {
             body = Some(quick_login_body(task.device_id.as_deref()));
         }
         "refresh" => {
-            endpoint.push_str(DREAMTONICS_TOKEN_ENDPOINT);
-            method = "POST";
-            content_type = "application/x-www-form-urlencoded";
             token = None;
-            body = Some(String::new());
         }
         "product_download_url" => {
             let product_id = match task.product_id.as_deref() {
@@ -1282,7 +1282,8 @@ fn refresh_access(refresh_token: &str) -> Result<(String, String, String, u64), 
     if !valid_bearer_token(refresh_token) {
         return Err("refresh token is missing or invalid");
     }
-    let client_id = refresh_client_id(refresh_token).ok_or("refresh token client is invalid")?;
+    let (client_id, token_endpoint) =
+        refresh_authority(refresh_token).ok_or("refresh token client is invalid")?;
     let body = Zeroizing::new(
         url::form_urlencoded::Serializer::new(String::new())
             .append_pair("grant_type", "refresh_token")
@@ -1292,7 +1293,7 @@ fn refresh_access(refresh_token: &str) -> Result<(String, String, String, u64), 
     );
     let (status, response_body) = dreamtonics_http(
         "POST",
-        DREAMTONICS_TOKEN_ENDPOINT,
+        token_endpoint,
         None,
         Some(body.as_str()),
         "application/x-www-form-urlencoded",
@@ -1326,13 +1327,15 @@ fn refresh_access(refresh_token: &str) -> Result<(String, String, String, u64), 
     ))
 }
 
-fn refresh_client_id(refresh: &str) -> Option<String> {
+fn refresh_authority(refresh: &str) -> Option<(String, &'static str)> {
     let payload = refresh.split('.').nth(1)?;
     let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
     let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    if claims.get("iss")?.as_str()? != "https://account.dreamtonics.com/realms/Dreamtonics" {
-        return None;
-    }
+    let endpoint = match claims.get("iss")?.as_str()? {
+        DREAMTONICS_ISSUER => DREAMTONICS_TOKEN_ENDPOINT,
+        DREAMTONICS_CN_ISSUER => DREAMTONICS_CN_TOKEN_ENDPOINT,
+        _ => return None,
+    };
     let client_id = claims.get("azp")?.as_str()?;
     if client_id.is_empty()
         || client_id.len() > 160
@@ -1342,7 +1345,7 @@ fn refresh_client_id(refresh: &str) -> Option<String> {
     {
         return None;
     }
-    Some(client_id.to_string())
+    Some((client_id.to_string(), endpoint))
 }
 
 fn is_valid_custom_endpoint(value: &str) -> bool {
