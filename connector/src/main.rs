@@ -375,7 +375,7 @@ fn wait_for_writeback(
                     _ => "Connected. Waiting for the remote...",
                 };
                 status.update(pending_status);
-                for task in response.directory_tasks {
+                if let Some(task) = response.directory_tasks.into_iter().next() {
                     status.ensure_active()?;
                     status.update("Handling a remote operation...");
                     execute_directory_task(
@@ -385,6 +385,7 @@ fn wait_for_writeback(
                         &task,
                         &mut last_reported_sha256,
                     )?;
+                    continue;
                 }
                 status.update(pending_status);
                 thread::sleep(Duration::from_secs(2));
@@ -560,7 +561,10 @@ fn submit_session_snapshot(
     }
     let ack: SessionSnapshotAck = serde_json::from_value(value)
         .map_err(|_| "session snapshot acknowledgement is invalid".to_string())?;
-    if status == 200 && ack.state == "accepted" && ack.source_sha256.as_deref() == Some(source_sha256.as_str()) {
+    if status == 200
+        && ack.state == "accepted"
+        && ack.source_sha256.as_deref() == Some(source_sha256.as_str())
+    {
         return Ok(SessionWatchResult::Accepted(source_sha256));
     }
     Err("session snapshot was not accepted".to_string())
