@@ -56,6 +56,12 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      - name: Run connector regressions
+        shell: pwsh
+        run: |
+          cargo test --locked -p boxy
+          node --test test/package_portable.test.mjs
+
       - name: Build client source
         shell: pwsh
         run: |
@@ -64,6 +70,10 @@ jobs:
       - name: Package portable Boxy
         shell: pwsh
         run: node scripts/package-portable.mjs x86_64-pc-windows-msvc
+
+      - name: Smoke test packaged Boxy
+        shell: pwsh
+        run: pwsh -NoProfile -File test/windows_startup_smoke.ps1 -Executable dist/boxy-windows-x64.exe
 
       - name: Upload Boxy for Windows
         env:
@@ -89,6 +99,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Run connector regressions
+        run: |
+          cargo test --locked -p boxy
+          node --test test/package_portable.test.mjs
 
       - name: Build client source
         run: |
