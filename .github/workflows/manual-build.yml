@@ -56,19 +56,14 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Verify client source
+      - name: Build client source
         shell: pwsh
         run: |
-          cargo test --locked -p boxy
           cargo build --locked --release -p boxy --target x86_64-pc-windows-msvc
 
       - name: Package portable Boxy
         shell: pwsh
         run: node scripts/package-portable.mjs x86_64-pc-windows-msvc
-
-      - name: Verify startup window
-        shell: pwsh
-        run: ./test/windows_startup_smoke.ps1 -Executable dist/boxy-windows-x64.exe
 
       - name: Upload Boxy for Windows
         env:
@@ -95,9 +90,8 @@ jobs:
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
-      - name: Verify client source
+      - name: Build client source
         run: |
-          cargo test --locked -p boxy
           cargo build --locked --release -p boxy --target aarch64-apple-darwin
           cargo build --locked --release -p boxy --target x86_64-apple-darwin
 

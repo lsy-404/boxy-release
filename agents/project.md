@@ -14,6 +14,7 @@
 ## 模块结构
 
 - connector/：本机连接器、用户确认、设备签名、密文 session I/O、受限本地任务、命令批准。
+- Dreamtonics 授权 API 请求由 connector 执行有限的固定动作；Worker 持有编辑状态并消费签名回执。
 - scripts/：便携版构建。
 - test/：跨平台配置和协议验证测试。
 - agents/：任务计划、调研和操作记录。

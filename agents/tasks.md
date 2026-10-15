@@ -14,3 +14,4 @@
 | 009 | [PackageManagement] pnpm CLI migration | Migrate connector UI package to pnpm | Keep supported Node.js workflows consistently on pnpm | ✅ 已完成 |
 
 | 010 | [Maintenance] Kit依赖升级 | 更新已使用的公共 kit 包和锁文件 | 使用最新已发布的共享组件 | ✅ 已完成 |
+| 011 | [Feature] Dreamtonics授权请求 | 将授权服务请求、安全响应回传与过期 token 刷新放入本机 connector | Worker 直连 Dreamtonics 返回 403；离线写回需先读取许可信息 | ✅ 已完成 |

@@ -39,7 +39,24 @@ const MAX_DIRECTORY_ENTRIES: usize = 100_000;
 const MAX_START_REQUEST_BYTES: usize = (4 * 1024 * 1024 + 2) / 3 + 16 * 1024;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_COMMAND_SECONDS: u64 = 3600;
+const MAX_DREAMTONICS_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const REQUEST_PATH: &str = "/api/v2/connector/operations";
+const DREAMTONICS_LICENSES_ENDPOINT: &str =
+    "https://authr3.dreamtonics.com/api/v1/client/my_licenses";
+const DREAMTONICS_ACTIVATE_ENDPOINT: &str =
+    "https://authr3.dreamtonics.com/api/v1/client/activate_offline_license";
+const DREAMTONICS_DEACTIVATE_ENDPOINT: &str =
+    "https://authr3.dreamtonics.com/api/v1/client/deactivate_offline_license";
+const DREAMTONICS_DEVICES_ENDPOINT: &str =
+    "https://authr3.dreamtonics.com/api/v1/client/my_devices?native_product=Synthesizer+V+Studio+2+Pro";
+const DREAMTONICS_ENROLL_ENDPOINT: &str =
+    "https://authr3.dreamtonics.com/api/v1/client/enroll_device";
+const DREAMTONICS_TOKEN_ENDPOINT: &str =
+    "https://account.dreamtonics.com/realms/Dreamtonics/protocol/openid-connect/token";
+const DREAMTONICS_DOWNLOAD_ENDPOINT: &str =
+    "https://authr3.dreamtonics.com/api/v1/update/get_download_url";
+const DREAMTONICS_MODEL_ENDPOINT: &str =
+    "https://authr3.dreamtonics.com/api/v1/model/request_model_download";
 
 #[derive(Debug)]
 struct Config {
@@ -140,6 +157,29 @@ struct DirectoryTask {
     items: Vec<product_database::FetchItem>,
     #[serde(default)]
     product_id: Option<String>,
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    method: Option<String>,
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    model_version: Option<u32>,
+}
+
+impl Drop for DirectoryTask {
+    fn drop(&mut self) {
+        if let Some(value) = &mut self.access_token {
+            value.zeroize();
+        }
+        if let Some(value) = &mut self.refresh_token {
+            value.zeroize();
+        }
+    }
 }
 
 fn main() {
@@ -674,8 +714,415 @@ fn execute_directory_task(
                 serde_json::json!({ "id": id, "installed": false }),
             )
         }
+        "dreamtonics_request" => {
+            let result = dreamtonics_request(task);
+            complete_task(
+                config,
+                key,
+                &format!("{base}/complete"),
+                serde_json::to_value(result).map_err(|error| error.to_string())?,
+            )
+        }
         _ => Err("unsupported directory task".to_string()),
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DreamtonicsRequestResult {
+    action: String,
+    status: u16,
+    response_body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refreshed_access_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refreshed_refresh_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    access_expiry: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_in: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct RefreshResponse {
+    access_token: String,
+    refresh_token: String,
+    expires_in: u64,
+}
+
+impl Drop for RefreshResponse {
+    fn drop(&mut self) {
+        self.access_token.zeroize();
+        self.refresh_token.zeroize();
+    }
+}
+
+impl DreamtonicsRequestResult {
+    fn failed(action: &str, error: &'static str) -> Self {
+        Self {
+            action: action.to_string(),
+            status: 599,
+            response_body: String::new(),
+            error: Some(error),
+            refreshed_access_token: None,
+            refreshed_refresh_token: None,
+            access_expiry: None,
+            expires_in: None,
+        }
+    }
+}
+
+impl Drop for DreamtonicsRequestResult {
+    fn drop(&mut self) {
+        if let Some(value) = &mut self.refreshed_access_token {
+            value.zeroize();
+        }
+        if let Some(value) = &mut self.refreshed_refresh_token {
+            value.zeroize();
+        }
+    }
+}
+
+fn dreamtonics_request(task: &DirectoryTask) -> DreamtonicsRequestResult {
+    let action = task.action.as_deref().unwrap_or_default();
+    let mut endpoint = String::new();
+    let mut method = "GET";
+    let mut body: Option<String> = None;
+    let mut token: Option<&str> = task.access_token.as_deref();
+    let mut content_type = "application/json";
+    match action {
+        "licenses" | "quick_licenses" => endpoint.push_str(DREAMTONICS_LICENSES_ENDPOINT),
+        "quick_devices" => endpoint.push_str(DREAMTONICS_DEVICES_ENDPOINT),
+        "offline_activate" => {
+            endpoint.push_str(DREAMTONICS_ACTIVATE_ENDPOINT);
+            method = "POST";
+            body = Some("{}".to_string());
+        }
+        "offline_deactivate" => {
+            endpoint.push_str(DREAMTONICS_DEACTIVATE_ENDPOINT);
+            method = "POST";
+            body = Some("{}".to_string());
+        }
+        "quick_login" => {
+            endpoint.push_str(DREAMTONICS_ENROLL_ENDPOINT);
+            method = "POST";
+            body = Some(
+                serde_json::json!({
+                    "payload": {
+                        "device_id": null,
+                        "device_hash": "",
+                        "editor_version": 0x20201,
+                        "device_name": "Synthesizer V Studio 2",
+                        "kickout_other_sessions": false
+                    }
+                })
+                .to_string(),
+            );
+        }
+        "refresh" => {
+            endpoint.push_str(DREAMTONICS_TOKEN_ENDPOINT);
+            method = "POST";
+            content_type = "application/x-www-form-urlencoded";
+            token = None;
+            body = Some(String::new());
+        }
+        "product_download_url" => {
+            let product_id = match task.product_id.as_deref() {
+                Some(value)
+                    if !value.is_empty()
+                        && value.len() <= 512
+                        && !value.chars().any(char::is_control) =>
+                {
+                    value
+                }
+                _ => {
+                    return DreamtonicsRequestResult::failed(
+                        action,
+                        "product id is missing or invalid",
+                    )
+                }
+            };
+            let mut url = match Url::parse(DREAMTONICS_DOWNLOAD_ENDPOINT) {
+                Ok(value) => value,
+                Err(_) => {
+                    return DreamtonicsRequestResult::failed(action, "upstream endpoint is invalid")
+                }
+            };
+            url.query_pairs_mut().append_pair("product", product_id);
+            endpoint = url.to_string();
+        }
+        "model_download_url" => {
+            let product_id = match task.product_id.as_deref() {
+                Some(value)
+                    if !value.is_empty()
+                        && value.len() <= 512
+                        && !value.chars().any(char::is_control) =>
+                {
+                    value
+                }
+                _ => {
+                    return DreamtonicsRequestResult::failed(
+                        action,
+                        "product id is missing or invalid",
+                    )
+                }
+            };
+            let version = match task.model_version {
+                Some(value) if value > 0 => value,
+                _ => return DreamtonicsRequestResult::failed(action, "model version is missing"),
+            };
+            endpoint.push_str(DREAMTONICS_MODEL_ENDPOINT);
+            method = "POST";
+            body = Some(serde_json::json!({
+                "payload": { "product_id": product_id, "model_type": "model", "version_number": version }
+            }).to_string());
+        }
+        "custom_request" => {
+            let requested_method = task.method.as_deref().unwrap_or_default();
+            if requested_method != "GET" && requested_method != "POST" {
+                return DreamtonicsRequestResult::failed(action, "request method is unsupported");
+            }
+            method = requested_method;
+            let requested_endpoint = match task.endpoint.as_deref() {
+                Some(value) => value,
+                None => {
+                    return DreamtonicsRequestResult::failed(action, "request endpoint is missing")
+                }
+            };
+            if !is_trusted_dreamtonics_endpoint(requested_endpoint) {
+                return DreamtonicsRequestResult::failed(action, "request endpoint is not allowed");
+            }
+            endpoint.push_str(requested_endpoint);
+            if method == "POST" {
+                let request_body = task.body.as_deref().unwrap_or("");
+                if request_body.len() > 256 * 1024 {
+                    return DreamtonicsRequestResult::failed(action, "request body is invalid");
+                }
+                let request_value = if request_body.trim().is_empty() {
+                    serde_json::json!({})
+                } else {
+                    match serde_json::from_str::<serde_json::Value>(request_body) {
+                        Ok(value) if value.is_object() => value,
+                        _ => {
+                            return DreamtonicsRequestResult::failed(
+                                action,
+                                "request body is invalid",
+                            )
+                        }
+                    }
+                };
+                let payload = request_value.get("body").unwrap_or(&request_value);
+                if !payload.is_object() {
+                    return DreamtonicsRequestResult::failed(action, "request body is invalid");
+                }
+                body = Some(payload.to_string());
+            }
+        }
+        _ => return DreamtonicsRequestResult::failed(action, "action is unsupported"),
+    }
+    if let Some(access_token) = token {
+        if !valid_bearer_token(access_token) {
+            return DreamtonicsRequestResult::failed(action, "access token is missing or invalid");
+        }
+    }
+    if action == "refresh" {
+        let refresh = task.refresh_token.as_deref().unwrap_or_default();
+        return match refresh_access(refresh) {
+            Ok((access, refresh, expiry, expires_in)) => DreamtonicsRequestResult {
+                action: action.to_string(),
+                status: 200,
+                response_body: "ok".to_string(),
+                error: None,
+                refreshed_access_token: Some(access),
+                refreshed_refresh_token: Some(refresh),
+                access_expiry: Some(expiry),
+                expires_in: Some(expires_in),
+            },
+            Err(error) => DreamtonicsRequestResult::failed(action, error),
+        };
+    }
+    let mut refreshed: Option<(String, String, String, u64)> = None;
+    let mut response = dreamtonics_http(method, &endpoint, token, body.as_deref(), content_type);
+    if action != "refresh"
+        && token.is_some()
+        && response
+            .as_ref()
+            .is_ok_and(|(status, _)| *status == 401 || *status == 403)
+    {
+        if let Some(refresh_token) = task
+            .refresh_token
+            .as_deref()
+            .filter(|value| valid_bearer_token(value))
+        {
+            if let Ok(credentials) = refresh_access(refresh_token) {
+                response = dreamtonics_http(
+                    method,
+                    &endpoint,
+                    Some(&credentials.0),
+                    body.as_deref(),
+                    content_type,
+                );
+                refreshed = Some(credentials);
+            }
+        }
+    }
+    let (status, response_body) = match response {
+        Ok(result) => result,
+        Err(error) => return DreamtonicsRequestResult::failed(action, error),
+    };
+    let (refreshed_access_token, refreshed_refresh_token, access_expiry, expires_in) =
+        match refreshed {
+            Some((access, refresh, expiry, seconds)) => {
+                (Some(access), Some(refresh), Some(expiry), Some(seconds))
+            }
+            None => (None, None, None, None),
+        };
+    DreamtonicsRequestResult {
+        action: action.to_string(),
+        status,
+        response_body,
+        error: None,
+        refreshed_access_token,
+        refreshed_refresh_token,
+        access_expiry,
+        expires_in,
+    }
+}
+
+fn dreamtonics_http(
+    method: &str,
+    endpoint: &str,
+    access_token: Option<&str>,
+    body: Option<&str>,
+    content_type: &str,
+) -> Result<(u16, String), &'static str> {
+    let agent = ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout(Duration::from_secs(15))
+        .build();
+    let mut request = match method {
+        "GET" => agent.get(endpoint),
+        "POST" => agent.post(endpoint),
+        _ => return Err("request method is unsupported"),
+    }
+    .set("Accept", "application/json");
+    if let Some(access_token) = access_token {
+        request = request.set("Authorization", &format!("Bearer {access_token}"));
+    }
+    if body.is_some() {
+        request = request.set("Content-Type", content_type);
+    }
+    let response = match body {
+        Some(body) => request.send_string(body),
+        None => request.call(),
+    };
+    let (status, response) = match response {
+        Ok(response) => (response.status(), response),
+        Err(ureq::Error::Status(status, response)) => (status, response),
+        Err(_) => return Err("upstream request failed"),
+    };
+    let mut bytes = Zeroizing::new(Vec::new());
+    response
+        .into_reader()
+        .take((MAX_DREAMTONICS_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "upstream response could not be read")?;
+    if bytes.len() > MAX_DREAMTONICS_RESPONSE_BYTES {
+        return Err("upstream response exceeds the size limit");
+    }
+    Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+fn valid_bearer_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 512 * 1024
+        && value.is_ascii()
+        && !value.bytes().any(|byte| byte.is_ascii_control())
+}
+
+fn refresh_access(refresh_token: &str) -> Result<(String, String, String, u64), &'static str> {
+    if !valid_bearer_token(refresh_token) {
+        return Err("refresh token is missing or invalid");
+    }
+    let client_id = refresh_client_id(refresh_token).ok_or("refresh token client is invalid")?;
+    let body = Zeroizing::new(
+        url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("grant_type", "refresh_token")
+            .append_pair("refresh_token", refresh_token)
+            .append_pair("client_id", &client_id)
+            .finish(),
+    );
+    let (status, response_body) = dreamtonics_http(
+        "POST",
+        DREAMTONICS_TOKEN_ENDPOINT,
+        None,
+        Some(body.as_str()),
+        "application/x-www-form-urlencoded",
+    )?;
+    if status != 200 {
+        return Err("upstream token refresh was rejected");
+    }
+    let response_body = Zeroizing::new(response_body);
+    let result: RefreshResponse = serde_json::from_str(&response_body)
+        .map_err(|_| "upstream token refresh response is invalid")?;
+    if !valid_bearer_token(&result.access_token) {
+        return Err("upstream token refresh response has no access token");
+    }
+    if !valid_bearer_token(&result.refresh_token) {
+        return Err("upstream token refresh response has no refresh token");
+    }
+    let expires_in = result.expires_in;
+    if !(1..=7 * 24 * 60 * 60).contains(&expires_in) {
+        return Err("upstream token refresh response has an invalid expiry");
+    }
+    let expiry = time::OffsetDateTime::now_utc()
+        .checked_add(time::Duration::seconds(expires_in as i64))
+        .ok_or("upstream token expiry is invalid")?
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(|_| "upstream token expiry could not be formatted")?;
+    Ok((
+        result.access_token.clone(),
+        result.refresh_token.clone(),
+        expiry,
+        expires_in,
+    ))
+}
+
+fn refresh_client_id(refresh: &str) -> Option<String> {
+    let payload = refresh.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    if claims.get("iss")?.as_str()? != "https://account.dreamtonics.com/realms/Dreamtonics" {
+        return None;
+    }
+    let client_id = claims.get("azp")?.as_str()?;
+    if client_id.is_empty()
+        || client_id.len() > 160
+        || !client_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    {
+        return None;
+    }
+    Some(client_id.to_string())
+}
+
+fn is_trusted_dreamtonics_endpoint(value: &str) -> bool {
+    let Ok(url) = Url::parse(value) else {
+        return false;
+    };
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    url.scheme() == "https"
+        && value.len() <= 2048
+        && url.port_or_known_default() == Some(443)
+        && url.username().is_empty()
+        && url.password().is_none()
+        && (host == "dreamtonics.com"
+            || host.ends_with(".dreamtonics.com")
+            || host == "dreamtonics.com.cn"
+            || host.ends_with(".dreamtonics.com.cn"))
 }
 
 fn execute_command_task(
