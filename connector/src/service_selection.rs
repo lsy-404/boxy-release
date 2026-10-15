@@ -1,5 +1,6 @@
 use std::{
-    path::Path,
+    fs,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -28,9 +29,33 @@ enum UiEvent {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "camelCase")]
 enum UiCommand {
-    Connect { url: String },
+    Connect { url: String, session_path: String },
+    ChooseSessionPath,
+    ResetSessionPath,
     OpenEditor,
     Stop,
+}
+
+struct SessionPathSelection {
+    selected: PathBuf,
+    default: PathBuf,
+}
+
+impl SessionPathSelection {
+    fn new(initial: &Path, default: &Path) -> Self {
+        Self {
+            selected: initial.to_path_buf(),
+            default: default.to_path_buf(),
+        }
+    }
+
+    fn choose(&mut self, path: PathBuf) {
+        self.selected = path;
+    }
+
+    fn reset(&mut self) {
+        self.selected.clone_from(&self.default);
+    }
 }
 
 #[derive(Clone)]
@@ -57,21 +82,26 @@ impl RunningStatus {
     }
 }
 
-pub(crate) fn run_window<F>(initial_url: &str, start: F) -> Result<i32, String>
+pub(crate) fn run_window<F>(
+    initial_url: &str,
+    initial_session_path: &Path,
+    default_session_path: &Path,
+    start: F,
+) -> Result<i32, String>
 where
-    F: FnOnce(String, RunningStatus) -> Result<(), String> + Send + 'static,
+    F: FnOnce(String, std::path::PathBuf, RunningStatus) -> Result<(), String> + Send + 'static,
 {
     let event_loop = EventLoopBuilder::<UiEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
     let window = WindowBuilder::new()
         .with_title("Boxy")
-        .with_inner_size(LogicalSize::new(560.0, 410.0))
+        .with_inner_size(LogicalSize::new(560.0, 470.0))
         .with_resizable(false)
         .build(&event_loop)
         .map_err(|error| format!("cannot create Boxy window: {error}"))?;
     let ipc_proxy = proxy.clone();
     let webview = WebViewBuilder::new()
-        .with_html(render_html(initial_url))
+        .with_html(render_html(initial_url, initial_session_path))
         .with_ipc_handler(move |request| {
             if let Ok(command) = serde_json::from_str::<UiCommand>(request.body()) {
                 let _ = ipc_proxy.send_event(UiEvent::Command(command));
@@ -82,15 +112,25 @@ where
 
     let cancelled = Arc::new(AtomicBool::new(false));
     let mut start = Some(start);
+    let mut session_path = SessionPathSelection::new(initial_session_path, default_session_path);
     let mut running = false;
     let mut finished = false;
     let mut editor_url: Option<String> = None;
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
-            Event::UserEvent(UiEvent::Command(UiCommand::Connect { url })) if !running => {
-                match validate_service_url(&url) {
-                    Ok(remote) => {
+            Event::UserEvent(UiEvent::Command(UiCommand::Connect {
+                url,
+                session_path: requested_path,
+            }))
+                if !running =>
+            {
+                match (
+                    validate_service_url(&url),
+                    validate_session_path(&requested_path),
+                ) {
+                    (Ok(remote), Ok(path)) => {
+                        session_path.choose(path);
                         let Some(start) = start.take() else { return };
                         running = true;
                         window.set_inner_size(LogicalSize::new(520.0, 310.0));
@@ -100,13 +140,39 @@ where
                             proxy: worker_proxy.clone(),
                             cancelled: Arc::clone(&cancelled),
                         };
+                        let session_path = session_path.selected.clone();
                         thread::spawn(move || {
-                            let result = start(remote, status);
+                            let result = start(remote, session_path, status);
                             let _ = worker_proxy.send_event(UiEvent::Finished(result));
                         });
                     }
-                    Err(error) => send_ui(&webview, json!({ "kind": "error", "message": error })),
+                    (Err(error), _) | (_, Err(error)) => {
+                        send_ui(&webview, json!({ "kind": "error", "message": error }))
+                    }
                 }
+            }
+            Event::UserEvent(UiEvent::Command(UiCommand::ChooseSessionPath)) if !running => {
+                let mut picker = rfd::FileDialog::new();
+                if let Some(parent) = session_path.selected.parent() {
+                    picker = picker.set_directory(parent);
+                }
+                if let Some(name) = session_path.selected.file_name() {
+                    picker = picker.set_file_name(name.to_string_lossy());
+                }
+                if let Some(path) = picker.pick_file() {
+                    session_path.choose(path);
+                    send_ui(
+                        &webview,
+                        json!({ "kind": "sessionPath", "path": session_path.selected.to_string_lossy() }),
+                    );
+                }
+            }
+            Event::UserEvent(UiEvent::Command(UiCommand::ResetSessionPath)) if !running => {
+                session_path.reset();
+                send_ui(
+                    &webview,
+                    json!({ "kind": "sessionPath", "path": session_path.selected.to_string_lossy() }),
+                );
             }
             Event::UserEvent(UiEvent::Command(UiCommand::OpenEditor)) => {
                 if let Some(url) = &editor_url {
@@ -154,13 +220,17 @@ fn send_ui(webview: &WebView, payload: serde_json::Value) {
     let _ = webview.evaluate_script(&format!("window.boxyUpdate({payload})"));
 }
 
-fn render_html(initial_url: &str) -> String {
+fn render_html(initial_url: &str, session_path: &Path) -> String {
     include_str!("../ui/index.html")
         .replace("{{FLUENT_CSS}}", include_str!("../ui/fluent.css"))
         .replace("{{BOXY_CSS}}", include_str!("../ui/styles.css"))
         .replace("{{BOXY_JS}}", include_str!("../ui/app.js"))
         .replace("{{BOXY_LOGO}}", include_str!("../../assets/boxy-pen.svg"))
         .replace("{{INITIAL_URL}}", &escape_html(initial_url))
+        .replace(
+            "{{INITIAL_SESSION_PATH}}",
+            &escape_html(&session_path.to_string_lossy()),
+        )
 }
 
 fn escape_html(value: &str) -> String {
@@ -171,6 +241,10 @@ fn escape_html(value: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
 }
+
+#[cfg(test)]
+#[path = "../../test/session_path_ui.rs"]
+mod session_path_ui;
 
 pub(crate) fn inferred_service_url(executable: &Path) -> Option<String> {
     let app_name = executable.ancestors().find_map(|path| {
@@ -236,4 +310,19 @@ pub(crate) fn validate_service_url(value: &str) -> Result<String, String> {
         );
     }
     Ok(url.origin().ascii_serialization())
+}
+
+fn validate_session_path(value: &str) -> Result<PathBuf, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("Choose an SV2 session file before connecting.".to_string());
+    }
+    let path = PathBuf::from(value);
+    if !fs::metadata(&path)
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+    {
+        return Err("The selected SV2 session path is not an existing file.".to_string());
+    }
+    Ok(path)
 }

@@ -163,6 +163,8 @@ struct DirectoryTask {
     #[serde(default)]
     product_id: Option<String>,
     #[serde(default)]
+    device_id: Option<String>,
+    #[serde(default)]
     access_token: Option<String>,
     #[serde(default)]
     expected_session_sha256: Option<String>,
@@ -222,13 +224,18 @@ fn main() {
 
 fn run() -> Result<i32, String> {
     let launch = LaunchOptions::from_environment_and_args()?;
-    service_selection::run_window(&launch.initial_url, move |server_url, status| {
-        let config = Config {
-            server_url,
-            session_path: launch.session_path,
-        };
-        run_connected(&config, &status)
-    })
+    service_selection::run_window(
+        &launch.initial_url,
+        &launch.session_path,
+        &session_io::default_session_path(),
+        move |server_url, session_path, status| {
+            let config = Config {
+                server_url,
+                session_path,
+            };
+            run_connected(&config, &status)
+        },
+    )
 }
 
 fn run_connected(config: &Config, status: &service_selection::RunningStatus) -> Result<(), String> {
@@ -994,18 +1001,7 @@ fn dreamtonics_request(task: &DirectoryTask) -> DreamtonicsRequestResult {
         "quick_login" => {
             endpoint.push_str(DREAMTONICS_ENROLL_ENDPOINT);
             method = "POST";
-            body = Some(
-                serde_json::json!({
-                    "payload": {
-                        "device_id": null,
-                        "device_hash": "",
-                        "editor_version": 0x20201,
-                        "device_name": "Synthesizer V Studio 2",
-                        "kickout_other_sessions": false
-                    }
-                })
-                .to_string(),
-            );
+            body = Some(quick_login_body(task.device_id.as_deref()));
         }
         "refresh" => {
             endpoint.push_str(DREAMTONICS_TOKEN_ENDPOINT);
@@ -1077,7 +1073,7 @@ fn dreamtonics_request(task: &DirectoryTask) -> DreamtonicsRequestResult {
                     return DreamtonicsRequestResult::failed(action, "request endpoint is missing")
                 }
             };
-            if !is_trusted_dreamtonics_endpoint(requested_endpoint) {
+            if !is_valid_custom_endpoint(requested_endpoint) {
                 return DreamtonicsRequestResult::failed(action, "request endpoint is not allowed");
             }
             endpoint.push_str(requested_endpoint);
@@ -1228,6 +1224,24 @@ fn valid_bearer_token(value: &str) -> bool {
         && !value.bytes().any(|byte| byte.is_ascii_control())
 }
 
+fn quick_login_body(device_id: Option<&str>) -> String {
+    let device_id = device_id.map(str::trim).filter(|value| !value.is_empty());
+    let device_name = env::var("COMPUTERNAME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "Synthesizer V Studio 2".to_string());
+    serde_json::json!({
+        "payload": {
+            "device_id": device_id,
+            "device_hash": "",
+            "editor_version": 0x20201,
+            "device_name": device_name,
+            "kickout_other_sessions": false
+        }
+    })
+    .to_string()
+}
+
 fn refresh_access(refresh_token: &str) -> Result<(String, String, String, u64), &'static str> {
     if !valid_bearer_token(refresh_token) {
         return Err("refresh token is missing or invalid");
@@ -1295,20 +1309,16 @@ fn refresh_client_id(refresh: &str) -> Option<String> {
     Some(client_id.to_string())
 }
 
-fn is_trusted_dreamtonics_endpoint(value: &str) -> bool {
+fn is_valid_custom_endpoint(value: &str) -> bool {
     let Ok(url) = Url::parse(value) else {
         return false;
     };
-    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
     url.scheme() == "https"
-        && value.len() <= 2048
-        && url.port_or_known_default() == Some(443)
+        && url.host_str().is_some()
         && url.username().is_empty()
         && url.password().is_none()
-        && (host == "dreamtonics.com"
-            || host.ends_with(".dreamtonics.com")
-            || host == "dreamtonics.com.cn"
-            || host.ends_with(".dreamtonics.com.cn"))
+        && url.fragment().is_none()
+        && value.len() <= 2048
 }
 
 fn execute_command_task(
@@ -1942,6 +1952,10 @@ fn show_message(title: &str, description: &str, level: MessageLevel) {
         .set_buttons(MessageButtons::Ok)
         .show();
 }
+
+#[cfg(test)]
+#[path = "../../test/connector_regression.rs"]
+mod connector_regression;
 
 #[cfg(test)]
 mod tests {

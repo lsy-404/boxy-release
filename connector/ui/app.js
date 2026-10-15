@@ -3,6 +3,7 @@ const setup = document.querySelector('#setup');
 const status = document.querySelector('#status');
 const error = document.querySelector('#error');
 const remote = document.querySelector('#remote');
+const sessionPath = document.querySelector('#session-path');
 const statusTitle = document.querySelector('#status-title');
 const statusMessage = document.querySelector('#status-message');
 const statusError = document.querySelector('#status-error');
@@ -23,8 +24,10 @@ function send(action, fields = {}) {
 connectForm.addEventListener('submit', event => {
   event.preventDefault();
   error.hidden = true;
-  send('connect', { url: remote.value.trim() });
+  send('connect', { url: remote.value.trim(), sessionPath: sessionPath.value.trim() });
 });
+document.querySelector('#choose-session').addEventListener('click', () => send('chooseSessionPath'));
+document.querySelector('#reset-session').addEventListener('click', () => send('resetSessionPath'));
 editorButton.addEventListener('click', () => send('openEditor'));
 stopButton.addEventListener('click', () => send('stop'));
 
@@ -46,6 +49,9 @@ window.boxyUpdate = update => {
       break;
     case 'status':
       statusMessage.textContent = update.message;
+      break;
+    case 'sessionPath':
+      sessionPath.value = update.path;
       break;
     case 'editorReady':
       editorButton.disabled = false;

@@ -27,6 +27,14 @@
             <span class="fluent-field__label">Remote service URL</span>
             <input id="remote" class="fluent-field__input" type="url" value="{{INITIAL_URL}}" placeholder="https://service.example" autocomplete="url" spellcheck="false" required autofocus>
           </label>
+          <label class="fluent-field session-field" for="session-path">
+            <span class="fluent-field__label">SV2 session file</span>
+            <span class="session-picker">
+              <input id="session-path" class="fluent-field__input" type="text" value="{{INITIAL_SESSION_PATH}}" autocomplete="off" spellcheck="false" required>
+              <button id="choose-session" class="fluent-button" type="button">Choose file</button>
+              <button id="reset-session" class="fluent-button fluent-button--subtle" type="button">Use default</button>
+            </span>
+          </label>
           <p id="error" class="error" role="alert" hidden></p>
           <div class="actions">
             <button id="connect" class="fluent-button fluent-button--primary" type="submit">Connect</button>
