@@ -55,7 +55,7 @@ dependencies = [
 
 [[package]]
 name = "boxy"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "base64",
  "dirs",

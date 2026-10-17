@@ -162,7 +162,7 @@ try {
   if (Test-Path -LiteralPath $profilePath) {
     throw "Boxy created a WebView2 profile directory beside its executable: $profilePath"
   }
-  Write-Output 'Connector created the local operation, opened its validated URL in the system browser, and created no adjacent WebView2 profile.'
+  Write-Output 'Connector created the local operation, its validated browser URL was fetched, and no adjacent WebView2 profile was created.'
 }
 finally {
   if ($null -ne $child) {
