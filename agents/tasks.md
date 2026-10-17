@@ -19,3 +19,4 @@
 | 013 | [Verify] 连接器回归 | 恢复一代路径选择、快速登录和自定义请求并运行完整本机回归 | 二代必须保持一代除阻断和门禁外的全部能力 | ✅ 本地及跨平台发行 CI 通过 |
 | 014 | [Release] 一代功能补齐发布 | 构建并公开发布 v2.0.4 Windows 与 macOS 包 | 分发路径选择及请求语义修复后的客户端 | ✅ 已公开发布 |
 | 015 | [BugFix] 区域 issuer 刷新 | 按经确认的签发方选择固定区域 token endpoint 并保留 issuer 限制 | 支持 Dreamtonics 中国区签发的已验证会话 | ✅ 已公开发布 v2.0.5 |
+| 017 | [BugFix] 区域产品接口 | 按 access token 的精确 issuer 选择固定国际或中国区产品 API 主机，并在刷新后重新选择 | 中国官网使用 `authr3.dreamtonics.com.cn`，公开 connector 原先固定使用国际主机 | ✅ 已完成，本地验证通过 |

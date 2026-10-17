@@ -457,6 +457,137 @@ fn refresh_authority_selects_only_the_exact_trusted_regional_issuer() {
     }
 }
 
+#[test]
+fn access_token_issuer_selects_only_the_fixed_regional_api_bases() {
+    let international = refresh_token_claims(super::DREAMTONICS_ISSUER, Some("test-client"));
+    assert_eq!(
+        dreamtonics_api_base(&international),
+        Some(super::DREAMTONICS_API_BASE)
+    );
+
+    let china = refresh_token_claims(super::DREAMTONICS_CN_ISSUER, Some("test-client"));
+    assert_eq!(
+        dreamtonics_api_base(&china),
+        Some(super::DREAMTONICS_CN_API_BASE)
+    );
+
+    for token in [
+        refresh_token_claims(
+            "https://account.dreamtonics.com.cn.evil.test/realms/Dreamtonics",
+            Some("client"),
+        ),
+        refresh_token_claims(
+            "http://account.dreamtonics.com.cn/realms/Dreamtonics",
+            Some("client"),
+        ),
+        refresh_token_claims(
+            "https://account.dreamtonics.com.cn/realms/Other",
+            Some("client"),
+        ),
+        "not-a-jwt".to_string(),
+    ] {
+        assert_eq!(dreamtonics_api_base(&token), None);
+    }
+    assert!(requires_regional_api("licenses"));
+    assert!(requires_regional_api("quick_licenses"));
+    assert!(requires_regional_api("quick_devices"));
+    assert!(requires_regional_api("quick_login"));
+    assert!(requires_regional_api("offline_activate"));
+    assert!(requires_regional_api("offline_deactivate"));
+    assert!(requires_regional_api("product_download_url"));
+    assert!(requires_regional_api("model_download_url"));
+    assert!(!requires_regional_api("custom_request"));
+    assert!(!requires_regional_api("refresh"));
+    assert!(!requires_regional_api("product_logos"));
+}
+
+#[test]
+fn fixed_dreamtonics_endpoints_follow_the_selected_api_region() {
+    let endpoints = [
+        (
+            super::DREAMTONICS_LICENSES_ENDPOINT,
+            "https://authr3.dreamtonics.com.cn/api/v1/client/my_licenses",
+        ),
+        (
+            "https://authr3.dreamtonics.com/api/v1/client/my_devices?native_product=Synthesizer+V+Studio+2+Pro",
+            "https://authr3.dreamtonics.com.cn/api/v1/client/my_devices?native_product=Synthesizer+V+Studio+2+Pro",
+        ),
+        (
+            "https://authr3.dreamtonics.com/api/v1/client/enroll_device",
+            "https://authr3.dreamtonics.com.cn/api/v1/client/enroll_device",
+        ),
+        (
+            "https://authr3.dreamtonics.com/api/v1/client/activate_offline_license",
+            "https://authr3.dreamtonics.com.cn/api/v1/client/activate_offline_license",
+        ),
+        (
+            "https://authr3.dreamtonics.com/api/v1/client/deactivate_offline_license",
+            "https://authr3.dreamtonics.com.cn/api/v1/client/deactivate_offline_license",
+        ),
+        (
+            "https://authr3.dreamtonics.com/api/v1/update/get_download_url?product=sample-product",
+            "https://authr3.dreamtonics.com.cn/api/v1/update/get_download_url?product=sample-product",
+        ),
+        (
+            "https://authr3.dreamtonics.com/api/v1/model/request_model_download",
+            "https://authr3.dreamtonics.com.cn/api/v1/model/request_model_download",
+        ),
+    ];
+    for (endpoint, expected_china_endpoint) in endpoints {
+        let china = replace_dreamtonics_api_base(
+            endpoint,
+            super::DREAMTONICS_API_BASE,
+            super::DREAMTONICS_CN_API_BASE,
+        )
+        .unwrap();
+        assert_eq!(china, expected_china_endpoint);
+        assert_eq!(
+            replace_dreamtonics_api_base(
+                &china,
+                super::DREAMTONICS_CN_API_BASE,
+                super::DREAMTONICS_API_BASE,
+            )
+            .unwrap(),
+            endpoint
+        );
+    }
+    assert_eq!(
+        replace_dreamtonics_api_base(
+            "https://service.example.test/api",
+            super::DREAMTONICS_API_BASE,
+            super::DREAMTONICS_CN_API_BASE,
+        ),
+        None
+    );
+}
+
+#[test]
+fn fixed_request_rejects_an_untrusted_access_issuer_before_network_io() {
+    for issuer in [
+        "https://account.dreamtonics.com.cn.evil.test/realms/Dreamtonics",
+        "http://account.dreamtonics.com.cn/realms/Dreamtonics",
+        "https://account.dreamtonics.com.cn/realms/Other",
+    ] {
+        let mut task = directory_task("licenses");
+        task.access_token = Some(refresh_token_claims(issuer, Some("test-client")));
+        let result = dreamtonics_request(&task);
+        assert_eq!(result.status, 599);
+        assert_eq!(
+            result.error,
+            Some("access token issuer is missing or invalid")
+        );
+    }
+}
+
+#[test]
+fn local_product_logo_action_does_not_require_a_jwt_issuer() {
+    let mut task = directory_task("product_logos");
+    task.access_token = Some("opaque-present-access-token".into());
+    let result = dreamtonics_product_logos(&task, Path::new("unused"));
+    assert_eq!(result.status, 200);
+    assert_eq!(result.response_body, r#"{"logos":[]}"#);
+}
+
 fn refresh_token_claims(issuer: &str, client_id: Option<&str>) -> String {
     let mut claims = serde_json::json!({ "iss": issuer });
     if let Some(client_id) = client_id {
