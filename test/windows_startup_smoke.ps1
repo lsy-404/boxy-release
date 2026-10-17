@@ -11,6 +11,7 @@ using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 
 public static class BoxyTestServer
@@ -19,10 +20,14 @@ public static class BoxyTestServer
     private static Thread worker;
     private static int browserRequests;
     private static int operationRequests;
+    private static int pollRequests;
+    private static int startProtocolVersion;
     private static int port;
 
     public static int BrowserRequests { get { return Volatile.Read(ref browserRequests); } }
     public static int OperationRequests { get { return Volatile.Read(ref operationRequests); } }
+    public static int PollRequests { get { return Volatile.Read(ref pollRequests); } }
+    public static int StartProtocolVersion { get { return Volatile.Read(ref startProtocolVersion); } }
     public static int Port { get { return port; } }
 
     public static void Start()
@@ -77,11 +82,13 @@ public static class BoxyTestServer
                 foreach (string line in lines)
                     if (line.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase))
                         int.TryParse(line.Substring(15).Trim(), out contentLength);
+                var requestBody = new MemoryStream();
                 var buffer = new byte[4096];
                 while (contentLength > 0)
                 {
                     int count = stream.Read(buffer, 0, Math.Min(buffer.Length, contentLength));
                     if (count <= 0) return;
+                    requestBody.Write(buffer, 0, count);
                     contentLength -= count;
                 }
 
@@ -90,9 +97,11 @@ public static class BoxyTestServer
                 if (request[0] == "POST" && request[1] == "/api/v2/connector/operations")
                 {
                     Interlocked.Increment(ref operationRequests);
+                    using (JsonDocument startRequest = JsonDocument.Parse(requestBody.ToArray()))
+                        Interlocked.Exchange(ref startProtocolVersion, startRequest.RootElement.GetProperty("protocolVersion").GetInt32());
                     string authorization = new string('A', 43);
                     string route = new string('a', 32);
-                    body = "{\"operationId\":\"smoke\",\"browserUrl\":\"http://127.0.0.1:" +
+                    body = "{\"protocolVersion\":3,\"operationId\":\"smoke\",\"browserUrl\":\"http://127.0.0.1:" +
                         port + "/d_" + route + "/?authorization=" + authorization + "\"}";
                 }
                 else if (request[0] == "GET" && request[1] == "/d_" +
@@ -103,7 +112,10 @@ public static class BoxyTestServer
                     contentType = "text/html";
                 }
                 else if (request[0] == "GET" && request[1].StartsWith("/api/v2/connector/operations/", StringComparison.Ordinal))
-                    body = "{\"state\":\"waiting\",\"directoryTasks\":[]}";
+                {
+                    Interlocked.Increment(ref pollRequests);
+                    body = "{\"protocolVersion\":3,\"state\":\"waiting\",\"directoryTasks\":[]}";
+                }
                 else
                     body = "{}";
 
@@ -159,10 +171,18 @@ try {
   if ([BoxyTestServer]::OperationRequests -ne 1) {
     throw "Expected one successful operation creation request; received $([BoxyTestServer]::OperationRequests)."
   }
+  $pollDeadline = [DateTime]::UtcNow.AddSeconds(10)
+  while ([DateTime]::UtcNow -lt $pollDeadline -and [BoxyTestServer]::PollRequests -eq 0) {
+    if ($child.HasExited) { throw "Boxy exited before the protocol-v3 poll completed (exit $($child.ExitCode))" }
+    Start-Sleep -Milliseconds 100
+  }
+  if ([BoxyTestServer]::StartProtocolVersion -ne 3 -or [BoxyTestServer]::PollRequests -eq 0) {
+    throw "Expected a protocol-v3 start and poll; start version $([BoxyTestServer]::StartProtocolVersion), polls $([BoxyTestServer]::PollRequests)."
+  }
   if (Test-Path -LiteralPath $profilePath) {
     throw "Boxy created a WebView2 profile directory beside its executable: $profilePath"
   }
-  Write-Output 'Connector created the local operation, its validated browser URL was fetched, and no adjacent WebView2 profile was created.'
+  Write-Output 'Connector sent protocol v3, fetched the validated browser URL, completed a v3 poll, and created no adjacent WebView2 profile.'
 }
 finally {
   if ($null -ne $child) {

@@ -25,3 +25,4 @@
 | 019 | [BugFix] 区域图片查询 | 图片补全读取许可证时按 access token 精确 issuer 选择固定区域 endpoint | 图片本地缓存未覆盖时仍有代码路径将 access token 发往国际许可 API | ✅ 已完成，本地验证通过 |
 | 020 | [Release] 区域图片请求 | 发布区域图片许可证请求修复 | 完成所有固定认证 API 的区域一致性 | ✅ v2.0.7 已公开，两平台 CI 与 Windows 启动验证通过 |
 | 021 | [Feature] 上游请求尝试回执 | 将固定 API、刷新/重试及图片附属 HTTP 尝试逐条放入签名任务结果 | 服务端需要记录连接器发出的每次请求及其返回状态/正文 | ✅ 已完成，本地验证通过 |
+| 023 | [Feature] 通用请求执行器 | 由服务端下发 protocol v3 通用 HTTP 与本地文件读取任务，客户端负责执行、日志和本地安装 | 移除客户端 Dreamtonics endpoint、issuer、参数及 refresh/retry 业务编排 | ✅ 已完成，本地验证通过 |
