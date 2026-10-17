@@ -43,6 +43,8 @@ const MAX_DREAMTONICS_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const REQUEST_PATH: &str = "/api/v2/connector/operations";
 pub(crate) const DREAMTONICS_LICENSES_ENDPOINT: &str =
     "https://authr3.dreamtonics.com/api/v1/client/my_licenses";
+const DREAMTONICS_API_BASE: &str = "https://authr3.dreamtonics.com/api/v1";
+const DREAMTONICS_CN_API_BASE: &str = "https://authr3.dreamtonics.com.cn/api/v1";
 const DREAMTONICS_ACTIVATE_ENDPOINT: &str =
     "https://authr3.dreamtonics.com/api/v1/client/activate_offline_license";
 const DREAMTONICS_DEACTIVATE_ENDPOINT: &str =
@@ -975,6 +977,24 @@ impl DreamtonicsRequestResult {
         result.status = status;
         result
     }
+
+    fn with_refreshed_credentials(
+        action: &str,
+        status: u16,
+        error: &'static str,
+        credentials: (String, String, String, u64),
+    ) -> Self {
+        Self {
+            action: action.to_string(),
+            status,
+            response_body: String::new(),
+            error: Some(error),
+            refreshed_access_token: Some(credentials.0),
+            refreshed_refresh_token: Some(credentials.1),
+            access_expiry: Some(credentials.2),
+            expires_in: Some(credentials.3),
+        }
+    }
 }
 
 impl Drop for DreamtonicsRequestResult {
@@ -1131,6 +1151,26 @@ fn dreamtonics_request(task: &DirectoryTask) -> DreamtonicsRequestResult {
             Err(error) => DreamtonicsRequestResult::failed(action, error),
         };
     }
+    let regional_api_base = if requires_regional_api(action) {
+        let Some(access_token) = token else {
+            return DreamtonicsRequestResult::failed(action, "access token is missing or invalid");
+        };
+        let Some(api_base) = dreamtonics_api_base(access_token) else {
+            return DreamtonicsRequestResult::failed(
+                action,
+                "access token issuer is missing or invalid",
+            );
+        };
+        let Some(regional_endpoint) =
+            replace_dreamtonics_api_base(&endpoint, DREAMTONICS_API_BASE, api_base)
+        else {
+            return DreamtonicsRequestResult::failed(action, "upstream endpoint is invalid");
+        };
+        endpoint = regional_endpoint;
+        Some(api_base)
+    } else {
+        None
+    };
     let mut refreshed: Option<(String, String, String, u64)> = None;
     let mut response = dreamtonics_http(method, &endpoint, token, body.as_deref(), content_type);
     if action != "refresh"
@@ -1145,9 +1185,32 @@ fn dreamtonics_request(task: &DirectoryTask) -> DreamtonicsRequestResult {
             .filter(|value| valid_bearer_token(value))
         {
             if let Ok(credentials) = refresh_access(refresh_token) {
+                let retry_endpoint = if let Some(current_base) = regional_api_base {
+                    let Some(next_base) = dreamtonics_api_base(&credentials.0) else {
+                        return DreamtonicsRequestResult::with_refreshed_credentials(
+                            action,
+                            502,
+                            "refreshed access token issuer is missing or invalid",
+                            credentials,
+                        );
+                    };
+                    let Some(endpoint) =
+                        replace_dreamtonics_api_base(&endpoint, current_base, next_base)
+                    else {
+                        return DreamtonicsRequestResult::with_refreshed_credentials(
+                            action,
+                            502,
+                            "refreshed upstream endpoint is invalid",
+                            credentials,
+                        );
+                    };
+                    endpoint
+                } else {
+                    endpoint.clone()
+                };
                 response = dreamtonics_http(
                     method,
-                    &endpoint,
+                    &retry_endpoint,
                     Some(&credentials.0),
                     body.as_deref(),
                     content_type,
@@ -1346,6 +1409,53 @@ fn refresh_authority(refresh: &str) -> Option<(String, &'static str)> {
         return None;
     }
     Some((client_id.to_string(), endpoint))
+}
+
+fn dreamtonics_api_base(access_token: &str) -> Option<&'static str> {
+    let mut parts = access_token.split('.');
+    parts.next()?;
+    let payload = parts.next()?;
+    parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    match claims.get("iss")?.as_str()? {
+        DREAMTONICS_ISSUER => Some(DREAMTONICS_API_BASE),
+        DREAMTONICS_CN_ISSUER => Some(DREAMTONICS_CN_API_BASE),
+        _ => None,
+    }
+}
+
+fn requires_regional_api(action: &str) -> bool {
+    matches!(
+        action,
+        "licenses"
+            | "quick_licenses"
+            | "quick_devices"
+            | "quick_login"
+            | "offline_activate"
+            | "offline_deactivate"
+            | "product_download_url"
+            | "model_download_url"
+    )
+}
+
+fn replace_dreamtonics_api_base(
+    endpoint: &str,
+    current_base: &str,
+    next_base: &str,
+) -> Option<String> {
+    if !matches!(current_base, DREAMTONICS_API_BASE | DREAMTONICS_CN_API_BASE)
+        || !matches!(next_base, DREAMTONICS_API_BASE | DREAMTONICS_CN_API_BASE)
+    {
+        return None;
+    }
+    Some(format!(
+        "{next_base}{}",
+        endpoint.strip_prefix(current_base)?
+    ))
 }
 
 fn is_valid_custom_endpoint(value: &str) -> bool {
