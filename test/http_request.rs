@@ -189,12 +189,13 @@ fn reports_transport_failure_as_599_with_one_attempt() {
 #[test]
 fn reports_invalid_text_and_classifies_attempt_without_echoing_invalid_bytes() {
     let (base, server) = fake_server("200 OK", &[0xff, 0xfe]);
-    let response = execute(&spec("GET", format!("{base}/bad-text")));
+    let response = crate::execute_http_request(&spec("GET", format!("{base}/bad-text")));
     server.join().unwrap();
     assert_eq!(response.status, 200);
     assert_eq!(response.error, Some("invalid_response"));
-    assert!(response.body.is_empty());
-    let attempt = response.attempt.as_ref().unwrap();
+    assert!(response.response_body.is_empty());
+    assert_eq!(response.response_body_base64.as_deref(), Some("__4"));
+    let attempt = response.upstream_attempts.first().unwrap();
     assert_eq!(attempt.body_kind, "unknown");
     assert!(!attempt.body_truncated);
     assert_eq!(attempt.error_class, Some("invalid_response"));

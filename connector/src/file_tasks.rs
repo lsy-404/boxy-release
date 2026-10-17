@@ -321,6 +321,9 @@ fn targets_session(root: &Path, path: &Path, session_path: &Path) -> bool {
         return true;
     };
     let target = root.join(relative);
+    if same_file_identity(&target, &session) {
+        return true;
+    }
     #[cfg(windows)]
     {
         target
@@ -331,6 +334,41 @@ fn targets_session(root: &Path, path: &Path, session_path: &Path) -> bool {
     {
         target == session
     }
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &Path, right: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    match (fs::metadata(left), fs::metadata(right)) {
+        (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
+fn same_file_identity(left: &Path, right: &Path) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    fn identity(path: &Path) -> Option<(u32, u64)> {
+        let file = File::open(path).ok()?;
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        let success = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+        (success != 0).then_some((
+            info.dwVolumeSerialNumber,
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        ))
+    }
+
+    matches!((identity(left), identity(right)), (Some(left), Some(right)) if left == right)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file_identity(_left: &Path, _right: &Path) -> bool {
+    false
 }
 
 fn read_file(path: &Path, max_bytes: usize) -> Result<Zeroizing<Vec<u8>>, &'static str> {

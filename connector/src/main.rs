@@ -928,16 +928,17 @@ impl Drop for HttpRequestResult {
 
 fn execute_http_request(request: &http_request::HttpRequestSpec) -> HttpRequestResult {
     let mut response = http_request::execute(request);
-    let (response_body, response_body_base64) = if request.response_encoding == "base64" {
-        (String::new(), Some(URL_SAFE_NO_PAD.encode(&response.body)))
-    } else {
-        (
-            std::str::from_utf8(&response.body)
-                .map(str::to_string)
-                .unwrap_or_default(),
-            None,
-        )
-    };
+    let (response_body, response_body_base64) =
+        if request.response_encoding == "base64" || response.error == Some("invalid_response") {
+            (String::new(), Some(URL_SAFE_NO_PAD.encode(&response.body)))
+        } else {
+            (
+                std::str::from_utf8(&response.body)
+                    .map(str::to_string)
+                    .unwrap_or_default(),
+                None,
+            )
+        };
     HttpRequestResult {
         status: response.status,
         response_body,

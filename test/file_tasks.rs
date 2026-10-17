@@ -189,3 +189,21 @@ fn rejects_symlink_components_for_reads_and_writes() {
     assert_eq!(write.files[0].error, Some("unsafe_path"));
     assert_eq!(fs::read(outside).unwrap(), b"outside");
 }
+
+#[test]
+fn rejects_hard_link_aliases_of_the_active_session() {
+    let temp = Temp::new();
+    let session = temp.0.join("session");
+    let alias = temp.0.join("alias");
+    fs::write(&session, b"session").unwrap();
+    fs::hard_link(&session, &alias).unwrap();
+
+    let result = write_files(
+        &temp.0,
+        &session,
+        &[write_entry("alias", b"replacement", true)],
+    );
+
+    assert_eq!(result.files[0].error, Some("session_path_forbidden"));
+    assert_eq!(fs::read(&session).unwrap(), b"session");
+}
