@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -85,9 +85,12 @@ pub fn inspect() -> Vec<ProductDatabaseStatus> {
     statuses
 }
 
-pub fn fetch(item: &FetchItem) -> Result<FetchResult, String> {
+pub fn fetch(
+    item: &FetchItem,
+    attempts: &mut Vec<crate::request_trace::UpstreamAttempt>,
+) -> Result<FetchResult, String> {
     if item.target == "sv2" {
-        return fetch_voice_models(&databases_directory()?, item);
+        return fetch_voice_models(&databases_directory()?, item, attempts);
     }
     if item.target != "downloads" {
         return Err("unknown product fetch target".to_string());
@@ -95,7 +98,7 @@ pub fn fetch(item: &FetchItem) -> Result<FetchResult, String> {
     let base = downloads_directory()?;
     let (destination, expected_magic, extension) = select_destination(&base, item)?;
     let url = validated_download_url(&item.url, extension)?;
-    let downloaded_bytes = download_to(&url, &destination, expected_magic, item)?;
+    let downloaded_bytes = download_to(&url, &destination, expected_magic, item, attempts)?;
     Ok(FetchResult {
         id: item.id.trim().to_string(),
         operation: "svpkDownload".to_string(),
@@ -104,7 +107,11 @@ pub fn fetch(item: &FetchItem) -> Result<FetchResult, String> {
     })
 }
 
-fn fetch_voice_models(base: &Path, item: &FetchItem) -> Result<FetchResult, String> {
+fn fetch_voice_models(
+    base: &Path,
+    item: &FetchItem,
+    attempts: &mut Vec<crate::request_trace::UpstreamAttempt>,
+) -> Result<FetchResult, String> {
     let id = validated_id(&item.id)?;
     let version = item
         .version_name
@@ -138,7 +145,8 @@ fn fetch_voice_models(base: &Path, item: &FetchItem) -> Result<FetchResult, Stri
                 return Err("product model file name is not a DNNI file".to_string());
             }
             let url = validated_download_url(url, ".dnni")?;
-            downloaded_bytes += download_to(&url, &staging.join(filename), &DNNI_MAGIC, item)?;
+            downloaded_bytes +=
+                download_to(&url, &staging.join(filename), &DNNI_MAGIC, item, attempts)?;
         }
         let active = base.join(&id);
         fs::create_dir_all(&active)
@@ -222,21 +230,17 @@ fn validated_download_url(value: &str, extension: &str) -> Result<Url, String> {
     if url.scheme() != "https" {
         return Err("product download URL must use HTTPS".to_string());
     }
-    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-    if !allowed_download_host(&host) {
-        return Err("product download URL is not hosted by Dreamtonics".to_string());
+    if url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("product download URL is invalid".to_string());
     }
     if !url.path().to_ascii_lowercase().ends_with(extension) {
         return Err("product download URL has an unexpected file type".to_string());
     }
     Ok(url)
-}
-
-fn allowed_download_host(host: &str) -> bool {
-    host == "dreamtonics.com"
-        || host.ends_with(".dreamtonics.com")
-        || host == "dreamtonics.com.cn"
-        || host.ends_with(".dreamtonics.com.cn")
 }
 
 fn safe_filename(value: &str) -> Result<&str, String> {
@@ -258,38 +262,36 @@ fn download_to(
     destination: &Path,
     expected_magic: &[u8],
     item: &FetchItem,
+    attempts: &mut Vec<crate::request_trace::UpstreamAttempt>,
 ) -> Result<u64, String> {
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("cannot prepare the product directory: {error}"))?;
     }
-    let response = ureq::get(url.as_str()).call();
-    let (status, response) = match response {
-        Ok(response) => (response.status(), response),
-        Err(ureq::Error::Status(status, response)) => (status, response),
-        Err(ureq::Error::Transport(error)) => {
-            return Err(format!("product download failed: {error}"))
-        }
-    };
-    if status != 200 {
-        return Err(format!("product download failed ({status})"));
-    }
-    let declared_length = response
-        .header("Content-Length")
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|length| *length <= MAX_PACKAGE_BYTES);
-    if response.header("Content-Length").is_some() && declared_length.is_none() {
-        return Err("product file is too large".to_string());
-    }
     let temporary = temporary_path(destination);
     let mut output = create_new_file(&temporary)?;
-    let mut input = response.into_reader();
-    let copied = match copy_limited(&mut input, &mut output, MAX_PACKAGE_BYTES) {
-        Ok(copied) => copied,
+    let download = crate::http_request::download_to_writer(
+        url.as_str(),
+        crate::http_request::MAX_HTTP_TIMEOUT_MS,
+        MAX_PACKAGE_BYTES,
+        &mut output,
+    );
+    let copied = match download {
+        Ok(result) => {
+            attempts.extend(result.attempt);
+            result.bytes
+        }
         Err(error) => {
+            attempts.extend(error.attempt);
             drop(output);
             let _ = fs::remove_file(&temporary);
-            return Err(format!("cannot download product file: {error}"));
+            return Err(match error.error {
+                "http_status" => {
+                    format!("product download failed ({})", error.status.unwrap_or(599))
+                }
+                "body_limit" => "product file is too large".to_string(),
+                _ => "product download failed".to_string(),
+            });
         }
     };
     if let Err(error) = output.sync_all() {
@@ -367,26 +369,6 @@ fn hex_lower(bytes: &[u8]) -> String {
         value.push(DIGITS[(byte & 0x0f) as usize] as char);
     }
     value
-}
-
-fn copy_limited(
-    input: &mut impl Read,
-    output: &mut impl Write,
-    limit: u64,
-) -> std::io::Result<u64> {
-    let mut total = 0u64;
-    let mut buffer = [0u8; COPY_BUFFER_BYTES];
-    loop {
-        let read = input.read(&mut buffer)?;
-        if read == 0 {
-            return Ok(total);
-        }
-        total = total.saturating_add(read as u64);
-        if total > limit {
-            return Err(std::io::Error::other("size limit exceeded"));
-        }
-        output.write_all(&buffer[..read])?;
-    }
 }
 
 fn temporary_path(destination: &Path) -> PathBuf {

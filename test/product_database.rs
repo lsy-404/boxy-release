@@ -47,14 +47,24 @@ fn accepts_only_canonical_database_ids() {
 }
 
 #[test]
-fn accepts_and_rejects_download_hosts() {
+fn accepts_server_selected_https_download_hosts_and_rejects_unsafe_urls() {
     assert!(validated_download_url("https://authr3.dreamtonics.com/x/y.svpk", ".svpk").is_ok());
     assert!(validated_download_url("https://cdn.dreamtonics.com.cn/y.dnni", ".dnni").is_ok());
+    assert!(validated_download_url("https://server-selected.example.test/y.svpk", ".svpk").is_ok());
     assert!(validated_download_url("http://authr3.dreamtonics.com/y.svpk", ".svpk").is_err());
-    assert!(validated_download_url("https://evil-dreamtonics.com/y.svpk", ".svpk").is_err());
     assert!(
-        validated_download_url("https://dreamtonics.com.evil.example/y.svpk", ".svpk").is_err()
+        validated_download_url("https://server-selected.example.test.evil/y.svpk", ".svpk").is_ok()
     );
+    assert!(validated_download_url(
+        "https://user:pass@server-selected.example.test/y.svpk",
+        ".svpk"
+    )
+    .is_err());
+    assert!(validated_download_url(
+        "https://server-selected.example.test/y.svpk#fragment",
+        ".svpk"
+    )
+    .is_err());
     assert!(validated_download_url("https://authr3.dreamtonics.com/y.zip", ".svpk").is_err());
 }
 
