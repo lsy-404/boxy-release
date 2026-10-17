@@ -1,5 +1,5 @@
 # Boxy Release 项目索引
-> 最后更新：2026-09-25
+> 最后更新：2026-10-16
 
 ## 项目目标
 
@@ -7,13 +7,13 @@
 
 ## 技术栈
 
-- Rust 2021：本地连接器、Windows WFP 和 macOS LuLu 规则导出
+- Rust 2021：本地连接器、Windows 防火墙和 macOS LuLu 规则导出
 - Node.js：便携应用打包脚本
 - GitHub Actions：跨平台验证和便携发行构建；Windows 和 macOS 依赖由客户端按需获取
 
 ## 模块结构
 
-- connector/：本机连接器、用户确认、设备签名、密文 session I/O、受限本地任务、命令批准。
+- connector/：本机后台连接器、系统浏览器启动、设备签名、密文 session I/O、受限本地任务、命令批准。
 - Dreamtonics 授权 API 请求由 connector 执行有限的固定动作；Worker 持有编辑状态并消费签名回执。
 - scripts/：便携版构建。
 - test/：跨平台配置和协议验证测试。
