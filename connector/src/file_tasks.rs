@@ -273,7 +273,7 @@ fn safe_path(root: &Path, relative: &str, allow_missing: bool) -> Result<PathBuf
     for (index, component) in components.iter().enumerate() {
         current.push(component.as_os_str());
         match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => return Err("unsafe_path"),
+            Ok(metadata) if is_unsafe_link(&metadata) => return Err("unsafe_path"),
             Ok(metadata) if index + 1 < components.len() && !metadata.is_dir() => {
                 return Err("unsafe_path")
             }
@@ -308,6 +308,21 @@ fn safe_windows_component(value: &str) -> bool {
         && !(basename.len() == 4
             && (basename.starts_with("COM") || basename.starts_with("LPT"))
             && matches!(basename.as_bytes()[3], b'1'..=b'9'))
+}
+
+fn is_unsafe_link(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 fn targets_session(root: &Path, path: &Path, session_path: &Path) -> bool {
@@ -373,7 +388,7 @@ fn same_file_identity(_left: &Path, _right: &Path) -> bool {
 
 fn read_file(path: &Path, max_bytes: usize) -> Result<Zeroizing<Vec<u8>>, &'static str> {
     let metadata = fs::symlink_metadata(path).map_err(|_| "file_unavailable")?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
+    if !metadata.is_file() || is_unsafe_link(&metadata) {
         return Err("unsafe_path");
     }
     if metadata.len() > max_bytes as u64 {
