@@ -259,15 +259,17 @@ pub(super) fn fetch_product_logos(
     session_path: &Path,
     keys: &[String],
     access_token: &str,
+    recorder: &crate::request_trace::UpstreamAttemptRecorder,
 ) -> Result<Vec<CachedProductLogo>, String> {
     fetch_product_logos_with_request(
         session_path,
         keys,
         access_token,
+        recorder,
         |endpoint, token| {
             crate::dreamtonics_http("GET", endpoint, Some(token), None, "application/json")
         },
-        download_product_image,
+        |url, max_bytes| download_product_image(url, max_bytes, recorder),
     )
 }
 
@@ -275,6 +277,7 @@ pub(super) fn fetch_product_logos_with_request<F, G>(
     session_path: &Path,
     keys: &[String],
     access_token: &str,
+    recorder: &crate::request_trace::UpstreamAttemptRecorder,
     mut request: F,
     download: G,
 ) -> Result<Vec<CachedProductLogo>, String>
@@ -290,13 +293,22 @@ where
                 .ok_or_else(|| "access token issuer is missing or invalid".to_string())
         },
         |endpoint| {
-            let (status, response_body) =
-                request(&endpoint, access_token).map_err(str::to_string)?;
+            let (status, response_body) = crate::request_trace::recorded_dreamtonics_http(
+                recorder,
+                "logo_licenses",
+                "GET",
+                &endpoint,
+                false,
+                || request(&endpoint, access_token),
+            )
+            .map_err(str::to_string)?;
             if !(200..300).contains(&status) {
                 return Err("license request failed".to_string());
             }
-            serde_json::from_str(&response_body)
-                .map_err(|_| "license response is invalid".to_string())
+            serde_json::from_str(&response_body).map_err(|_| {
+                recorder.mark_last_error_class("invalid_response");
+                "license response is invalid".to_string()
+            })
         },
         download,
     )
@@ -533,23 +545,31 @@ fn trusted_product_image_url(value: &str) -> Option<String> {
     .then(|| url.to_string())
 }
 
-fn download_product_image(url: &str, max_bytes: usize) -> Option<Vec<u8>> {
+fn download_product_image(
+    url: &str,
+    max_bytes: usize,
+    recorder: &crate::request_trace::UpstreamAttemptRecorder,
+) -> Option<Vec<u8>> {
     trusted_product_image_url(url)?;
-    let agent = ureq::AgentBuilder::new()
-        .redirects(0)
-        .timeout(std::time::Duration::from_secs(15))
-        .build();
-    let response = agent.get(url).call().ok()?;
-    if !(200..300).contains(&response.status()) {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    response
-        .into_reader()
-        .take(max_bytes.saturating_add(1) as u64)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    (bytes.len() <= max_bytes).then_some(bytes)
+    crate::request_trace::recorded_binary_get(recorder, "image_download", url, max_bytes, || {
+        let agent = ureq::AgentBuilder::new()
+            .redirects(0)
+            .timeout(std::time::Duration::from_secs(15))
+            .build();
+        let response = match agent.get(url).call() {
+            Ok(response) => response,
+            Err(ureq::Error::Status(_, response)) => response,
+            Err(_) => return Err("upstream request failed"),
+        };
+        let status = response.status();
+        let mut bytes = Vec::new();
+        response
+            .into_reader()
+            .take(max_bytes.saturating_add(1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "upstream response could not be read")?;
+        Ok((status, bytes))
+    })
 }
 
 fn image_data_url_bounded(bytes: &[u8], max_bytes: usize) -> Option<String> {

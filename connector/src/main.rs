@@ -7,6 +7,7 @@ mod host_block;
 mod launch;
 mod network_block;
 mod product_database;
+pub(crate) mod request_trace;
 mod session_io;
 #[cfg(windows)]
 mod windows_firewall;
@@ -28,6 +29,7 @@ use std::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::{Signer, SigningKey};
 use rand_core::{OsRng, RngCore};
+use request_trace::{recorded_dreamtonics_http, UpstreamAttempt, UpstreamAttemptRecorder};
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -857,6 +859,7 @@ struct DreamtonicsRequestResult {
     access_expiry: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     expires_in: Option<u64>,
+    upstream_attempts: Vec<UpstreamAttempt>,
 }
 
 #[derive(Deserialize)]
@@ -864,6 +867,32 @@ struct RefreshResponse {
     access_token: String,
     refresh_token: String,
     expires_in: u64,
+}
+
+struct DreamtonicsHttpRequest {
+    method: String,
+    endpoint: String,
+    access_token: Option<Zeroizing<String>>,
+    body: Option<Zeroizing<String>>,
+    content_type: String,
+}
+
+impl DreamtonicsHttpRequest {
+    fn new(
+        method: &str,
+        endpoint: &str,
+        access_token: Option<&str>,
+        body: Option<&str>,
+        content_type: &str,
+    ) -> Self {
+        Self {
+            method: method.to_string(),
+            endpoint: endpoint.to_string(),
+            access_token: access_token.map(|value| Zeroizing::new(value.to_string())),
+            body: body.map(|value| Zeroizing::new(value.to_string())),
+            content_type: content_type.to_string(),
+        }
+    }
 }
 
 impl Drop for RefreshResponse {
@@ -884,6 +913,7 @@ impl DreamtonicsRequestResult {
             refreshed_refresh_token: None,
             access_expiry: None,
             expires_in: None,
+            upstream_attempts: Vec::new(),
         }
     }
 
@@ -908,6 +938,7 @@ impl DreamtonicsRequestResult {
             refreshed_refresh_token: Some(credentials.1),
             access_expiry: Some(credentials.2),
             expires_in: Some(credentials.3),
+            upstream_attempts: Vec::new(),
         }
     }
 }
@@ -924,6 +955,38 @@ impl Drop for DreamtonicsRequestResult {
 }
 
 fn dreamtonics_request(task: &DirectoryTask) -> DreamtonicsRequestResult {
+    dreamtonics_request_with_transport(task, &mut |request| {
+        dreamtonics_http(
+            &request.method,
+            &request.endpoint,
+            request.access_token.as_deref().map(String::as_str),
+            request.body.as_deref().map(String::as_str),
+            &request.content_type,
+        )
+    })
+}
+
+fn dreamtonics_request_with_transport<F>(
+    task: &DirectoryTask,
+    transport: &mut F,
+) -> DreamtonicsRequestResult
+where
+    F: FnMut(DreamtonicsHttpRequest) -> Result<(u16, String), &'static str>,
+{
+    let mut recorder = UpstreamAttemptRecorder::new();
+    let mut result = dreamtonics_request_inner(task, &mut recorder, transport);
+    result.upstream_attempts = recorder.into_attempts();
+    result
+}
+
+fn dreamtonics_request_inner<F>(
+    task: &DirectoryTask,
+    recorder: &mut UpstreamAttemptRecorder,
+    transport: &mut F,
+) -> DreamtonicsRequestResult
+where
+    F: FnMut(DreamtonicsHttpRequest) -> Result<(u16, String), &'static str>,
+{
     let action = task.action.as_deref().unwrap_or_default();
     let mut endpoint = String::new();
     let mut method = "GET";
@@ -1052,7 +1115,7 @@ fn dreamtonics_request(task: &DirectoryTask) -> DreamtonicsRequestResult {
     }
     if action == "refresh" {
         let refresh = task.refresh_token.as_deref().unwrap_or_default();
-        return match refresh_access(refresh) {
+        return match refresh_access_with(refresh, recorder, transport) {
             Ok((access, refresh, expiry, expires_in)) => DreamtonicsRequestResult {
                 action: action.to_string(),
                 status: 200,
@@ -1062,6 +1125,7 @@ fn dreamtonics_request(task: &DirectoryTask) -> DreamtonicsRequestResult {
                 refreshed_refresh_token: Some(refresh),
                 access_expiry: Some(expiry),
                 expires_in: Some(expires_in),
+                upstream_attempts: Vec::new(),
             },
             Err(error) => DreamtonicsRequestResult::failed(action, error),
         };
@@ -1087,7 +1151,16 @@ fn dreamtonics_request(task: &DirectoryTask) -> DreamtonicsRequestResult {
         None
     };
     let mut refreshed: Option<(String, String, String, u64)> = None;
-    let mut response = dreamtonics_http(method, &endpoint, token, body.as_deref(), content_type);
+    let mut response =
+        recorded_dreamtonics_http(recorder, "primary", method, &endpoint, false, || {
+            transport(DreamtonicsHttpRequest::new(
+                method,
+                &endpoint,
+                token,
+                body.as_deref(),
+                content_type,
+            ))
+        });
     if action != "refresh"
         && token.is_some()
         && response
@@ -1099,7 +1172,7 @@ fn dreamtonics_request(task: &DirectoryTask) -> DreamtonicsRequestResult {
             .as_deref()
             .filter(|value| valid_bearer_token(value))
         {
-            if let Ok(credentials) = refresh_access(refresh_token) {
+            if let Ok(credentials) = refresh_access_with(refresh_token, recorder, transport) {
                 let retry_endpoint = if let Some(current_base) = regional_api_base {
                     let Some(next_base) = dreamtonics_api_base(&credentials.0) else {
                         return DreamtonicsRequestResult::with_refreshed_credentials(
@@ -1123,13 +1196,33 @@ fn dreamtonics_request(task: &DirectoryTask) -> DreamtonicsRequestResult {
                 } else {
                     endpoint.clone()
                 };
-                response = dreamtonics_http(
+                let retry = recorded_dreamtonics_http(
+                    recorder,
+                    "retry",
                     method,
                     &retry_endpoint,
-                    Some(&credentials.0),
-                    body.as_deref(),
-                    content_type,
+                    false,
+                    || {
+                        transport(DreamtonicsHttpRequest::new(
+                            method,
+                            &retry_endpoint,
+                            Some(&credentials.0),
+                            body.as_deref(),
+                            content_type,
+                        ))
+                    },
                 );
+                response = match retry {
+                    Ok(result) => Ok(result),
+                    Err(error) => {
+                        return DreamtonicsRequestResult::with_refreshed_credentials(
+                            action,
+                            599,
+                            error,
+                            credentials,
+                        )
+                    }
+                };
                 refreshed = Some(credentials);
             }
         }
@@ -1154,6 +1247,7 @@ fn dreamtonics_request(task: &DirectoryTask) -> DreamtonicsRequestResult {
         refreshed_refresh_token,
         access_expiry,
         expires_in,
+        upstream_attempts: Vec::new(),
     }
 }
 
@@ -1161,18 +1255,31 @@ fn dreamtonics_product_logos(
     task: &DirectoryTask,
     session_path: &Path,
 ) -> DreamtonicsRequestResult {
+    let recorder = UpstreamAttemptRecorder::new();
+    let mut result = dreamtonics_product_logos_with_recorder(task, session_path, &recorder);
+    result.upstream_attempts = recorder.into_attempts();
+    result
+}
+
+fn dreamtonics_product_logos_with_recorder(
+    task: &DirectoryTask,
+    session_path: &Path,
+    recorder: &UpstreamAttemptRecorder,
+) -> DreamtonicsRequestResult {
     let action = task.action.as_deref().unwrap_or_default();
     let Some(access_token) = task.access_token.as_deref() else {
         return DreamtonicsRequestResult::failed(action, "access token is missing");
     };
-    match assets::fetch_product_logos(session_path, &task.keys, access_token).and_then(|logos| {
-        let response = serde_json::json!({ "logos": logos }).to_string();
-        if response.len() > 512 * 1024 {
-            Err("product logo response exceeds the size limit".to_string())
-        } else {
-            Ok(response)
-        }
-    }) {
+    match assets::fetch_product_logos(session_path, &task.keys, access_token, recorder).and_then(
+        |logos| {
+            let response = serde_json::json!({ "logos": logos }).to_string();
+            if response.len() > 512 * 1024 {
+                Err("product logo response exceeds the size limit".to_string())
+            } else {
+                Ok(response)
+            }
+        },
+    ) {
         Ok(response_body) => DreamtonicsRequestResult {
             action: action.to_string(),
             status: 200,
@@ -1182,6 +1289,7 @@ fn dreamtonics_product_logos(
             refreshed_refresh_token: None,
             access_expiry: None,
             expires_in: None,
+            upstream_attempts: Vec::new(),
         },
         Err(_) => DreamtonicsRequestResult::failed(action, "product logos could not be fetched"),
     }
@@ -1256,7 +1364,14 @@ fn quick_login_body(device_id: Option<&str>) -> String {
     .to_string()
 }
 
-fn refresh_access(refresh_token: &str) -> Result<(String, String, String, u64), &'static str> {
+fn refresh_access_with<F>(
+    refresh_token: &str,
+    recorder: &mut UpstreamAttemptRecorder,
+    transport: &mut F,
+) -> Result<(String, String, String, u64), &'static str>
+where
+    F: FnMut(DreamtonicsHttpRequest) -> Result<(u16, String), &'static str>,
+{
     if !valid_bearer_token(refresh_token) {
         return Err("refresh token is missing or invalid");
     }
@@ -1269,34 +1384,53 @@ fn refresh_access(refresh_token: &str) -> Result<(String, String, String, u64), 
             .append_pair("client_id", &client_id)
             .finish(),
     );
-    let (status, response_body) = dreamtonics_http(
-        "POST",
-        token_endpoint,
-        None,
-        Some(body.as_str()),
-        "application/x-www-form-urlencoded",
-    )?;
+    let (status, response_body) =
+        recorded_dreamtonics_http(recorder, "refresh", "POST", token_endpoint, true, || {
+            transport(DreamtonicsHttpRequest::new(
+                "POST",
+                token_endpoint,
+                None,
+                Some(body.as_str()),
+                "application/x-www-form-urlencoded",
+            ))
+        })?;
     if status != 200 {
         return Err("upstream token refresh was rejected");
     }
     let response_body = Zeroizing::new(response_body);
-    let result: RefreshResponse = serde_json::from_str(&response_body)
-        .map_err(|_| "upstream token refresh response is invalid")?;
+    let result: RefreshResponse = match serde_json::from_str(&response_body) {
+        Ok(result) => result,
+        Err(_) => {
+            recorder.mark_last_error_class("invalid_response");
+            return Err("upstream token refresh response is invalid");
+        }
+    };
     if !valid_bearer_token(&result.access_token) {
+        recorder.mark_last_error_class("invalid_response");
         return Err("upstream token refresh response has no access token");
     }
     if !valid_bearer_token(&result.refresh_token) {
+        recorder.mark_last_error_class("invalid_response");
         return Err("upstream token refresh response has no refresh token");
     }
     let expires_in = result.expires_in;
     if !(1..=7 * 24 * 60 * 60).contains(&expires_in) {
+        recorder.mark_last_error_class("invalid_response");
         return Err("upstream token refresh response has an invalid expiry");
     }
-    let expiry = time::OffsetDateTime::now_utc()
-        .checked_add(time::Duration::seconds(expires_in as i64))
-        .ok_or("upstream token expiry is invalid")?
-        .format(&time::format_description::well_known::Rfc3339)
-        .map_err(|_| "upstream token expiry could not be formatted")?;
+    let Some(expiry) =
+        time::OffsetDateTime::now_utc().checked_add(time::Duration::seconds(expires_in as i64))
+    else {
+        recorder.mark_last_error_class("invalid_response");
+        return Err("upstream token expiry is invalid");
+    };
+    let expiry = match expiry.format(&time::format_description::well_known::Rfc3339) {
+        Ok(expiry) => expiry,
+        Err(_) => {
+            recorder.mark_last_error_class("invalid_response");
+            return Err("upstream token expiry could not be formatted");
+        }
+    };
     Ok((
         result.access_token.clone(),
         result.refresh_token.clone(),
