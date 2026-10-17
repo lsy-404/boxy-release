@@ -28,7 +28,7 @@ Boxy connects using the service URL supplied through `--server`, `BOXY_API_URL`,
 
 For example, `service.example.test.exe` or `service.example.test.app` suggests `https://service.example.test`; the downloaded `boxy-windows-x64.exe` uses the default service. The client reads the outer `.app` bundle name on macOS.
 
-`BOXY_API_URL` or `--server URL` can prefill the service address. The selected service controls the browser editor and the remote operations it requests. `--session PATH` selects a non-default SV2 session. The service observes the public IP from the connection, so the client does not contact a separate IP lookup site.
+`BOXY_API_URL` or `--server URL` sets the service address. The selected service controls the browser editor and the remote operations it requests. `--session PATH` selects a non-default SV2 session. The service observes the public IP from the connection, so the client does not contact a separate IP lookup site.
 
 After the service creates an operation and returns a validated browser URL, Boxy opens that URL in the system browser and continues monitoring the local session until the operation is no longer available or the process is stopped.
 

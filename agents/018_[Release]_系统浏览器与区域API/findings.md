@@ -8,3 +8,5 @@
 - 合并后 Rust 测试 29 unit + 6 host-block + 6 launch 共 41 项通过，Node 打包测试通过，fmt/diff 检查通过；最终 Windows release 为 2.0.6，3,365,376 bytes。
 - 本机实际 smoke 使用假 session、本地回环服务及仅对测试子进程指定的无效 WebView2 runtime 路径，编辑器请求到达且旁置 profile 不存在。
 - 随后通过现有浏览器工具只读核对系统 Edge 新测试标签页，页面正文为 Boxy smoke editor；核对后关闭该测试标签，不操作原有用户页。
+- GitHub Actions 38991665280 全部成功：Windows 回归、release 构建、打包和启动 smoke，macOS 回归及双架构构建、lipo 校验和打包均通过。两个资产齐全后已将 v2.0.6 公开并设为最新版本。
+- 公开 Windows 资产为 3,369,472 bytes，SHA256 775a5968201e003a079bd83a2eee9efe606235744e37540b0f706bb7d6098b5d；macOS universal ZIP 为 3,410,230 bytes，SHA256 f48a896889ae0285d661794093ada7b515c91413cd85d22c098d441418517670。CI 与本地构建环境不同，不以两者二进制逐字节相同作为结论。

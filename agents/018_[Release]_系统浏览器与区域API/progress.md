@@ -5,3 +5,5 @@
 - 最终构建将复用 browser-only worktree 的 target 缓存，不写入其他工作区的业务源码。
 - 最终构建复用 browser-only target，完成 Rust、Node、fmt、依赖树检查及 Windows release 构建；cargo tree 中没有 Tao、Wry 或 WebView2 crate。
 - 使用新建的独立临时 fixture 执行 windows_startup_smoke.ps1，返回成功；通过浏览器工具确认系统 Edge 的测试页正文，再关闭测试页。原来的 Boxy 2.0.5 进程和目录没有被删除或替换。
+- 以 b29fa8d 推送 main 并创建 v2.0.6，调度 GitHub Actions 38991665280；构建期间发行保持 draft，待两个平台资产验证后公开。
+- GitHub Windows/macOS 构建全部完成并成功，核对两项 release 资产名称、大小和 GitHub 返回的摘要后公开发行。没有覆盖旧版本资产。
