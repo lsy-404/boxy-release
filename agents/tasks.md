@@ -23,4 +23,4 @@
 | 017 | [BugFix] 区域产品接口 | 按 access token 的精确 issuer 选择固定国际或中国区产品 API 主机，并在刷新后重新选择 | 中国官网使用 `authr3.dreamtonics.com.cn`，公开 connector 原先固定使用国际主机 | ✅ 已完成，本地验证通过 |
 | 018 | [Release] 系统浏览器与区域 API | 验证并发布去内嵌浏览器与中国区 API 的新连接器 | 完成用户要求的可运行交付 | ✅ v2.0.6 已公开，两平台 CI 与 Windows 启动验证通过 |
 | 019 | [BugFix] 区域图片查询 | 图片补全读取许可证时按 access token 精确 issuer 选择固定区域 endpoint | 图片本地缓存未覆盖时仍有代码路径将 access token 发往国际许可 API | ✅ 已完成，本地验证通过 |
-| 020 | [Release] 区域图片请求 | 发布区域图片许可证请求修复 | 完成所有固定认证 API 的区域一致性 | 🔄 进行中 |
+| 020 | [Release] 区域图片请求 | 发布区域图片许可证请求修复 | 完成所有固定认证 API 的区域一致性 | ✅ v2.0.7 已公开，两平台 CI 与 Windows 启动验证通过 |
