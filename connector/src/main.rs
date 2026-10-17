@@ -4,9 +4,9 @@ mod assets;
 mod device_ids;
 mod device_info;
 mod host_block;
+mod launch;
 mod network_block;
 mod product_database;
-mod service_selection;
 mod session_io;
 #[cfg(windows)]
 mod windows_firewall;
@@ -229,28 +229,23 @@ fn main() {
 }
 
 fn run() -> Result<i32, String> {
-    let launch = LaunchOptions::from_environment_and_args()?;
-    service_selection::run_window(
-        &launch.initial_url,
-        &launch.session_path,
-        &session_io::default_session_path(),
-        move |server_url, session_path, status| {
-            let config = Config {
-                server_url,
-                session_path,
-            };
-            run_connected(&config, &status)
-        },
-    )
+    let launch =
+        launch::LaunchOptions::from_environment_and_args(session_io::default_session_path())?;
+    let session_path =
+        launch::resolve_session_path(launch.session_path, launch.session_path_explicit)?;
+    let config = Config {
+        server_url: launch.server_url,
+        session_path,
+    };
+    run_connected(&config)?;
+    Ok(0)
 }
 
-fn run_connected(config: &Config, status: &service_selection::RunningStatus) -> Result<(), String> {
-    status.update("Preparing the encrypted local session...");
+fn run_connected(config: &Config) -> Result<(), String> {
     let ciphertext = read_session_ciphertext(&config.session_path)?;
     let source_sha256 = sha256_base64url(&ciphertext);
     let machine = machine_report()?;
     let device_key = load_or_create_device_key()?;
-    status.ensure_active()?;
     let mut request = ConnectorStartRequest {
         ciphertext: URL_SAFE_NO_PAD.encode(&ciphertext),
         source_sha256: source_sha256.clone(),
@@ -279,75 +274,16 @@ fn run_connected(config: &Config, status: &service_selection::RunningStatus) -> 
                 .to_string(),
         );
     }
-    status.update("Connecting to the selected remote...");
-    status.ensure_active()?;
     let response =
         post_json::<_, ConnectorStartResponse>(&config.server_url, REQUEST_PATH, &request)?;
-    status.ensure_active()?;
     if response.operation_id.is_empty() || response.browser_url.is_empty() {
         return Err("authorization service returned an incomplete pairing response".to_string());
     }
     let browser_url = validate_browser_url(&config.server_url, &response.browser_url)?;
-    status.ensure_active()?;
-    let mut stable_editor_url = browser_url.clone();
-    stable_editor_url.set_query(None);
-    status.update("Opening the remote editor in your browser...");
     webbrowser::open(browser_url.as_str())
         .map_err(|error| format!("cannot open the authorization browser page: {error}"))?;
-    status.set_editor_url(stable_editor_url.as_str());
-    status.update("Browser opened. Waiting for the selected remote...");
-    wait_for_writeback(
-        config,
-        &device_key,
-        &response.operation_id,
-        &source_sha256,
-        status,
-    )?;
-    status.update("The remote session was written back.");
+    wait_for_writeback(config, &device_key, &response.operation_id, &source_sha256)?;
     Ok(())
-}
-
-struct LaunchOptions {
-    initial_url: String,
-    session_path: PathBuf,
-}
-
-impl LaunchOptions {
-    fn from_environment_and_args() -> Result<Self, String> {
-        let mut server_url = env::var("BOXY_API_URL").ok().or_else(|| {
-            env::current_exe()
-                .ok()
-                .and_then(|path| service_selection::inferred_service_url(&path))
-        });
-        let mut session_path = None;
-        let mut arguments = env::args().skip(1);
-        while let Some(argument) = arguments.next() {
-            match argument.as_str() {
-                "--server" => {
-                    server_url = Some(
-                        arguments
-                            .next()
-                            .ok_or_else(|| "--server requires a URL".to_string())?,
-                    )
-                }
-                "--session" => {
-                    session_path = Some(PathBuf::from(
-                        arguments
-                            .next()
-                            .ok_or_else(|| "--session requires a path".to_string())?,
-                    ))
-                }
-                "--help" | "-h" => {
-                    return Err("usage: boxy [--server URL] [--session PATH]".to_string())
-                }
-                _ => return Err(format!("unknown argument: {argument}")),
-            }
-        }
-        Ok(Self {
-            initial_url: server_url.unwrap_or_default(),
-            session_path: session_path.unwrap_or_else(session_io::default_session_path),
-        })
-    }
 }
 
 fn wait_for_writeback(
@@ -355,19 +291,16 @@ fn wait_for_writeback(
     device_key: &SigningKey,
     operation_id: &str,
     expected_source_sha256: &str,
-    status: &service_selection::RunningStatus,
 ) -> Result<(), String> {
     let path = format!("/api/v2/connector/operations/{operation_id}");
     let mut last_reported_sha256 = expected_source_sha256.to_string();
     loop {
-        status.ensure_active()?;
         match report_session_change(config, device_key, operation_id, &last_reported_sha256) {
             Ok(SessionWatchResult::Unchanged) | Ok(SessionWatchResult::WritebackPending) => {}
             Ok(SessionWatchResult::Accepted(source_sha256)) => {
                 last_reported_sha256 = source_sha256;
             }
             Err(_) => {
-                status.update("Waiting to synchronize the local session...");
                 thread::sleep(Duration::from_secs(2));
                 continue;
             }
@@ -379,18 +312,9 @@ fn wait_for_writeback(
             &nonce,
             &signature,
         )?;
-        status.ensure_active()?;
         match response.state.as_str() {
             "waiting" | "editor_active" | "temporary_pending_activation" => {
-                let pending_status = match response.state.as_str() {
-                    "editor_active" => "Remote editor is active. Waiting for changes...",
-                    "temporary_pending_activation" => "Remote activation is pending...",
-                    _ => "Connected. Waiting for the remote...",
-                };
-                status.update(pending_status);
                 if let Some(task) = response.directory_tasks.into_iter().next() {
-                    status.ensure_active()?;
-                    status.update("Handling a remote operation...");
                     execute_directory_task(
                         config,
                         device_key,
@@ -400,11 +324,9 @@ fn wait_for_writeback(
                     )?;
                     continue;
                 }
-                status.update(pending_status);
                 thread::sleep(Duration::from_secs(2));
             }
             "ready_for_writeback" => {
-                status.update("Writing the updated session...");
                 let ciphertext = response
                     .ciphertext
                     .ok_or_else(|| "writeback response has no ciphertext".to_string())?;
@@ -451,8 +373,6 @@ fn wait_for_writeback(
                         }
                         _ => {}
                     }
-                    status
-                        .update("The local session changed; the latest version was synchronized.");
                     continue;
                 }
                 let written_sha256 = match replace_session_if_unchanged(
@@ -495,13 +415,9 @@ fn wait_for_writeback(
                             }
                             _ => {}
                         }
-                        status.update(
-                            "The local session changed; the latest version was synchronized.",
-                        );
                         continue;
                     }
                 };
-                status.update("Reporting completion to the remote...");
                 let receipt = ConnectorReceipt {
                     source_sha256,
                     written_sha256: Some(written_sha256.clone()),
@@ -523,7 +439,6 @@ fn wait_for_writeback(
                     return Err("writeback completion was not accepted".to_string());
                 }
                 last_reported_sha256 = written_sha256;
-                status.update("Updated session written. Monitoring for more changes...");
                 continue;
             }
             "expired" | "rejected" => {
