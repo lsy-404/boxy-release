@@ -189,3 +189,57 @@ fn rejects_symlink_components_for_reads_and_writes() {
     assert_eq!(write.files[0].error, Some("unsafe_path"));
     assert_eq!(fs::read(outside).unwrap(), b"outside");
 }
+
+#[test]
+fn rejects_hard_link_aliases_of_the_active_session() {
+    let temp = Temp::new();
+    let session = temp.0.join("session");
+    let alias = temp.0.join("alias");
+    fs::write(&session, b"session").unwrap();
+    fs::hard_link(&session, &alias).unwrap();
+
+    let result = write_files(
+        &temp.0,
+        &session,
+        &[write_entry("alias", b"replacement", true)],
+    );
+
+    assert_eq!(result.files[0].error, Some("session_path_forbidden"));
+    assert_eq!(fs::read(&session).unwrap(), b"session");
+}
+
+#[cfg(windows)]
+#[test]
+fn rejects_junction_components_that_escape_the_root() {
+    use std::process::Command;
+
+    let temp = Temp::new();
+    let root = temp.0.join("root");
+    let outside = temp.0.join("outside");
+    let junction = root.join("junction");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("file.txt"), b"outside").unwrap();
+
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "New-Item -ItemType Junction -Path $env:BOXY_JUNCTION_PATH -Target $env:BOXY_JUNCTION_TARGET | Out-Null",
+        ])
+        .env("BOXY_JUNCTION_PATH", &junction)
+        .env("BOXY_JUNCTION_TARGET", &outside)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "could not create junction fixture: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(
+        safe_path(&root, "junction/file.txt", false),
+        Err("unsafe_path")
+    );
+}

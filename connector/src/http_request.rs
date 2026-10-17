@@ -109,7 +109,6 @@ pub(crate) fn execute(request: &HttpRequestSpec) -> HttpResponse {
         bytes.zeroize();
         Some("body_limit")
     } else if request.response_encoding == "utf8" && std::str::from_utf8(&bytes).is_err() {
-        bytes.zeroize();
         Some("invalid_response")
     } else if !(200..300).contains(&status) {
         None

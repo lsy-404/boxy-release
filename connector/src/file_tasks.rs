@@ -273,7 +273,7 @@ fn safe_path(root: &Path, relative: &str, allow_missing: bool) -> Result<PathBuf
     for (index, component) in components.iter().enumerate() {
         current.push(component.as_os_str());
         match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => return Err("unsafe_path"),
+            Ok(metadata) if is_unsafe_link(&metadata) => return Err("unsafe_path"),
             Ok(metadata) if index + 1 < components.len() && !metadata.is_dir() => {
                 return Err("unsafe_path")
             }
@@ -310,6 +310,21 @@ fn safe_windows_component(value: &str) -> bool {
             && matches!(basename.as_bytes()[3], b'1'..=b'9'))
 }
 
+fn is_unsafe_link(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    false
+}
+
 fn targets_session(root: &Path, path: &Path, session_path: &Path) -> bool {
     let Ok(root) = root.canonicalize() else {
         return true;
@@ -321,6 +336,9 @@ fn targets_session(root: &Path, path: &Path, session_path: &Path) -> bool {
         return true;
     };
     let target = root.join(relative);
+    if same_file_identity(&target, &session) {
+        return true;
+    }
     #[cfg(windows)]
     {
         target
@@ -333,9 +351,44 @@ fn targets_session(root: &Path, path: &Path, session_path: &Path) -> bool {
     }
 }
 
+#[cfg(unix)]
+fn same_file_identity(left: &Path, right: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    match (fs::metadata(left), fs::metadata(right)) {
+        (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
+fn same_file_identity(left: &Path, right: &Path) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    fn identity(path: &Path) -> Option<(u32, u64)> {
+        let file = File::open(path).ok()?;
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        let success = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+        (success != 0).then_some((
+            info.dwVolumeSerialNumber,
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        ))
+    }
+
+    matches!((identity(left), identity(right)), (Some(left), Some(right)) if left == right)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file_identity(_left: &Path, _right: &Path) -> bool {
+    false
+}
+
 fn read_file(path: &Path, max_bytes: usize) -> Result<Zeroizing<Vec<u8>>, &'static str> {
     let metadata = fs::symlink_metadata(path).map_err(|_| "file_unavailable")?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
+    if !metadata.is_file() || is_unsafe_link(&metadata) {
         return Err("unsafe_path");
     }
     if metadata.len() > max_bytes as u64 {
