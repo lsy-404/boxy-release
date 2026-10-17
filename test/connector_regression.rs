@@ -242,10 +242,12 @@ fn product_logo_license_request_uses_the_issuer_selected_endpoint() {
         let session_path = directory.0.join("app/sessions/session");
         let access_token = refresh_token_claims(issuer, Some("test-client"));
         let captured = RefCell::new(None);
+        let recorder = UpstreamAttemptRecorder::new();
         let result = assets::fetch_product_logos_with_request(
             &session_path,
             &["license-only".to_string()],
             &access_token,
+            &recorder,
             |endpoint, token| {
                 *captured.borrow_mut() = Some((endpoint.to_string(), token.to_string()));
                 Ok((200, r#"{"data":[]}"#.to_string()))
@@ -271,10 +273,12 @@ fn product_logo_license_request_rejects_invalid_issuer_before_transport() {
         Some("test-client"),
     );
     let mut requests = 0;
+    let recorder = UpstreamAttemptRecorder::new();
     let result = assets::fetch_product_logos_with_request(
         &session_path,
         &["license-only".to_string()],
         &invalid_token,
+        &recorder,
         |_, _| {
             requests += 1;
             Ok((200, r#"{"data":[]}"#.to_string()))
@@ -302,10 +306,12 @@ fn product_logo_local_cache_does_not_require_an_issuer() {
     )
     .unwrap();
 
+    let recorder = UpstreamAttemptRecorder::new();
     let result = assets::fetch_product_logos_with_request(
         &session_path,
         &["cached product".to_string()],
         "not-a-jwt",
+        &recorder,
         |_, _| panic!("local cache hit must not make a license request"),
         |_, _| Some(b"\x89PNG\r\n\x1a\nimage".to_vec()),
     )
@@ -313,6 +319,251 @@ fn product_logo_local_cache_does_not_require_an_issuer() {
 
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].id, "cached-product");
+}
+
+#[test]
+fn upstream_attempts_record_china_primary_refresh_and_retry_in_order() {
+    let mut task = directory_task("licenses");
+    task.access_token = Some(refresh_token_claims(
+        DREAMTONICS_CN_ISSUER,
+        Some("test-client"),
+    ));
+    task.refresh_token = Some(refresh_token_claims(
+        DREAMTONICS_CN_ISSUER,
+        Some("test-client"),
+    ));
+    let new_access = refresh_token_claims(DREAMTONICS_CN_ISSUER, Some("test-client"));
+    let new_refresh = refresh_token_claims(DREAMTONICS_CN_ISSUER, Some("test-client"));
+    let mut calls = Vec::new();
+    let mut transport = |request: DreamtonicsHttpRequest| {
+        calls.push((
+            request.method,
+            request.endpoint,
+            request.body.as_deref().map(|body| body.to_string()),
+        ));
+        match calls.len() {
+            1 => Ok((401, r#"{"error":"expired"}"#.to_string())),
+            2 => Ok((
+                200,
+                serde_json::json!({
+                    "access_token": new_access.clone(),
+                    "refresh_token": new_refresh.clone(),
+                    "id_token": "redact-this-id-token",
+                    "expires_in": 3600,
+                    "scope": "licenses"
+                })
+                .to_string(),
+            )),
+            3 => Ok((200, r#"{"data":["retried"]}"#.to_string())),
+            _ => panic!("unexpected upstream call"),
+        }
+    };
+
+    let result = dreamtonics_request_with_transport(&task, &mut transport);
+    assert_eq!(result.status, 200);
+    assert_eq!(result.response_body, r#"{"data":["retried"]}"#);
+    assert_eq!(
+        calls.iter().map(|call| call.1.as_str()).collect::<Vec<_>>(),
+        [
+            "https://authr3.dreamtonics.com.cn/api/v1/client/my_licenses",
+            "https://account.dreamtonics.com.cn/realms/Dreamtonics/protocol/openid-connect/token",
+            "https://authr3.dreamtonics.com.cn/api/v1/client/my_licenses",
+        ]
+    );
+    assert_eq!(
+        result
+            .upstream_attempts
+            .iter()
+            .map(|attempt| attempt.phase)
+            .collect::<Vec<_>>(),
+        ["primary", "refresh", "retry"]
+    );
+    assert_eq!(
+        result
+            .upstream_attempts
+            .iter()
+            .map(|attempt| attempt.sequence)
+            .collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+    let refresh_trace = result.upstream_attempts[1]
+        .response_body
+        .as_deref()
+        .unwrap();
+    assert!(refresh_trace.contains("licenses"));
+    assert!(!refresh_trace.contains("access_token"));
+    assert!(!refresh_trace.contains("refresh_token"));
+    assert!(!refresh_trace.contains("redact-this-id-token"));
+    assert!(calls[1].2.as_deref().unwrap().contains("refresh_token="));
+    assert!(!refresh_trace.contains(calls[1].2.as_deref().unwrap()));
+}
+
+#[test]
+fn upstream_attempt_records_transport_failure_without_response_status() {
+    let mut task = directory_task("licenses");
+    task.access_token = Some(refresh_token_claims(
+        DREAMTONICS_CN_ISSUER,
+        Some("test-client"),
+    ));
+    let mut transport = |_: DreamtonicsHttpRequest| Err("upstream request failed");
+
+    let result = dreamtonics_request_with_transport(&task, &mut transport);
+    let trace = serde_json::to_value(&result).unwrap();
+    let attempt = &trace["upstreamAttempts"][0];
+    assert_eq!(attempt["phase"], "primary");
+    assert_eq!(
+        attempt["endpoint"],
+        "https://authr3.dreamtonics.com.cn/api/v1/client/my_licenses"
+    );
+    assert!(attempt["status"].is_null());
+    assert_eq!(attempt["errorClass"], "transport");
+    assert_eq!(result.status, 599);
+}
+
+#[test]
+fn upstream_attempt_keeps_refreshed_credentials_when_retry_transport_fails() {
+    let mut task = directory_task("licenses");
+    task.access_token = Some(refresh_token_claims(
+        DREAMTONICS_CN_ISSUER,
+        Some("test-client"),
+    ));
+    task.refresh_token = Some(refresh_token_claims(
+        DREAMTONICS_CN_ISSUER,
+        Some("test-client"),
+    ));
+    let new_access = refresh_token_claims(DREAMTONICS_CN_ISSUER, Some("test-client"));
+    let new_refresh = refresh_token_claims(DREAMTONICS_CN_ISSUER, Some("test-client"));
+    let mut request_count = 0;
+    let mut transport = move |_request: DreamtonicsHttpRequest| {
+        request_count += 1;
+        match request_count {
+            1 => Ok((401, "unauthorized".to_string())),
+            2 => Ok((
+                200,
+                serde_json::json!({
+                    "access_token": new_access.clone(),
+                    "refresh_token": new_refresh.clone(),
+                    "expires_in": 3600
+                })
+                .to_string(),
+            )),
+            3 => Err("upstream request failed"),
+            _ => panic!("unexpected upstream call"),
+        }
+    };
+
+    let result = dreamtonics_request_with_transport(&task, &mut transport);
+    assert_eq!(result.status, 599);
+    assert!(result.refreshed_access_token.is_some());
+    assert!(result.refreshed_refresh_token.is_some());
+    assert_eq!(result.upstream_attempts.len(), 3);
+    assert_eq!(result.upstream_attempts[2].phase, "retry");
+    assert_eq!(result.upstream_attempts[2].error_class, Some("transport"));
+}
+
+#[test]
+fn product_logo_license_failure_is_retained_in_attempt_trace() {
+    let directory = TestDirectory::new();
+    let session_path = directory.0.join("app/sessions/session");
+    let mut task = directory_task("product_logos");
+    task.keys = vec!["missing-product".to_string()];
+    task.access_token = Some(refresh_token_claims(
+        DREAMTONICS_CN_ISSUER,
+        Some("test-client"),
+    ));
+    let recorder = UpstreamAttemptRecorder::new();
+    let result = assets::fetch_product_logos_with_request(
+        &session_path,
+        &task.keys,
+        task.access_token.as_deref().unwrap(),
+        &recorder,
+        |_, _| Err("upstream request failed"),
+        |_, _| None,
+    );
+    assert!(result.unwrap().is_empty());
+    let attempt = recorder.into_attempts().pop().unwrap();
+    assert_eq!(attempt.phase, "logo_licenses");
+    assert_eq!(attempt.error_class, Some("transport"));
+    assert!(attempt.status.is_none());
+}
+
+#[test]
+fn binary_attempt_records_failed_image_download_without_body() {
+    let recorder = UpstreamAttemptRecorder::new();
+    let bytes = request_trace::recorded_binary_get(
+        &recorder,
+        "image_download",
+        "https://cdn.dreamtonics.com/image.png?signature=secret",
+        1024,
+        || Ok((503, b"binary-error-body".to_vec())),
+    );
+    assert!(bytes.is_none());
+    let trace = serde_json::to_value(recorder.into_attempts()).unwrap();
+    let attempt = &trace[0];
+    assert_eq!(attempt["bodyKind"], "binary");
+    assert!(attempt["responseBody"].is_null());
+    assert_eq!(attempt["status"], 503);
+    assert_eq!(attempt["errorClass"], "http_status");
+    assert_eq!(attempt["endpoint"], "https://cdn.dreamtonics.com/image.png");
+    assert!(!trace.to_string().contains("signature=secret"));
+    assert!(!trace.to_string().contains("binary-error-body"));
+}
+
+#[test]
+fn upstream_attempt_bodies_are_utf8_safe_and_within_both_budgets() {
+    let recorder = UpstreamAttemptRecorder::new();
+    let response_body = "界".repeat(request_trace::MAX_UPSTREAM_ATTEMPT_BODY_BYTES);
+    for index in 0..5 {
+        recorded_dreamtonics_http(
+            &recorder,
+            "primary",
+            "GET",
+            &format!("https://authr3.dreamtonics.com/path/{index}"),
+            false,
+            || Ok((200, response_body.clone())),
+        )
+        .unwrap();
+    }
+    let attempts = recorder.into_attempts();
+    assert_eq!(attempts.len(), 5);
+    let body_bytes = attempts
+        .iter()
+        .map(|attempt| attempt.response_body.as_ref().unwrap().len())
+        .sum::<usize>();
+    assert!(body_bytes <= request_trace::MAX_UPSTREAM_ATTEMPT_TOTAL_BODY_BYTES);
+    assert_eq!(attempts[4].response_body.as_deref(), Some("界"));
+    assert!(attempts[4].body_truncated);
+    for attempt in attempts.iter().take(4) {
+        assert_eq!(
+            attempt.response_body.as_ref().unwrap().len(),
+            request_trace::MAX_UPSTREAM_ATTEMPT_BODY_BYTES - 1
+        );
+        assert!(attempt.body_truncated);
+    }
+}
+
+#[test]
+fn serialized_completion_payload_fits_a_bounded_large_body_envelope() {
+    let recorder = UpstreamAttemptRecorder::new();
+    let trace_body = "\0".repeat(request_trace::MAX_UPSTREAM_ATTEMPT_BODY_BYTES);
+    for index in 0..4 {
+        recorded_dreamtonics_http(
+            &recorder,
+            "primary",
+            "GET",
+            &format!("https://authr3.dreamtonics.com/path/{index}"),
+            false,
+            || Ok((200, trace_body.clone())),
+        )
+        .unwrap();
+    }
+    let mut result = DreamtonicsRequestResult::failed("licenses", "request failed");
+    result.response_body = "\0".repeat(MAX_DREAMTONICS_RESPONSE_BYTES);
+    result.upstream_attempts = recorder.into_attempts();
+    let serialized_bytes = serde_json::to_vec(&result).unwrap().len();
+
+    assert!(serialized_bytes > 14_000_000);
+    assert!(serialized_bytes < 15_000_000);
 }
 
 #[test]
