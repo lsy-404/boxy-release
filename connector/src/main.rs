@@ -1343,6 +1343,14 @@ fn dreamtonics_api_base(access_token: &str) -> Option<&'static str> {
     }
 }
 
+pub(crate) fn dreamtonics_license_endpoint(access_token: &str) -> Option<String> {
+    replace_dreamtonics_api_base(
+        DREAMTONICS_LICENSES_ENDPOINT,
+        DREAMTONICS_API_BASE,
+        dreamtonics_api_base(access_token)?,
+    )
+}
+
 fn requires_regional_api(action: &str) -> bool {
     matches!(
         action,

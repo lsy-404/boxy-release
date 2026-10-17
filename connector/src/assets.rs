@@ -260,37 +260,58 @@ pub(super) fn fetch_product_logos(
     keys: &[String],
     access_token: &str,
 ) -> Result<Vec<CachedProductLogo>, String> {
+    fetch_product_logos_with_request(
+        session_path,
+        keys,
+        access_token,
+        |endpoint, token| {
+            crate::dreamtonics_http("GET", endpoint, Some(token), None, "application/json")
+        },
+        download_product_image,
+    )
+}
+
+pub(super) fn fetch_product_logos_with_request<F, G>(
+    session_path: &Path,
+    keys: &[String],
+    access_token: &str,
+    mut request: F,
+    download: G,
+) -> Result<Vec<CachedProductLogo>, String>
+where
+    F: FnMut(&str, &str) -> Result<(u16, String), &'static str>,
+    G: FnMut(&str, usize) -> Option<Vec<u8>>,
+{
     fetch_product_logos_with(
         session_path,
         keys,
         || {
-            let (status, response_body) = crate::dreamtonics_http(
-                "GET",
-                crate::DREAMTONICS_LICENSES_ENDPOINT,
-                Some(access_token),
-                None,
-                "application/json",
-            )
-            .map_err(str::to_string)?;
+            crate::dreamtonics_license_endpoint(access_token)
+                .ok_or_else(|| "access token issuer is missing or invalid".to_string())
+        },
+        |endpoint| {
+            let (status, response_body) =
+                request(&endpoint, access_token).map_err(str::to_string)?;
             if !(200..300).contains(&status) {
                 return Err("license request failed".to_string());
             }
             serde_json::from_str(&response_body)
                 .map_err(|_| "license response is invalid".to_string())
         },
-        download_product_image,
+        download,
     )
 }
 
 pub(super) fn fetch_product_logos_with<F, G>(
     session_path: &Path,
     keys: &[String],
-    load_licenses: F,
-    mut download: G,
+    license_endpoint: F,
+    load_licenses: G,
+    mut download: impl FnMut(&str, usize) -> Option<Vec<u8>>,
 ) -> Result<Vec<CachedProductLogo>, String>
 where
-    F: FnOnce() -> Result<serde_json::Value, String>,
-    G: FnMut(&str, usize) -> Option<Vec<u8>>,
+    F: FnOnce() -> Result<String, String>,
+    G: FnOnce(&str) -> Result<serde_json::Value, String>,
 {
     if keys.len() > MAX_LOGOS {
         return Err("too many product logo keys".to_string());
@@ -383,7 +404,8 @@ where
     if wanted.difference(&covered).next().is_none() || logos.len() >= MAX_LOGOS {
         return Ok(logos);
     }
-    let Ok(licenses) = load_licenses() else {
+    let endpoint = license_endpoint()?;
+    let Ok(licenses) = load_licenses(&endpoint) else {
         return Ok(logos);
     };
     let licenses = licenses.get("data").unwrap_or(&licenses);

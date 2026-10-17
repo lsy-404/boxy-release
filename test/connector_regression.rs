@@ -1,5 +1,6 @@
 use super::*;
 use std::{
+    cell::RefCell,
     fs,
     io::{Read, Write},
     net::TcpListener,
@@ -168,7 +169,8 @@ fn product_logo_action_matches_local_metadata_then_falls_back_to_licenses() {
     let logos = assets::fetch_product_logos_with(
         &session_path,
         &keys,
-        || {
+        || Ok("https://test.invalid/licenses".to_string()),
+        |_| {
             license_reads += 1;
             Ok(serde_json::json!({"data":[{
                 "id":"license-cache-id",
@@ -215,12 +217,102 @@ fn product_logo_fetch_skips_license_request_when_local_metadata_covers_keys() {
     let logos = assets::fetch_product_logos_with(
         &session_path,
         &["synth one".to_string()],
-        || panic!("licenses should not be fetched when local metadata matches"),
+        || panic!("license endpoint should not be resolved when local metadata matches"),
+        |_| panic!("licenses should not be fetched when local metadata matches"),
         |_, _| Some(b"RIFF1234WEBPimage".to_vec()),
     )
     .unwrap();
     assert_eq!(logos.len(), 1);
     assert!(logos[0].data_url.starts_with("data:image/webp;base64,"));
+}
+
+#[test]
+fn product_logo_license_request_uses_the_issuer_selected_endpoint() {
+    for (issuer, expected_endpoint) in [
+        (
+            DREAMTONICS_ISSUER,
+            "https://authr3.dreamtonics.com/api/v1/client/my_licenses",
+        ),
+        (
+            DREAMTONICS_CN_ISSUER,
+            "https://authr3.dreamtonics.com.cn/api/v1/client/my_licenses",
+        ),
+    ] {
+        let directory = TestDirectory::new();
+        let session_path = directory.0.join("app/sessions/session");
+        let access_token = refresh_token_claims(issuer, Some("test-client"));
+        let captured = RefCell::new(None);
+        let result = assets::fetch_product_logos_with_request(
+            &session_path,
+            &["license-only".to_string()],
+            &access_token,
+            |endpoint, token| {
+                *captured.borrow_mut() = Some((endpoint.to_string(), token.to_string()));
+                Ok((200, r#"{"data":[]}"#.to_string()))
+            },
+            |_, _| None,
+        )
+        .unwrap();
+
+        assert!(result.is_empty());
+        assert_eq!(
+            captured.into_inner(),
+            Some((expected_endpoint.to_string(), access_token))
+        );
+    }
+}
+
+#[test]
+fn product_logo_license_request_rejects_invalid_issuer_before_transport() {
+    let directory = TestDirectory::new();
+    let session_path = directory.0.join("app/sessions/session");
+    let invalid_token = refresh_token_claims(
+        "https://account.dreamtonics.com.cn.evil.test/realms/Dreamtonics",
+        Some("test-client"),
+    );
+    let mut requests = 0;
+    let result = assets::fetch_product_logos_with_request(
+        &session_path,
+        &["license-only".to_string()],
+        &invalid_token,
+        |_, _| {
+            requests += 1;
+            Ok((200, r#"{"data":[]}"#.to_string()))
+        },
+        |_, _| None,
+    );
+
+    assert_eq!(
+        result.unwrap_err(),
+        "access token issuer is missing or invalid"
+    );
+    assert_eq!(requests, 0);
+}
+
+#[test]
+fn product_logo_local_cache_does_not_require_an_issuer() {
+    let directory = TestDirectory::new();
+    let app_root = directory.0.join("app");
+    let session_path = app_root.join("sessions/session");
+    let metadata_directory = app_root.join("databases/meta");
+    fs::create_dir_all(&metadata_directory).unwrap();
+    fs::write(
+        metadata_directory.join("cached-product.json"),
+        r#"{"name":"cached product","imageUrl":"https://cdn.dreamtonics.com/product.png"}"#,
+    )
+    .unwrap();
+
+    let result = assets::fetch_product_logos_with_request(
+        &session_path,
+        &["cached product".to_string()],
+        "not-a-jwt",
+        |_, _| panic!("local cache hit must not make a license request"),
+        |_, _| Some(b"\x89PNG\r\n\x1a\nimage".to_vec()),
+    )
+    .unwrap();
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].id, "cached-product");
 }
 
 #[test]
@@ -239,7 +331,8 @@ fn product_logo_urls_formats_and_cache_are_bounded_and_trusted() {
     let logos = assets::fetch_product_logos_with(
         &session_path,
         &["untrusted".to_string()],
-        || Ok(serde_json::json!({"data":[{"id":"x","productId":"untrusted","logo":"http://dreamtonics.com/image.png"}]})),
+        || Ok("https://test.invalid/licenses".to_string()),
+        |_| Ok(serde_json::json!({"data":[{"id":"x","productId":"untrusted","logo":"http://dreamtonics.com/image.png"}]})),
         |_, _| {
             download_count += 1;
             Some(b"not an image".to_vec())
@@ -254,7 +347,8 @@ fn product_logo_urls_formats_and_cache_are_bounded_and_trusted() {
     let logos = assets::fetch_product_logos_with(
         &session_path,
         &["oversized".to_string()],
-        || Ok(serde_json::json!({"data":[{"id":"oversized-cache","productId":"oversized","imageUrl":"https://img.dreamtonics.com/a.png"}]})),
+        || Ok("https://test.invalid/licenses".to_string()),
+        |_| Ok(serde_json::json!({"data":[{"id":"oversized-cache","productId":"oversized","imageUrl":"https://img.dreamtonics.com/a.png"}]})),
         |_, _| Some(too_large.clone()),
     )
     .unwrap();
@@ -265,7 +359,8 @@ fn product_logo_urls_formats_and_cache_are_bounded_and_trusted() {
     assert!(assets::fetch_product_logos_with(
         &session_path,
         &invalid_keys,
-        || panic!("invalid key count must fail before network access"),
+        || panic!("invalid key count must fail before endpoint resolution"),
+        |_| panic!("invalid key count must fail before network access"),
         |_, _| None,
     )
     .is_err());
