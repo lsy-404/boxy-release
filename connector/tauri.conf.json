@@ -1,0 +1,22 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Boxy",
+  "version": "2.2.0",
+  "identifier": "app.boxy.bridge",
+  "build": {
+    "frontendDist": "https://boxy.voidcarve.com"
+  },
+  "app": {
+    "windows": [],
+    "withGlobalTauri": false,
+    "security": {
+      "capabilities": [],
+      "assetProtocol": { "enable": false, "scope": [] }
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": ["../assets/boxy-pen.ico", "../assets/boxy-pen.icns", "../assets/boxy-pen.png"],
+    "macOS": { "minimumSystemVersion": "11.0" }
+  }
+}

@@ -1,0 +1,7 @@
+/target/
+/dist/
+/connector/gen/
+node_modules/
+*.log
+!/test/
+!/agents/
