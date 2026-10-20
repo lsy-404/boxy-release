@@ -15,3 +15,8 @@ Worker修复使用最新origin/main 5d97d64建立独立worktree，原private pri
 额外真实Windows验收通过：invalid URL回显、HTTP503创建失败回显、同一选择页改正URL后完成云UI和签名任务、退出0及清理。新增清理脚本路径白名单与严格测试PID约束。独立生命周期/ACL复核未发现阻断项。
 
 Worker改动71fd6a0已由独立干净工作树推送远端main，105项Worker测试、tsc、build及Wrangler dry-run均通过。2026-10-20部署成功，version=04f46cce-d464-48f3-8063-af79e119ddba，静态资源无变化；保留dashboard变量。private primary含用户untracked，故不移动其本地main、不从该工作树合并/推送；交付基于已fetch的远端main快进，无PR及历史改写。两仓用户现有内容均保留。
+最终交付：GitHub Actions 39457543227 的prepare/Windows/macOS全部success，source=edb462b4a397a52719a26a0ffc579436ab6f6681。Windows正式包的启动、单文件及完整选择/错误重试smoke在CI通过；从Release下载的同一Windows exe再次本机选择/错误恢复/签名任务/正常退出清理验收通过。当前代码的Blob导出真实本机测试亦通过。
+
+2026-10-20已公开v2.2.1并设为latest，Release ID 418620667，正文精确为改进了一些内容；tag解析到同一source。Windows asset=659873930，size=11620864，sha256=5e43b5f119313ca9b877d38d8ab02c2e50e0b2f29f0147d9e212c2bcf8ee6210；macOS asset=659859289，size=8361403，sha256=3c56a7e1eebd64a2e1b4b379b7bc8d393e113c3b370270a65ae5222d7fb97a85。两项均实际下载校验GitHub digest；macOS Fat Mach-O 2架构及plist 2.2.1已读取核实。校验过的附件与metadata保存在C:\Users\User\.codex\backups\boxy-release\20261020-v2.2.1，未覆盖旧备份。
+
+尚无大陆机器对新版本的现场复测结果；恢复测试为本机loopback传输断连/截断响应，并不证明大陆到Boxy的网络根因已消除。本次未将客户端所在地替代令牌issuer路由，也未改写历史或删除旧Release。
