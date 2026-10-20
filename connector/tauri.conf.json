@@ -1,16 +1,22 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Boxy",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "identifier": "app.boxy.bridge",
   "build": {
-    "frontendDist": "https://boxy.voidcarve.com"
+    "frontendDist": "bootstrap"
   },
   "app": {
     "windows": [],
-    "withGlobalTauri": false,
+    "withGlobalTauri": true,
     "security": {
-      "capabilities": [],
+      "capabilities": [{
+        "identifier": "service-selection",
+        "windows": ["service-selection"],
+        "local": true,
+        "permissions": ["allow-select-service"]
+      }],
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self'; connect-src ipc: http://ipc.localhost",
       "assetProtocol": { "enable": false, "scope": [] }
     }
   },

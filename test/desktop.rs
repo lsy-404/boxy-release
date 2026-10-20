@@ -1,6 +1,30 @@
 use super::*;
 
 #[test]
+fn selection_navigation_only_accepts_the_local_entry_page() {
+    for url in [
+        "tauri://localhost/",
+        "tauri://localhost/index.html",
+        "http://tauri.localhost/index.html",
+    ] {
+        assert!(local_selection_url(&Url::parse(url).unwrap()), "{url}");
+    }
+    for url in [
+        "https://service.example/index.html",
+        "https://tauri.localhost/index.html",
+        "http://tauri.localhost:3000/index.html",
+        "tauri://localhost/other.html",
+        "tauri://localhost/index.html?server=example",
+        "tauri://localhost/index.html#remote",
+        "tauri://user@localhost/index.html",
+        "tauri://remote/index.html",
+        "about:blank",
+    ] {
+        assert!(!local_selection_url(&Url::parse(url).unwrap()), "{url}");
+    }
+}
+
+#[test]
 fn cloud_navigation_accepts_https_and_loopback_without_business_host_rules() {
     for url in [
         "https://service.example/editor",
