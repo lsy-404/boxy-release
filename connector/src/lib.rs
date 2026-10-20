@@ -43,6 +43,9 @@ const MAX_START_REQUEST_BYTES: usize = (4 * 1024 * 1024 + 2) / 3 + 16 * 1024;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_COMMAND_SECONDS: u64 = 3600;
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const MAX_POLL_RETRIES: u32 = 5;
+const POLL_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+const POLL_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 const CONNECTOR_PROTOCOL_VERSION: u8 = 3;
 const REQUEST_PATH: &str = "/api/v2/connector/operations";
 
@@ -332,13 +335,15 @@ fn wait_for_writeback(
                 continue;
             }
         }
-        let (nonce, signature) = request_signature(device_key, "GET", &path);
-        let response = get_signed::<ConnectorOperationResponse>(
+        let Some(response) = get_signed_poll::<ConnectorOperationResponse>(
             &config.server_url,
             &path,
-            &nonce,
-            &signature,
-        )?;
+            device_key,
+            host,
+        )?
+        else {
+            return Ok(());
+        };
         require_protocol_v3(response.protocol_version)?;
         match response.state.as_str() {
             "waiting" | "editor_active" | "temporary_pending_activation" => {
@@ -1447,19 +1452,81 @@ fn post_json<T: Serialize, R: for<'de> Deserialize<'de>>(
     parse_response(response)
 }
 
-fn get_signed<R: for<'de> Deserialize<'de>>(
+fn get_signed_poll<R: for<'de> Deserialize<'de>>(
     server: &str,
     path: &str,
-    nonce: &str,
-    signature: &str,
-) -> Result<R, String> {
-    parse_response(
-        ureq::get(&format!("{server}{path}"))
+    key: &SigningKey,
+    host: &dyn ConnectorHost,
+) -> Result<Option<R>, String> {
+    let mut failures = 0;
+    loop {
+        if host.should_stop() {
+            return Ok(None);
+        }
+        let (nonce, signature) = request_signature(key, "GET", path);
+        let response = ureq::get(&format!("{server}{path}"))
             .timeout(Duration::from_secs(30))
-            .set("X-Connector-Nonce", nonce)
-            .set("X-Connector-Signature", signature)
-            .call(),
+            .set("X-Connector-Nonce", &nonce)
+            .set("X-Connector-Signature", &signature)
+            .call();
+        let retry = match response {
+            Ok(response) => {
+                let mut body = Vec::new();
+                match response.into_reader().read_to_end(&mut body) {
+                    Ok(_) => {
+                        return serde_json::from_slice(&body).map(Some).map_err(|_| {
+                            "authorization service returned invalid poll JSON".to_string()
+                        });
+                    }
+                    Err(error) if retryable_poll_read_error(&error) => true,
+                    Err(_) => {
+                        return Err(
+                            "authorization service poll response could not be read".to_string()
+                        );
+                    }
+                }
+            }
+            Err(ureq::Error::Status(status, _)) if retryable_poll_status(status) => true,
+            Err(ureq::Error::Transport(_)) => true,
+            Err(ureq::Error::Status(status, _)) => {
+                return Err(format!("authorization service rejected poll ({status})"));
+            }
+        };
+        if retry {
+            failures += 1;
+            if failures > MAX_POLL_RETRIES {
+                return Err(
+                    "authorization service poll failed after repeated temporary network errors"
+                        .to_string(),
+                );
+            }
+            let delay = poll_retry_delay(failures);
+            if wait_or_stop(host, delay) {
+                return Ok(None);
+            }
+        }
+    }
+}
+
+fn retryable_poll_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 502 | 503 | 504)
+}
+
+fn retryable_poll_read_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::UnexpectedEof
     )
+}
+
+fn poll_retry_delay(failures: u32) -> Duration {
+    POLL_RETRY_BASE_DELAY
+        .saturating_mul(1_u32 << failures.saturating_sub(1).min(8))
+        .min(POLL_RETRY_MAX_DELAY)
 }
 
 fn post_signed_json<T: Serialize>(
