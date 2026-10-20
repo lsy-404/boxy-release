@@ -124,7 +124,7 @@ fn drive_render_smoke(
         let (sender, receiver) = mpsc::sync_channel(1);
         window
             .eval_with_callback(
-                "(() => { const input=document.getElementById('service-url'); const button=document.getElementById('connect'); const error=document.getElementById('error'); const rect=e=>e?e.getBoundingClientRect():{width:0,height:0}; return {href:location.href,title:document.title,readyState:document.readyState,body:!!document.body,input:!!input,inputValue:input?.value??null,button:!!button,error:!!error,inputRect:rect(input),buttonRect:rect(button),borderRadius:input?getComputedStyle(input).borderRadius:null,bodyText:document.body?.innerText??''}; })()",
+                "(() => { const input=document.getElementById('service-url'); const button=document.getElementById('connect'); const error=document.getElementById('error'); const rect=e=>{const r=e?.getBoundingClientRect();return {width:r?.width??0,height:r?.height??0};}; return {href:location.href,title:document.title,readyState:document.readyState,body:!!document.body,input:!!input,inputValue:input?.value??null,button:!!button,error:!!error,inputRect:rect(input),buttonRect:rect(button),borderRadius:input?getComputedStyle(input).borderRadius:null,bodyText:document.body?.innerText??''}; })()",
                 move |value| {
                     let _ = sender.send(value);
                 },
@@ -140,7 +140,8 @@ fn drive_render_smoke(
                         continue;
                     }
                 };
-                rendered = snapshot["title"] == "Boxy"
+                rendered = snapshot["readyState"] == "complete"
+                    && snapshot["title"] == "Boxy"
                     && snapshot["body"] == true
                     && snapshot["input"] == true
                     && snapshot["inputValue"] == ""
@@ -158,9 +159,7 @@ fn drive_render_smoke(
                     break;
                 }
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("WKWebView render callback disconnected".to_string());
-            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
         thread::sleep(Duration::from_millis(150));
