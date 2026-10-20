@@ -56,6 +56,11 @@ name = "boxy"
 path = "src/main.rs"
 required-features = ["desktop"]
 
+[[example]]
+name = "desktop_render_smoke"
+path = "../test/desktop_render_smoke.rs"
+required-features = ["desktop"]
+
 [[test]]
 name = "host_block_status"
 path = "../test/connector/host_block_status.test.rs"

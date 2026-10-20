@@ -119,6 +119,11 @@ jobs:
         run: |
           cargo test --locked -p boxy
           node --test test/package_portable.test.mjs
+          node --test test/tauri_webview_fixture.test.mjs
+
+      - name: Smoke test macOS WKWebView selection
+        timeout-minutes: 3
+        run: bash test/macos_webview_render_smoke.sh
 
       - name: Build client source
         run: |
