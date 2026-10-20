@@ -1,0 +1,3 @@
+# 发现
+
+当前main为3633f54单一root提交。launch.rs存在DEFAULT_SERVICE_URL，Tauri配置frontendDist亦为固定远程URL。prepare_config在Tauri启动前解析并选择session；无URL时需要先选择服务，再触发session路径验证或文件选择。Tauri2.12.4提供官方vanilla全局invoke接口；必须以local capability和caller校验限定唯一bootstrap命令。
