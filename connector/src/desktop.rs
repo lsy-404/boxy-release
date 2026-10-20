@@ -309,7 +309,7 @@ fn local_selection_url(url: &Url) -> bool {
         _ => false,
     };
     origin
-        && matches!(url.path(), "/" | "/index.html")
+        && matches!(url.path(), "" | "/" | "/index.html")
         && url.port().is_none()
         && url.username().is_empty()
         && url.password().is_none()

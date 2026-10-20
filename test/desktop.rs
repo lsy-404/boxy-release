@@ -3,6 +3,7 @@ use super::*;
 #[test]
 fn selection_navigation_only_accepts_the_local_entry_page() {
     for url in [
+        "tauri://localhost",
         "tauri://localhost/",
         "tauri://localhost/index.html",
         "http://tauri.localhost/index.html",
@@ -16,6 +17,9 @@ fn selection_navigation_only_accepts_the_local_entry_page() {
         "tauri://localhost/other.html",
         "tauri://localhost/index.html?server=example",
         "tauri://localhost/index.html#remote",
+        "tauri://localhost?server=example",
+        "tauri://localhost#remote",
+        "tauri://user@localhost",
         "tauri://user@localhost/index.html",
         "tauri://remote/index.html",
         "about:blank",
