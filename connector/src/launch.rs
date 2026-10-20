@@ -6,12 +6,11 @@ use std::{
 use rfd::FileDialog;
 use url::Url;
 
-const DEFAULT_SERVICE_URL: &str = "https://boxy.voidcarve.com";
-
-pub(crate) struct LaunchOptions {
-    pub(crate) server_url: String,
-    pub(crate) session_path: PathBuf,
-    pub(crate) session_path_explicit: bool,
+#[derive(Clone, Debug)]
+pub struct LaunchOptions {
+    pub server_url: Option<String>,
+    pub session_path: PathBuf,
+    pub session_path_explicit: bool,
 }
 
 pub(crate) struct LaunchArguments {
@@ -76,13 +75,18 @@ pub(crate) fn resolve_server_url(
     command_line: Option<&str>,
     environment: Option<&str>,
     executable: Option<&Path>,
-) -> Result<String, String> {
-    let value = command_line
-        .or(environment)
-        .map(str::to_string)
-        .or_else(|| executable.and_then(inferred_service_url))
-        .unwrap_or_else(|| DEFAULT_SERVICE_URL.to_string());
-    validate_service_url(&value)
+) -> Result<Option<String>, String> {
+    if let Some(value) = command_line.or(environment) {
+        return validate_service_url(value).map(Some);
+    }
+    executable
+        .and_then(inferred_service_url)
+        .map(|value| validate_service_url(&value))
+        .transpose()
+}
+
+pub(crate) fn validate_selected_service_url(value: &str) -> Result<String, String> {
+    validate_service_url(value)
 }
 
 pub(crate) fn resolve_session_path(path: PathBuf, explicit: bool) -> Result<PathBuf, String> {

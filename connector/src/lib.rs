@@ -16,6 +16,8 @@ mod windows_process;
 #[cfg(windows)]
 mod windows_tray;
 
+pub use launch::LaunchOptions;
+
 use std::{
     env,
     fs::{self, File},
@@ -212,13 +214,16 @@ pub fn run_elevated_if_requested() -> Option<i32> {
     None
 }
 
-pub fn prepare_config() -> Result<Config, String> {
-    let launch =
-        launch::LaunchOptions::from_environment_and_args(session_io::default_session_path())?;
+pub fn prepare_config() -> Result<LaunchOptions, String> {
+    LaunchOptions::from_environment_and_args(session_io::default_session_path())
+}
+
+pub fn resolve_config(launch: &LaunchOptions, server_url: &str) -> Result<Config, String> {
+    let server_url = launch::validate_selected_service_url(server_url)?;
     let session_path =
-        launch::resolve_session_path(launch.session_path, launch.session_path_explicit)?;
+        launch::resolve_session_path(launch.session_path.clone(), launch.session_path_explicit)?;
     Ok(Config {
-        server_url: launch.server_url,
+        server_url,
         session_path,
     })
 }
