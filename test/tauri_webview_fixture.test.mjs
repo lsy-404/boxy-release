@@ -15,7 +15,7 @@ test("local cloud fixture verifies protocol 3 signed poll and file receipt", asy
   const directory = mkdtempSync(join(tmpdir(), "boxy-tauri-fixture-test-"));
   const statePath = join(directory, "state.json");
   const portPath = join(directory, "port.txt");
-  const child = spawn(process.execPath, [fixture, "--state-file", statePath, "--port-file", portPath], {
+  const child = spawn(process.execPath, [fixture, "--state-file", statePath, "--port-file", portPath, "--probe-select-service"], {
     stdio: "ignore",
   });
   t.after(async () => {
@@ -51,8 +51,10 @@ test("local cloud fixture verifies protocol 3 signed poll and file receipt", asy
   const editor = await fetch(operation.browserUrl);
   assert.equal(editor.status, 200);
   assert.match(editor.headers.get("set-cookie"), /HttpOnly/);
-  assert.equal((await fetch(`${base}/smoke.js`)).status, 200);
-  assert.equal((await fetch(`${base}/ready?ipc=absent`, { headers: { cookie: "boxy-auth=fixture-auth" } })).status, 200);
+  const smokeScript = await fetch(`${base}/smoke.js`);
+  assert.equal(smokeScript.status, 200);
+  assert.match(await smokeScript.text(), /select_service.*serverUrl/);
+  assert.equal((await fetch(`${base}/ready?ipc=absent&select=absent`, { headers: { cookie: "boxy-auth=fixture-auth" } })).status, 200);
 
   const pollPath = "/api/v2/connector/operations/packaging-smoke";
   const nonce = "fixture-nonce";
@@ -88,6 +90,8 @@ test("local cloud fixture verifies protocol 3 signed poll and file receipt", asy
   assert.equal(state.readyFetch, true);
   assert.equal(state.cookieReturned, true);
   assert.equal(state.nativeIpcDenied, true);
+  assert.equal(state.remoteSelectServiceDenied, true);
+  assert.equal(state.operationStartCount, 1);
   assert.equal(state.signedPolls, 1);
   assert.equal(state.signedTaskReceipts, 1);
   assert.equal(state.readReceiptValid, true);

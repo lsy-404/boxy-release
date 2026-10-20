@@ -9,6 +9,7 @@ for (let index = 2; index < process.argv.length; index += 2) {
 const statePath = options.get("--state-file");
 const portPath = options.get("--port-file");
 const enableExport = process.argv.includes("--enable-export");
+const probeSelectService = process.argv.includes("--probe-select-service");
 if (!statePath || !portPath) throw new Error("--state-file and --port-file are required");
 
 const state = {
@@ -16,6 +17,8 @@ const state = {
   readyFetch: false,
   cookieReturned: false,
   nativeIpcDenied: false,
+  remoteSelectServiceDenied: false,
+  operationStartCount: 0,
   exportStarted: false,
   startProtocolVersion: null,
   signedPolls: 0,
@@ -70,6 +73,11 @@ const server = createServer(async (request, response) => {
     const url = new URL(request.url, "http://127.0.0.1");
     if (request.method === "POST" && url.pathname === "/api/v2/connector/operations") {
       const body = await readJson(request);
+      state.operationStartCount += 1;
+      if (state.operationStartCount > 1) {
+        saveState();
+        return send(response, 409, JSON.stringify({ error: "operation_already_started" }));
+      }
       state.startProtocolVersion = body.protocolVersion;
       if (body.protocolVersion !== 3) throw new Error("wrong_protocol_version");
       const rawPublicKey = Buffer.from(body.devicePublicKey ?? "", "base64url");
@@ -99,7 +107,10 @@ const server = createServer(async (request, response) => {
       const exportScript = enableExport
         ? 'await fetch("/export-started");const blob=new Blob(["boxy-export-fixture\\n"],{type:"text/plain"});const link=document.createElement("a");link.href=URL.createObjectURL(blob);link.download="boxy-export-fixture.txt";link.click();'
         : "";
-      const script = `async function probe(){let ipc="absent";const call=window.__TAURI_INTERNALS__?.invoke;if(typeof call==="function"){try{ipc=await Promise.race([call("plugin:window|set_title",{label:"editor",title:"ipc-probe"}).then(()=>"allowed",()=>"denied"),new Promise(r=>setTimeout(()=>r("timeout"),1000))])}catch{ipc="denied"}}const response=await fetch(\`/ready?ipc=\${ipc}\`);document.body.dataset.ready=response.ok?"yes":"error";if(response.ok){${exportScript}}}probe().catch(()=>document.body.dataset.ready="error")`;
+      const serviceProbe = probeSelectService
+        ? 'let service="absent";if(typeof call==="function"){try{service=await Promise.race([call("select_service",{serverUrl:location.origin}).then(()=>"allowed",()=>"denied"),new Promise(r=>setTimeout(()=>r("timeout"),1000))])}catch{service="denied"}}'
+        : 'const service="not_probed";';
+      const script = `async function probe(){let ipc="absent";const call=window.__TAURI_INTERNALS__?.invoke;if(typeof call==="function"){try{ipc=await Promise.race([call("plugin:window|set_title",{label:"editor",title:"ipc-probe"}).then(()=>"allowed",()=>"denied"),new Promise(r=>setTimeout(()=>r("timeout"),1000))])}catch{ipc="denied"}}${serviceProbe}const response=await fetch(\`/ready?ipc=\${ipc}&select=\${service}\`);document.body.dataset.ready=response.ok?"yes":"error";if(response.ok){${exportScript}}}probe().catch(()=>document.body.dataset.ready="error")`;
       return send(response, 200, script, "text/javascript; charset=utf-8");
     }
     if (request.method === "GET" && url.pathname === "/export-started" && enableExport) {
@@ -111,7 +122,10 @@ const server = createServer(async (request, response) => {
       state.cookieReturned = request.headers.cookie === "boxy-auth=fixture-auth";
       const ipcProbe = url.searchParams.get("ipc") ?? "absent";
       state.nativeIpcDenied = ipcProbe === "absent" || ipcProbe === "denied";
-      state.readyFetch = state.cookieReturned && state.nativeIpcDenied;
+      const serviceProbe = url.searchParams.get("select") ?? "not_probed";
+      state.remoteSelectServiceDenied = serviceProbe === "absent" || serviceProbe === "denied";
+      state.readyFetch = state.cookieReturned && state.nativeIpcDenied
+        && (!probeSelectService || state.remoteSelectServiceDenied);
       saveState();
       const allowed = state.cookieReturned && state.nativeIpcDenied;
       return send(response, allowed ? 200 : 403, allowed ? "ready" : "cookie_or_ipc_failed", "text/plain; charset=utf-8");

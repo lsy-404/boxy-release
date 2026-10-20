@@ -61,6 +61,7 @@ jobs:
         run: |
           cargo test --locked -p boxy
           node --test test/package_portable.test.mjs
+          node --test test/tauri_webview_fixture.test.mjs
 
       - name: Build client source
         shell: pwsh
@@ -84,6 +85,10 @@ jobs:
       - name: Smoke test packaged Boxy
         shell: pwsh
         run: pwsh -NoProfile -File test/windows_startup_smoke.ps1 -Executable dist/boxy-windows-x64.exe
+
+      - name: Smoke test service selection
+        shell: pwsh
+        run: pwsh -NoProfile -File test/windows_service_selection_smoke.ps1 -Executable dist/boxy-windows-x64.exe
 
       - name: Upload Boxy for Windows
         env:

@@ -24,11 +24,9 @@ Windows users download and run `boxy-windows-x64.exe` directly. The executable u
 
 ## Start and choose a service
 
-Boxy connects using the service URL supplied through `--server`, `BOXY_API_URL`, or a domain-style executable name. Ordinary release filenames use `https://boxy.voidcarve.com`. The URL must be an HTTPS origin with no credentials, path, query, or fragment; HTTP is allowed only for localhost development. If the default SV2 session file is unavailable, Boxy opens a native file picker.
+Boxy uses a service URL supplied through `--server`, `BOXY_API_URL`, or a domain-style executable name. For example, `service.example.test.exe` or `service.example.test.app` suggests `https://service.example.test`; the client reads the outer `.app` bundle name on macOS. An ordinary release filename such as `boxy-windows-x64.exe` has no default service. Boxy opens a local service selection page and waits for the user to choose an address. Until the user submits a valid URL, the connector does not read the SV2 session or contact a service.
 
-For example, `service.example.test.exe` or `service.example.test.app` suggests `https://service.example.test`; the downloaded `boxy-windows-x64.exe` uses the default service. The client reads the outer `.app` bundle name on macOS.
-
-`BOXY_API_URL` or `--server URL` sets the service address. The selected service controls the cloud UI and the remote operations it requests. `--session PATH` selects a non-default SV2 session. The service observes the public IP from the connection, so the client does not contact a separate IP lookup site.
+The service URL must be an HTTPS origin with no credentials, path, query, or fragment; HTTP is allowed only for localhost development. `BOXY_API_URL` or `--server URL` supplies the service before launch. `--session PATH` selects an SV2 session and is applied after the service has been selected. The service observes the public IP from the connection, so the client does not contact a separate IP lookup site.
 
 After the service creates an operation and returns a validated editor URL, Boxy opens that cloud page in its native window. The selected service supplies the interface and protocol-v3 tasks; closing the Boxy window ends the local connector.
 
