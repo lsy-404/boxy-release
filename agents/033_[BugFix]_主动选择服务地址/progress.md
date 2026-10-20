@@ -7,3 +7,11 @@
 本地完整Rust测试先通过43库+4桌面+6host+9启动，新增精确本地选择页URL测试后桌面5项通过，2.2.1 Windows release编译通过。真实UIA验收与跨平台构建待完成。
 
 用户补充中国区旧版TLS握手EOF截图；代码定位为Boxy operation轮询GET传输错误直接退出，并非上游区域API响应。只读协议审查发现写回GET并非幂等，新增独立Worker修复及客户端安全有限GET重试任务，禁止重发start/task/receipt POST。真实大陆网络尚未复验，不把重试机制等同于跨境可达性证明。
+整合验证：48库、5桌面、6host、9启动共68项Rust测试与2项Node测试全部通过。子分支真实Windows 2.2.1 release EXE验收确认空白URL、锁定session在选择前未读取、UIA确认loopback服务、远端select_service拒绝、唯一operation创建及唯一signed read_files回执，两个正常退出均无临时profile和AppData变化。
+
+线上只读D1核对截图所示会话：2026-10-20 16:09至16:11 UTC，quick_licenses/licenses预期与实际endpoint均为国际my_licenses，多次HTTP200且product_count=8；16:09:36已有写回派发，最后logo步骤16:11:46处理200。当前operation为editor_active。该证据说明本会话已有正常产品响应，截图TLS EOF为后来Boxy轮询传输中断；不能将其当作.cn上游报错或产品空响应。代码仍按session issuer精确选择国际/中国区，不依据电脑地理位置切换。
+
+Worker修复使用最新origin/main 5d97d64建立独立worktree，原private primary及其3项untracked保持原样；live查询两仓main均unprotected。客户端poll仅重试临时GET错误，完整非法JSON/401仍终止，start/task/receipt POST不重放。
+额外真实Windows验收通过：invalid URL回显、HTTP503创建失败回显、同一选择页改正URL后完成云UI和签名任务、退出0及清理。新增清理脚本路径白名单与严格测试PID约束。独立生命周期/ACL复核未发现阻断项。
+
+Worker改动71fd6a0已由独立干净工作树推送远端main，105项Worker测试、tsc、build及Wrangler dry-run均通过。2026-10-20部署成功，version=04f46cce-d464-48f3-8063-af79e119ddba，静态资源无变化；保留dashboard变量。private primary含用户untracked，故不移动其本地main、不从该工作树合并/推送；交付基于已fetch的远端main快进，无PR及历史改写。两仓用户现有内容均保留。
