@@ -8,3 +8,4 @@
 - Windows 2.2.1 release 的真实 smoke 观察到进程归属窗口，UI Automation 可定位并操作 `service-url` 与 `connect` 控件；UIA 操作限定于测试启动的 Boxy PID。
 - 被独占锁定的无效 session 在 URL 确认前未引发文件读取或文件对话框；选择后云页握手、cookie、protocol-v3 签名回执通过。
 - 远端页面尝试 `select_service` 被拒绝，且服务端只观察到一次 operation 创建。正常关闭返回 0 并清除本次 profile。
+- 新增失败恢复验证：无效 URL 在本地验证错误后仍可编辑；HTTP 503 的 start attempt 返回本地错误，重填有效 fixture 后启动成功并完成签名回执；整个进程正常退出 0。

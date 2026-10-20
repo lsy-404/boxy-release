@@ -10,6 +10,7 @@ const statePath = options.get("--state-file");
 const portPath = options.get("--port-file");
 const enableExport = process.argv.includes("--enable-export");
 const probeSelectService = process.argv.includes("--probe-select-service");
+const rejectOperationStart = process.argv.includes("--reject-operation-start");
 if (!statePath || !portPath) throw new Error("--state-file and --port-file are required");
 
 const state = {
@@ -74,6 +75,10 @@ const server = createServer(async (request, response) => {
     if (request.method === "POST" && url.pathname === "/api/v2/connector/operations") {
       const body = await readJson(request);
       state.operationStartCount += 1;
+      if (rejectOperationStart) {
+        saveState();
+        return send(response, 503, JSON.stringify({ error: "fixture_start_rejected" }));
+      }
       if (state.operationStartCount > 1) {
         saveState();
         return send(response, 409, JSON.stringify({ error: "operation_already_started" }));

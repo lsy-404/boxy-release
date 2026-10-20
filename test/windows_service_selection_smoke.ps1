@@ -25,6 +25,8 @@ $sessionDir = Join-Path $sessionRoot 'Config'
 $tempRoot = Join-Path $testRoot 'isolated-temp'
 $fixtureState = Join-Path $testRoot 'fixture-state.json'
 $fixturePort = Join-Path $testRoot 'fixture-port.txt'
+$rejectState = Join-Path $testRoot 'reject-state.json'
+$rejectPort = Join-Path $testRoot 'reject-port.txt'
 $fixtureScript = Join-Path $PSScriptRoot 'fixtures/tauri-webview-server.mjs'
 $fixtureExecutable = Join-Path $appDir 'boxy-service-smoke.exe'
 $sessionPath = Join-Path $sessionDir 'session.bin'
@@ -109,6 +111,27 @@ function Get-ControlValue($Element) {
   return [string]$Element.Current.Name
 }
 
+function Get-SelectionError($Selection) {
+  $parts = [System.Collections.Generic.List[string]]::new()
+  if ($null -ne $Selection.Error) {
+    $value = Get-ControlValue $Selection.Error
+    if (-not [string]::IsNullOrWhiteSpace($value)) { $parts.Add($value) }
+  }
+  $texts = $Selection.Window.FindAll(
+    [System.Windows.Automation.TreeScope]::Descendants,
+    [System.Windows.Automation.PropertyCondition]::new(
+      [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+      [System.Windows.Automation.ControlType]::Text
+    )
+  )
+  foreach ($text in $texts) {
+    if ($text.Current.AutomationId -eq 'error' -or $text.Current.Name -match 'valid service URL|HTTPS|credentials|path, query|authorization service|rejected the request') {
+      if (-not [string]::IsNullOrWhiteSpace($text.Current.Name)) { $parts.Add($text.Current.Name) }
+    }
+  }
+  return ($parts -join ' ')
+}
+
 function Set-ControlValue($Element, [string]$Value) {
   $pattern = $null
   if (-not $Element.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)) {
@@ -191,6 +214,50 @@ function Wait-ServiceSelection([Diagnostics.Process]$Process, [int]$TimeoutSecon
   throw 'The blank local service selection page did not become accessible through UI Automation.'
 }
 
+function Wait-ServiceError([Diagnostics.Process]$Process, [int]$TimeoutSeconds) {
+  $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+  $lastSelection = $null
+  while ([DateTime]::UtcNow -lt $deadline) {
+    if ($Process.HasExited) { throw "Boxy exited before returning to service selection (exit $($Process.ExitCode))." }
+    $selection = Find-ServiceSelection $Process.Id
+    if ($null -ne $selection) {
+      $lastSelection = $selection
+      $message = Get-SelectionError $selection
+      if (-not [string]::IsNullOrWhiteSpace($message)) { return $selection }
+    }
+    Start-Sleep -Milliseconds 150
+  }
+  $details = if ($null -eq $lastSelection) { 'selection controls not found' } else {
+    $controls = $lastSelection.Window.FindAll(
+      [System.Windows.Automation.TreeScope]::Descendants,
+      [System.Windows.Automation.Condition]::TrueCondition
+    )
+    (@($controls | ForEach-Object { "id=$($_.Current.AutomationId),type=$($_.Current.ControlType.ProgrammaticName),name=$($_.Current.Name),enabled=$($_.Current.IsEnabled)" }) -join '; ')
+  }
+  throw "The failed connection did not return an accessible error to the local service selection page. UIA: $details"
+}
+
+function Start-ProtocolFixture([string]$StatePath, [string]$PortPath, [switch]$RejectStart) {
+  $node = (Get-Command node -ErrorAction Stop).Source
+  $startInfo = [Diagnostics.ProcessStartInfo]::new()
+  $startInfo.FileName = $node
+  $startInfo.UseShellExecute = $false
+  $startInfo.CreateNoWindow = $true
+  foreach ($argument in @($fixtureScript, '--state-file', $StatePath, '--port-file', $PortPath)) {
+    $startInfo.ArgumentList.Add($argument)
+  }
+  $startInfo.ArgumentList.Add('--probe-select-service')
+  if ($RejectStart) { $startInfo.ArgumentList.Add('--reject-operation-start') }
+  $process = [Diagnostics.Process]::Start($startInfo)
+  $deadline = [DateTime]::UtcNow.AddSeconds(15)
+  while ([DateTime]::UtcNow -lt $deadline -and -not (Test-Path -LiteralPath $PortPath)) {
+    if ($process.HasExited) { throw 'The local protocol fixture stopped before it became ready.' }
+    Start-Sleep -Milliseconds 100
+  }
+  if (-not (Test-Path -LiteralPath $PortPath)) { throw 'The local protocol fixture did not become ready.' }
+  return $process
+}
+
 function Wait-FileFixtureState([Diagnostics.Process]$Process) {
   $deadline = [DateTime]::UtcNow.AddSeconds(90)
   while ([DateTime]::UtcNow -lt $deadline) {
@@ -224,6 +291,7 @@ $signerBefore = if (Test-Path -LiteralPath $signerPath -PathType Leaf) {
 } else { $null }
 $appLocalDataBefore = Get-PathInventory $appLocalDataPath
 $fixtureProcess = $null
+$rejectFixtureProcess = $null
 $unselectedProcess = $null
 $connectedProcess = $null
 $invalidSessionLock = $null
@@ -236,7 +304,7 @@ try {
   $unselected = Wait-ServiceSelection $unselectedProcess 45
   $entered = Get-ControlValue $unselected.Input
   if (-not [string]::IsNullOrWhiteSpace($entered)) { throw "Ordinary release filename unexpectedly prefilled service URL '$entered'." }
-  if ($null -ne $unselected.Error -and -not [string]::IsNullOrWhiteSpace((Get-ControlValue $unselected.Error))) {
+  if (-not [string]::IsNullOrWhiteSpace((Get-SelectionError $unselected))) {
     throw 'The invalid session path produced an error before service selection.'
   }
   Start-Sleep -Milliseconds 700
@@ -250,28 +318,41 @@ try {
   $unselectedProcess.Dispose()
   $unselectedProcess = $null
 
-  $node = (Get-Command node -ErrorAction Stop).Source
-  $fixtureStart = [Diagnostics.ProcessStartInfo]::new()
-  $fixtureStart.FileName = $node
-  $fixtureStart.UseShellExecute = $false
-  $fixtureStart.CreateNoWindow = $true
-  foreach ($argument in @($fixtureScript, '--state-file', $fixtureState, '--port-file', $fixturePort, '--probe-select-service')) {
-    $fixtureStart.ArgumentList.Add($argument)
-  }
-  $fixtureProcess = [Diagnostics.Process]::Start($fixtureStart)
-  $serverDeadline = [DateTime]::UtcNow.AddSeconds(15)
-  while ([DateTime]::UtcNow -lt $serverDeadline -and -not (Test-Path -LiteralPath $fixturePort)) {
-    if ($fixtureProcess.HasExited) { throw 'The local protocol fixture stopped before it became ready.' }
-    Start-Sleep -Milliseconds 100
-  }
-  if (-not (Test-Path -LiteralPath $fixturePort)) { throw 'The local protocol fixture did not become ready.' }
-  $serverUrl = "http://127.0.0.1:$((Get-Content -LiteralPath $fixturePort -Raw).Trim())"
+  $rejectFixtureProcess = Start-ProtocolFixture $rejectState $rejectPort -RejectStart
+  $rejectUrl = "http://127.0.0.1:$((Get-Content -LiteralPath $rejectPort -Raw).Trim())"
 
   $connectedProcess = Start-Boxy @('--session', $sessionPath)
   $connected = Wait-ServiceSelection $connectedProcess 45
   if (-not [string]::IsNullOrWhiteSpace((Get-ControlValue $connected.Input))) {
     throw 'The ordinary release filename unexpectedly prefilled the service URL on the connection run.'
   }
+  Set-ControlValue $connected.Input 'not-a-service-url'
+  Start-Sleep -Milliseconds 150
+  Invoke-Control $connected.Connect
+  $connected = Wait-ServiceError $connectedProcess 15
+  $invalidError = Get-SelectionError $connected
+  if ($invalidError -notmatch 'valid service URL') {
+    throw "An invalid URL did not produce the expected local validation error. UIA text: $invalidError"
+  }
+
+  Set-ControlValue $connected.Input $rejectUrl
+  Start-Sleep -Milliseconds 150
+  Invoke-Control $connected.Connect
+  $connected = Wait-ServiceError $connectedProcess 45
+  $startError = Get-SelectionError $connected
+  if ($startError -notmatch '503|fixture_start_rejected|status code|HTTP') {
+    throw "A failed operation start did not return an actionable error to the local chooser. UIA text: $startError"
+  }
+  $failedStart = Get-Content -LiteralPath $rejectState -Raw | ConvertFrom-Json
+  if ($failedStart.operationStartCount -ne 1) { throw 'The rejecting service did not receive exactly one start request.' }
+
+  $rejectFixtureProcess.Kill()
+  $rejectFixtureProcess.WaitForExit(5000) | Out-Null
+  $rejectFixtureProcess.Dispose()
+  $rejectFixtureProcess = $null
+
+  $fixtureProcess = Start-ProtocolFixture $fixtureState $fixturePort
+  $serverUrl = "http://127.0.0.1:$((Get-Content -LiteralPath $fixturePort -Raw).Trim())"
   Set-ControlValue $connected.Input $serverUrl
   Start-Sleep -Milliseconds 250
   Invoke-Control $connected.Connect
@@ -307,19 +388,23 @@ try {
   $appLocalDataAfter = Get-PathInventory $appLocalDataPath
   if ($appLocalDataBefore -cne $appLocalDataAfter) { throw 'The smoke run created or changed Tauri app-local data.' }
 
-  Write-Output 'Ordinary release opened a blank local chooser; invalid session was deferred until selection; the confirmed loopback service completed cloud UI and protocol-v3 receipt with normal cleanup.'
+  Write-Output 'Ordinary release opened a blank chooser; invalid session stayed untouched before selection; invalid URL and rejected start recovered after choosing the valid loopback service; protocol-v3 receipt and normal cleanup passed.'
 }
 finally {
+  $cleanupFailures = [System.Collections.Generic.List[string]]::new()
   if ($null -ne $invalidSessionLock) { $invalidSessionLock.Dispose() }
   foreach ($process in @($unselectedProcess, $connectedProcess)) {
     if ($null -eq $process) { continue }
     if (-not $process.HasExited) {
       Close-OwnedFileDialog ([uint32]$process.Id)
       if (-not $process.CloseMainWindow()) {
-        Write-Warning 'The failed smoke did not accept a normal close request; stopping only the test-owned process for cleanup.'
+        $cleanupFailures.Add("Boxy PID $($process.Id) did not accept a normal close request; terminated only this test-owned PID for cleanup.")
+        $process.Kill()
+      } elseif (-not $process.WaitForExit(30000)) {
+        $cleanupFailures.Add("Boxy PID $($process.Id) did not exit after normal close; terminated only this test-owned PID for cleanup.")
         $process.Kill()
       }
-      $process.WaitForExit(5000) | Out-Null
+      if (-not $process.HasExited) { $process.WaitForExit(5000) | Out-Null }
     }
     $process.Dispose()
   }
@@ -330,8 +415,26 @@ finally {
     }
     $fixtureProcess.Dispose()
   }
-  Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
+  if ($null -ne $rejectFixtureProcess) {
+    if (-not $rejectFixtureProcess.HasExited) {
+      $rejectFixtureProcess.Kill()
+      $rejectFixtureProcess.WaitForExit(5000) | Out-Null
+    }
+    $rejectFixtureProcess.Dispose()
+  }
+  $resolvedTempBase = [IO.Path]::GetFullPath($tempBase).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+  $resolvedTestRoot = [IO.Path]::GetFullPath($testRoot)
+  $testRootLeaf = [IO.Path]::GetFileName($resolvedTestRoot)
+  $testRootIsSafe = $resolvedTestRoot.StartsWith(
+    $resolvedTempBase + [IO.Path]::DirectorySeparatorChar,
+    [StringComparison]::OrdinalIgnoreCase
+  ) -and $testRootLeaf -match '^boxy-service-selection-[0-9a-f]{32}$'
+  if (-not $testRootIsSafe) {
+    throw 'Refusing to remove the smoke directory because its resolved path is outside the expected test-owned temp location.'
+  }
+  Remove-Item -LiteralPath $resolvedTestRoot -Recurse -Force -ErrorAction SilentlyContinue
   if (-not $normalUnselectedExit -or -not $normalConnectedExit) {
     Write-Output 'Smoke failed before both normal Boxy exits; only test-owned fixture resources were cleaned.'
   }
+  if ($cleanupFailures.Count -gt 0) { throw ($cleanupFailures -join ' ') }
 }
