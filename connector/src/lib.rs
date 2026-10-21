@@ -1488,8 +1488,16 @@ fn get_signed_poll<R: for<'de> Deserialize<'de>>(
             }
             Err(ureq::Error::Status(status, _)) if retryable_poll_status(status) => true,
             Err(ureq::Error::Transport(_)) => true,
-            Err(ureq::Error::Status(status, _)) => {
-                return Err(format!("authorization service rejected poll ({status})"));
+            Err(ureq::Error::Status(status, response)) => {
+                let mut detail = String::new();
+                let _ = response
+                    .into_reader()
+                    .take(4096)
+                    .read_to_string(&mut detail);
+                return Err(format!(
+                    "authorization service rejected poll ({status}): {}",
+                    detail.trim()
+                ));
             }
         };
         if retry {

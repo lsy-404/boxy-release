@@ -165,7 +165,13 @@ fn valid_hostname(candidate: &str) -> bool {
 }
 
 fn validate_service_url(value: &str) -> Result<String, String> {
-    let url = Url::parse(value.trim()).map_err(|_| "Enter a valid service URL.".to_string())?;
+    let value = value.trim();
+    let value = if value.contains("://") {
+        value.to_string()
+    } else {
+        format!("https://{value}")
+    };
+    let url = Url::parse(&value).map_err(|_| "Enter a valid service URL.".to_string())?;
     let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
     if url.scheme() != "https" && !(url.scheme() == "http" && local) {
         return Err("Use HTTPS unless the service is on this computer.".to_string());
