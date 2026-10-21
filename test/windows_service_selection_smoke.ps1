@@ -125,7 +125,7 @@ function Get-SelectionError($Selection) {
     )
   )
   foreach ($text in $texts) {
-    if ($text.Current.AutomationId -eq 'error' -or $text.Current.Name -match 'valid service URL|HTTPS|credentials|path, query|authorization service|rejected the request') {
+    if ($text.Current.AutomationId -eq 'error' -or $text.Current.Name -match 'valid service URL|Use HTTPS|credentials|path, query|authorization service|rejected the request') {
       if (-not [string]::IsNullOrWhiteSpace($text.Current.Name)) { $parts.Add($text.Current.Name) }
     }
   }
@@ -326,7 +326,7 @@ try {
   if (-not [string]::IsNullOrWhiteSpace((Get-ControlValue $connected.Input))) {
     throw 'The ordinary release filename unexpectedly prefilled the service URL on the connection run.'
   }
-  Set-ControlValue $connected.Input 'not-a-service-url'
+  Set-ControlValue $connected.Input 'not a service url'
   Start-Sleep -Milliseconds 150
   Invoke-Control $connected.Connect
   $connected = Wait-ServiceError $connectedProcess 15
