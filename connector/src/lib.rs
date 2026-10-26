@@ -12,7 +12,7 @@ pub use launch::{Config, LaunchOptions};
 use std::{
     collections::{BTreeMap, HashMap},
     env, fs,
-    io::Read,
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::mpsc,
@@ -584,7 +584,7 @@ fn execute_file_task(
                 .map_err(|e| e.to_string())
         }
         "fs.upload" | "fs.download" => {
-            transfer_file(config, key, connection, &root, protected, task, kind)
+            transfer_file(config, key, connection, &root, protected, task, kind, host)
         }
         _ => Err("unsupported_task".to_string()),
     }
@@ -612,10 +612,12 @@ fn transfer_file(
     protected: &Path,
     task: &RemoteTask,
     kind: &str,
+    host: &dyn ConnectorHost,
 ) -> Result<Value, String> {
     use std::io::Seek;
     let relative = task.params["path"].as_str().ok_or("invalid_params")?;
     let content_path = format!("{connection}/tasks/{}/content", task.id);
+    let progress_path = format!("{connection}/tasks/{}/progress", task.id);
     if kind == "fs.upload" {
         let expected_hash = task.params["expectedSha256"]
             .as_str()
@@ -630,15 +632,36 @@ fn transfer_file(
             file_tasks::verify_stream_file(root, protected, relative, expected_hash, expected_size)
                 .map_err(str::to_string)?;
         file.rewind().map_err(|error| error.to_string())?;
+        let mut progress = TransferProgress::new(
+            config,
+            key,
+            &progress_path,
+            "uploading",
+            Some(expected_size),
+        );
+        progress.report(0, true);
         let (nonce, signature) = request_signature(key, "POST", &content_path);
+        let mut reader = ProgressReader {
+            reader: file,
+            host,
+            progress: &mut progress,
+            completed: 0,
+        };
         let response = ureq::post(&format!("{}{}", config.server_url, content_path))
             .timeout(Duration::from_secs(120))
             .set("Content-Length", &expected_size.to_string())
             .set("X-Connector-Nonce", &nonce)
             .set("X-Connector-Signature", &signature)
-            .send(file);
+            .send(&mut reader);
+        let completed = reader.completed;
+        if host.should_stop() {
+            return Err("cancelled".to_string());
+        }
         match response {
-            Ok(_) => Ok(json!({"path":relative,"sha256":expected_hash,"size":expected_size})),
+            Ok(_) => {
+                progress.finish(completed);
+                Ok(json!({"path":relative,"sha256":expected_hash,"size":expected_size}))
+            }
             Err(ureq::Error::Status(status, response)) => Err(format!(
                 "content upload rejected ({status}): {}",
                 response.into_string().unwrap_or_default()
@@ -655,23 +678,62 @@ fn transfer_file(
         if expected_size.is_some_and(|size| size > max_bytes) {
             return Err("invalid_expected_size".to_string());
         }
+        if host.should_stop() {
+            return Err("cancelled".to_string());
+        }
+        let mut progress =
+            TransferProgress::new(config, key, &progress_path, "downloading", expected_size);
+        progress.report(0, true);
         let (nonce, signature) = request_signature(key, "GET", &content_path);
         let response = ureq::get(&format!("{}{}", config.server_url, content_path))
             .timeout(Duration::from_secs(120))
             .set("X-Connector-Nonce", &nonce)
             .set("X-Connector-Signature", &signature)
             .call()
-            .map_err(|error| format!("content download failed: {error}"))?;
+            .map_err(|error| {
+                if host.should_stop() {
+                    "cancelled".to_string()
+                } else {
+                    format!("content download failed: {error}")
+                }
+            })?;
+        let total_was_unknown = progress.total_bytes.is_none();
+        progress.total_bytes = progress.total_bytes.or_else(|| {
+            response
+                .header("Content-Length")
+                .and_then(|value| value.parse().ok())
+        });
+        if total_was_unknown && progress.total_bytes.is_some() {
+            progress.report(0, true);
+        }
         let mut temporary = tempfile::Builder::new()
             .prefix("boxy-download-")
             .tempfile()
             .map_err(|e| e.to_string())?;
-        let mut reader = response.into_reader().take(max_bytes.saturating_add(1));
-        let size =
-            std::io::copy(&mut reader, temporary.as_file_mut()).map_err(|e| e.to_string())?;
-        if size > max_bytes {
-            return Err("file_too_large".to_string());
+        let mut reader = response.into_reader();
+        let mut size = 0u64;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            if host.should_stop() {
+                return Err("cancelled".to_string());
+            }
+            let count = reader
+                .read(&mut buffer)
+                .map_err(|error| error.to_string())?;
+            if count == 0 {
+                break;
+            }
+            size = size.saturating_add(count as u64);
+            if size > max_bytes {
+                return Err("file_too_large".to_string());
+            }
+            temporary
+                .as_file_mut()
+                .write_all(&buffer[..count])
+                .map_err(|error| error.to_string())?;
+            progress.report(size, false);
         }
+        progress.finish(size);
         if expected_size.is_some_and(|expected| size != expected) {
             return Err("size_mismatch".to_string());
         }
@@ -691,6 +753,95 @@ fn transfer_file(
         file_tasks::install_stream_file(root, protected, relative, temporary, &hash, size)
             .map_err(str::to_string)?;
         Ok(json!({"path":relative,"sha256":hash,"size":size}))
+    }
+}
+
+struct TransferProgress<'a> {
+    config: &'a Config,
+    key: &'a SigningKey,
+    path: &'a str,
+    phase: &'static str,
+    total_bytes: Option<u64>,
+    last_report: Option<std::time::Instant>,
+}
+
+impl<'a> TransferProgress<'a> {
+    fn new(
+        config: &'a Config,
+        key: &'a SigningKey,
+        path: &'a str,
+        phase: &'static str,
+        total_bytes: Option<u64>,
+    ) -> Self {
+        Self {
+            config,
+            key,
+            path,
+            phase,
+            total_bytes,
+            last_report: None,
+        }
+    }
+
+    fn report(&mut self, completed_bytes: u64, force: bool) {
+        let now = std::time::Instant::now();
+        if !force
+            && self
+                .last_report
+                .is_some_and(|last| now.duration_since(last) < Duration::from_millis(500))
+        {
+            return;
+        }
+        let body = TransferProgressBody {
+            completed_bytes,
+            total_bytes: self.total_bytes,
+            phase: self.phase,
+        };
+        if let Ok(serialized) = serde_json::to_vec(&body) {
+            let (nonce, signature) = request_signature(self.key, "POST", self.path);
+            let _ = ureq::post(&format!("{}{}", self.config.server_url, self.path))
+                .timeout(Duration::from_secs(2))
+                .set("Content-Type", "application/json")
+                .set("X-Connector-Nonce", &nonce)
+                .set("X-Connector-Signature", &signature)
+                .send_bytes(&serialized);
+        }
+        self.last_report = Some(std::time::Instant::now());
+    }
+
+    fn finish(&mut self, completed_bytes: u64) {
+        if self.total_bytes.is_none() {
+            self.total_bytes = Some(completed_bytes);
+        }
+        self.report(completed_bytes, true);
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TransferProgressBody {
+    completed_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_bytes: Option<u64>,
+    phase: &'static str,
+}
+
+struct ProgressReader<'p, 'c, R> {
+    reader: R,
+    host: &'p dyn ConnectorHost,
+    progress: &'p mut TransferProgress<'c>,
+    completed: u64,
+}
+
+impl<R: Read> Read for ProgressReader<'_, '_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.host.should_stop() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+        }
+        let count = self.reader.read(buffer)?;
+        self.completed = self.completed.saturating_add(count as u64);
+        self.progress.report(self.completed, false);
+        Ok(count)
     }
 }
 

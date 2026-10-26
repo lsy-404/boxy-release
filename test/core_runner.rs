@@ -4,7 +4,10 @@ use serde_json::json;
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    },
 };
 
 #[derive(Default)]
@@ -40,6 +43,25 @@ impl ConnectorHost for TestHost {
     }
     fn should_stop(&self) -> bool {
         false
+    }
+}
+
+struct StopAfterChecks {
+    checks: AtomicUsize,
+    stop_after: usize,
+}
+
+impl ConnectorHost for StopAfterChecks {
+    fn open_editor(&self, _url: Url) -> Result<(), String> {
+        unreachable!()
+    }
+
+    fn approve_process(&self, _executable: &str, _args: &[String], _cwd: Option<&Path>) -> bool {
+        false
+    }
+
+    fn should_stop(&self) -> bool {
+        self.checks.fetch_add(1, Ordering::SeqCst) >= self.stop_after
     }
 }
 
@@ -234,6 +256,191 @@ fn awaiting_auth_task_is_rejected_before_execution_and_connection_closes() {
     .unwrap_err();
     assert!(error.contains("before authorization"));
     server.join().unwrap();
+}
+
+#[test]
+fn upload_reports_signed_progress_and_ignores_progress_endpoint_failures() {
+    let temp = tempfile::tempdir().unwrap();
+    let contents = b"generic upload";
+    std::fs::write(temp.path().join("upload.bin"), contents).unwrap();
+    let expected_hash = sha256_base64url(contents);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let verifier = key.verifying_key();
+    let server = thread::spawn(move || {
+        let (mut stream, request, body) = accept_json(&listener);
+        verify_signed(
+            &request,
+            "POST",
+            "/api/connections/conn/tasks/upload1/progress",
+            &verifier,
+        );
+        let progress: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(progress["phase"], "uploading");
+        assert_eq!(progress["completedBytes"], 0);
+        assert_eq!(progress["totalBytes"], contents.len());
+        respond(&mut stream, 503, &json!({"ignored":true}));
+
+        let (mut stream, request, body) = accept_json(&listener);
+        verify_signed(
+            &request,
+            "POST",
+            "/api/connections/conn/tasks/upload1/content",
+            &verifier,
+        );
+        assert_eq!(body, contents);
+        respond(&mut stream, 200, &json!({"accepted":true}));
+
+        let (mut stream, request, body) = accept_json(&listener);
+        verify_signed(
+            &request,
+            "POST",
+            "/api/connections/conn/tasks/upload1/progress",
+            &verifier,
+        );
+        let progress: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(progress["phase"], "uploading");
+        assert_eq!(progress["completedBytes"], contents.len());
+        assert_eq!(progress["totalBytes"], contents.len());
+        respond(&mut stream, 503, &json!({"ignored":true}));
+    });
+
+    let task = RemoteTask {
+        id: "upload1".into(),
+        kind: "fs.upload".into(),
+        params: json!({
+            "path":"upload.bin",
+            "expectedSha256":expected_hash,
+            "expectedSize":contents.len(),
+        }),
+    };
+    let host = TestHost::default();
+    let result = transfer_file(
+        &Config {
+            server_url: format!("http://{address}"),
+        },
+        &key,
+        "/api/connections/conn",
+        temp.path(),
+        Path::new(".boxy-no-protected-path"),
+        &task,
+        "fs.upload",
+        &host,
+    )
+    .unwrap();
+
+    assert_eq!(result["size"], contents.len());
+    server.join().unwrap();
+}
+
+#[test]
+fn download_reports_progress_and_stops_before_installing_a_partial_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let key = SigningKey::from_bytes(&[9; 32]);
+    let verifier = key.verifying_key();
+    let contents = vec![12; 16 * 1024];
+    let total_size = contents.len();
+    let server = thread::spawn(move || {
+        let (mut stream, request, body) = accept_json(&listener);
+        verify_signed(
+            &request,
+            "POST",
+            "/api/connections/conn/tasks/download1/progress",
+            &verifier,
+        );
+        let progress: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(progress["phase"], "downloading");
+        assert_eq!(progress["completedBytes"], 0);
+        assert!(progress.get("totalBytes").is_none());
+        respond(&mut stream, 200, &json!({"accepted":true}));
+
+        let (mut stream, request, _) = accept_json(&listener);
+        verify_signed(
+            &request,
+            "GET",
+            "/api/connections/conn/tasks/download1/content",
+            &verifier,
+        );
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {total_size}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        stream.write_all(&contents).unwrap();
+
+        let (mut stream, request, body) = accept_json(&listener);
+        verify_signed(
+            &request,
+            "POST",
+            "/api/connections/conn/tasks/download1/progress",
+            &verifier,
+        );
+        let progress: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(progress["phase"], "downloading");
+        assert_eq!(progress["completedBytes"], 0);
+        assert_eq!(progress["totalBytes"], total_size);
+        respond(&mut stream, 200, &json!({"accepted":true}));
+    });
+
+    let task = RemoteTask {
+        id: "download1".into(),
+        kind: "fs.download".into(),
+        params: json!({"path":"download.bin","maxBytes":65536}),
+    };
+    let host = StopAfterChecks {
+        checks: AtomicUsize::new(0),
+        stop_after: 2,
+    };
+    let error = transfer_file(
+        &Config {
+            server_url: format!("http://{address}"),
+        },
+        &key,
+        "/api/connections/conn",
+        temp.path(),
+        Path::new(".boxy-no-protected-path"),
+        &task,
+        "fs.download",
+        &host,
+    )
+    .unwrap_err();
+
+    assert_eq!(error, "cancelled");
+    assert!(!temp.path().join("download.bin").exists());
+    server.join().unwrap();
+}
+
+#[test]
+fn upload_reader_checks_cancellation_before_reading_the_source() {
+    let key = SigningKey::from_bytes(&[11; 32]);
+    let config = Config {
+        server_url: "http://127.0.0.1:1".into(),
+    };
+    let host = StopAfterChecks {
+        checks: AtomicUsize::new(0),
+        stop_after: 0,
+    };
+    let mut progress = TransferProgress::new(
+        &config,
+        &key,
+        "/api/connections/conn/tasks/upload/progress",
+        "uploading",
+        Some(6),
+    );
+    let mut reader = ProgressReader {
+        reader: std::io::Cursor::new(b"source"),
+        host: &host,
+        progress: &mut progress,
+        completed: 0,
+    };
+    let error = reader.read(&mut [0; 6]).unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+    assert_eq!(reader.reader.position(), 0);
+    assert_eq!(reader.completed, 0);
 }
 
 fn accept_json(listener: &TcpListener) -> (TcpStream, String, Vec<u8>) {
