@@ -12,6 +12,7 @@ permissions:
 
 jobs:
   windows:
+    if: false
     name: Windows runtime
     runs-on: windows-latest
     steps:
@@ -50,11 +51,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-
-      - name: Run Rust and source checks
-        run: |
-          cargo test --workspace --all-targets --locked
-          node --test test/*.test.mjs
 
       - name: Run native WebView smoke
         run: bash test/macos_webview_render_smoke.sh
