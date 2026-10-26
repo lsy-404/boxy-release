@@ -1,2480 +1,1448 @@
-mod assets;
-mod device_ids;
-mod device_info;
 mod file_tasks;
-mod host_block;
 mod http_request;
 mod launch;
-pub mod local_images;
+pub mod local_resources;
 mod mounts;
-mod network_block;
-mod product_database;
-mod progress;
 pub(crate) mod request_trace;
-mod session_io;
-#[cfg(windows)]
-mod windows_firewall;
 #[cfg(windows)]
 mod windows_process;
-#[cfg(windows)]
-mod windows_tray;
 
-pub use launch::LaunchOptions;
+pub use launch::{Config, LaunchOptions};
 
 use std::{
-    env,
-    fs::{self, File},
-    io::{Read, Write},
+    collections::{BTreeMap, HashMap},
+    env, fs,
+    io::Read,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
+    sync::mpsc,
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::{Signer, SigningKey};
+use notify::{RecursiveMode, Watcher};
 use rand_core::{OsRng, RngCore};
-use request_trace::UpstreamAttempt;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
-const MAX_SESSION_BYTES: usize = 1024 * 1024;
-const MAX_DIRECTORY_ENTRIES: usize = 100_000;
-const MAX_START_REQUEST_BYTES: usize = (4 * 1024 * 1024 + 2) / 3 + 16 * 1024;
-const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
-const MAX_COMMAND_SECONDS: u64 = 3600;
-const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const MAX_POLL_RETRIES: u32 = 5;
-const MAX_RECEIPT_RETRIES: u32 = 5;
-const POLL_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
-const POLL_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
-const CONNECTOR_PROTOCOL_VERSION: u8 = 3;
-const REQUEST_PATH: &str = "/api/v2/connector/operations";
-
-#[derive(Debug)]
-pub struct Config {
-    pub server_url: String,
-    pub session_path: PathBuf,
-}
+const PROTOCOL_VERSION: u8 = 4;
+const CONNECT_PATH: &str = "/api/connect";
+const MAX_TASK_BYTES: usize = 4 * 1024 * 1024;
+const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_PROCESS_SECONDS: u64 = 3600;
+const POLL_DELAY: Duration = Duration::from_millis(900);
 
 pub trait ConnectorHost: Send + Sync {
     fn open_editor(&self, url: Url) -> Result<(), String>;
-    fn approve_command(&self, command: &str, shell: &str, cwd: &Path) -> bool;
+    fn approve_process(&self, executable: &str, args: &[String], cwd: Option<&Path>) -> bool;
     fn should_stop(&self) -> bool;
+    fn set_resource_root(&self, _root: &Path) {}
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ConnectorStartRequest {
+struct Hello<'a> {
     protocol_version: u8,
+    client_version: &'static str,
+    platform: &'static str,
     capabilities: Vec<&'static str>,
-    ciphertext: String,
-    source_sha256: String,
-    machine: MachineReport,
-    device_public_key: String,
-    connector_version: String,
-    directory_manifest: Vec<DirectoryEntry>,
-    installed_applications: Vec<String>,
-    device_name: String,
-    device_info: device_info::DeviceInfo,
-    server_translations: Vec<assets::ServerTranslationCatalog>,
-    session_path: String,
+    public_key: &'a str,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct DirectoryEntry {
-    path: String,
-    size: u64,
-    sha256: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ConnectorReceipt {
-    source_sha256: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    written_sha256: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    observed_sha256: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MachineReport {
-    platform: String,
-    machine_material: String,
-    details: DeviceDetails,
-    is_virtual_machine: bool,
-    hardware_device_id: String,
-    sv_device_hash: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DeviceDetails {
-    operating_system: String,
-    architecture: String,
-    model: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ConnectorStartResponse {
-    protocol_version: Option<u8>,
-    operation_id: String,
+struct ConnectResponse {
+    protocol_version: u8,
+    connection_id: String,
     browser_url: String,
+    expires_at: String,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ConnectorOperationResponse {
-    protocol_version: Option<u8>,
+struct PollResponse {
+    protocol_version: u8,
     state: String,
-    ciphertext: Option<String>,
-    source_sha256: Option<String>,
-    expires_at: Option<String>,
     #[serde(default)]
-    directory_tasks: Vec<DirectoryTask>,
+    tasks: Vec<RemoteTask>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct DirectoryTask {
+struct RemoteTask {
     id: String,
     kind: String,
-    relative_path: Option<String>,
-    expected_sha256: Option<String>,
-    #[serde(default)]
-    expected_size: Option<u64>,
-    #[serde(default)]
-    command: Option<String>,
-    #[serde(default)]
-    shell: Option<String>,
-    #[serde(default)]
-    cwd: Option<String>,
-    #[serde(default)]
-    timeout_seconds: Option<u64>,
-    #[serde(default)]
-    blocked: Option<bool>,
-    #[serde(default)]
-    mode: Option<String>,
-    #[serde(default)]
-    items: Vec<product_database::FetchItem>,
-    #[serde(default)]
-    product_id: Option<String>,
-    #[serde(default)]
-    expected_session_sha256: Option<String>,
-    #[serde(default)]
-    request: Option<http_request::HttpRequestSpec>,
-    #[serde(default)]
-    paths: Vec<String>,
-    #[serde(default)]
-    max_file_bytes: Option<usize>,
-    #[serde(default)]
-    max_total_bytes: Option<usize>,
-    #[serde(default)]
-    action: Option<String>,
-    #[serde(default)]
-    files: Vec<file_tasks::WriteFileTaskEntry>,
-    #[serde(default)]
-    moves: Vec<file_tasks::MoveEntry>,
-    #[serde(default)]
-    removals: Vec<file_tasks::RemovalEntry>,
-    #[serde(default)]
-    mount: Option<mounts::MountSpec>,
-    #[serde(default)]
-    ranges: Vec<file_tasks::RangeReadTaskEntry>,
-    #[serde(default)]
-    patches: Vec<file_tasks::FilePatchTaskEntry>,
+    params: Value,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SessionSnapshotAck {
-    state: String,
-    source_sha256: Option<String>,
-}
-
-impl Drop for DirectoryTask {
+impl Drop for RemoteTask {
     fn drop(&mut self) {
-        if let Some(request) = self.request.take() {
-            drop(request);
-        }
-        for file in &mut self.files {
-            zeroize::Zeroize::zeroize(&mut file.content_base64);
-        }
-        for item in &mut self.items {
-            item.url.zeroize();
-            if let Some(files) = &mut item.files {
-                for file in files {
-                    file.url.zeroize();
-                }
-            }
-        }
-        self.mount.take();
+        zeroize_json(&mut self.params);
     }
-}
-
-pub fn run_elevated_if_requested() -> Option<i32> {
-    if let Some(code) = host_block::run_elevated_host_block_if_requested() {
-        return Some(code);
-    }
-    #[cfg(windows)]
-    if let Some(code) = windows_firewall::run_elevated_if_requested() {
-        return Some(code);
-    }
-    #[cfg(windows)]
-    if let Some(code) = network_block::run_elevated_if_requested() {
-        return Some(code);
-    }
-    None
 }
 
 pub fn prepare_config() -> Result<LaunchOptions, String> {
-    LaunchOptions::from_environment_and_args(session_io::default_session_path())
+    LaunchOptions::from_environment_and_args()
 }
 
-pub fn resolve_config(launch: &LaunchOptions, server_url: &str) -> Result<Config, String> {
-    let server_url = launch::validate_selected_service_url(server_url)?;
-    let session_path =
-        launch::resolve_session_path(launch.session_path.clone(), launch.session_path_explicit)?;
+pub fn resolve_config(_launch: &LaunchOptions, server_url: &str) -> Result<Config, String> {
     Ok(Config {
-        server_url,
-        session_path,
+        server_url: launch::validate_service_url(server_url)?,
     })
+}
+
+pub fn run_elevated_if_requested() -> Option<i32> {
+    #[cfg(windows)]
+    {
+        let mut arguments = env::args_os();
+        arguments.next();
+        if arguments.next()?.to_string_lossy() != "--elevated-exec" {
+            return None;
+        }
+        let encoded = arguments.next()?;
+        if arguments.next().is_some() {
+            return Some(1);
+        }
+        let bytes = URL_SAFE_NO_PAD
+            .decode(encoded.to_string_lossy().as_bytes())
+            .ok()?;
+        let request: ElevatedRequest = serde_json::from_slice(&bytes).ok()?;
+        return Some(match run_elevated_child(request) {
+            Ok(()) => 0,
+            Err(_) => 1,
+        });
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
 }
 
 pub fn run_connected(config: &Config, host: &dyn ConnectorHost) -> Result<(), String> {
     if host.should_stop() {
         return Ok(());
     }
-    let ciphertext = read_session_ciphertext(&config.session_path)?;
-    let source_sha256 = sha256_base64url(&ciphertext);
-    let machine = machine_report()?;
-    let device_key = new_device_signing_key();
-    let root = sv2_root(&config.session_path)?;
-    let mut mount_manager =
-        mounts::MountManager::new(&root, &config.session_path, &config.server_url);
-    let mut capabilities = vec![
-        "file_stream_v1",
-        "file_move_v1",
-        "file_remove_v1",
-        "file_manifest_v1",
-        "file_range_v1",
-        "file_patch_v1",
-    ];
-    if mount_manager.capability_available() {
-        capabilities.push("file_mount_v1");
-    }
-    let mut request = ConnectorStartRequest {
-        protocol_version: CONNECTOR_PROTOCOL_VERSION,
-        capabilities,
-        ciphertext: URL_SAFE_NO_PAD.encode(&ciphertext),
-        source_sha256: source_sha256.clone(),
-        machine,
-        device_public_key: URL_SAFE_NO_PAD.encode(device_key.verifying_key().as_bytes()),
-        connector_version: env!("CARGO_PKG_VERSION").to_string(),
-        directory_manifest: directory_manifest(&root, &mount_manager.active_paths())?,
-        installed_applications: installed_applications(),
-        device_name: sanitized_device_name(),
-        device_info: device_info::collect(),
-        server_translations: assets::server_translations(&config.session_path),
-        session_path: config.session_path.to_string_lossy().into_owned(),
+    let key = SigningKey::generate(&mut OsRng);
+    let public_key = URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes());
+    let hello = Hello {
+        protocol_version: PROTOCOL_VERSION,
+        client_version: env!("CARGO_PKG_VERSION"),
+        platform: platform_name(),
+        capabilities: capabilities(),
+        public_key: &public_key,
     };
-    let mut request_bytes = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
-    if request_bytes.len() > MAX_START_REQUEST_BYTES && !request.server_translations.is_empty() {
-        request.server_translations.clear();
-        request_bytes = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
+    let connected: ConnectResponse = post_json(config, CONNECT_PATH, &hello)?;
+    if connected.protocol_version != PROTOCOL_VERSION
+        || connected.connection_id.is_empty()
+        || !connected
+            .connection_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("service returned an incomplete connection response".to_string());
     }
-    if request_bytes.len() > MAX_START_REQUEST_BYTES {
-        return Err(
-            "SV2 data directory metadata exceeds the authorization service request limit; no partial directory manifest was sent"
-                .to_string(),
-        );
+    let expires_at = time::OffsetDateTime::parse(
+        &connected.expires_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .map_err(|_| "service returned an invalid connection expiry".to_string())?;
+    if expires_at <= time::OffsetDateTime::now_utc() {
+        return Err("service connection response has expired".to_string());
     }
-    let response =
-        post_json::<_, ConnectorStartResponse>(&config.server_url, REQUEST_PATH, &request)?;
-    require_protocol_v3(response.protocol_version)?;
-    if response.operation_id.is_empty() || response.browser_url.is_empty() {
-        return Err("authorization service returned an incomplete pairing response".to_string());
+    let browser = validate_browser_url(&config.server_url, &connected.browser_url)?;
+    host.open_editor(browser)?;
+    run_connection(config, &connected.connection_id, &key, host)
+}
+
+fn platform_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        "macos"
     }
-    let browser_url = validate_browser_url(&config.server_url, &response.browser_url)?;
-    host.open_editor(browser_url)?;
-    wait_for_writeback(
+}
+
+fn capabilities() -> Vec<&'static str> {
+    let mut result = vec![
+        "process.exec",
+        "fs.read",
+        "fs.write",
+        "fs.list",
+        "fs.read_ranges",
+        "fs.patch",
+        "fs.move",
+        "fs.remove",
+        "fs.upload",
+        "fs.download",
+        "fs.watch",
+        "http.request",
+    ];
+    if cfg!(any(target_os = "windows", target_os = "macos")) {
+        result.extend(["fs.mount", "fs.unmount"]);
+    }
+    result
+}
+
+#[cfg(test)]
+pub(crate) fn hello_body(
+    platform: &'static str,
+    capabilities: Vec<&'static str>,
+    public_key: &str,
+) -> Result<Value, String> {
+    serde_json::to_value(Hello {
+        protocol_version: PROTOCOL_VERSION,
+        client_version: env!("CARGO_PKG_VERSION"),
+        platform,
+        capabilities,
+        public_key,
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn run_connection(
+    config: &Config,
+    id: &str,
+    key: &SigningKey,
+    host: &dyn ConnectorHost,
+) -> Result<(), String> {
+    let base = format!("/api/connections/{id}");
+    let mut watches = HashMap::<
+        String,
+        (
+            notify::RecommendedWatcher,
+            mpsc::Receiver<notify::Result<notify::Event>>,
+            PathBuf,
+        ),
+    >::new();
+    let mut mounts = HashMap::<PathBuf, mounts::MountManager>::new();
+    let result = (|| loop {
+        if host.should_stop() {
+            break Ok(());
+        }
+        let poll: PollResponse = get_signed(config, &base, key, host)?;
+        if poll.protocol_version != PROTOCOL_VERSION {
+            break Err("service protocol version is not supported".to_string());
+        }
+        match poll.state.as_str() {
+            "awaiting_auth" => {
+                if !poll.tasks.is_empty() {
+                    break Err("service sent executor tasks before authorization".to_string());
+                }
+                if wait_or_stop(host, POLL_DELAY) {
+                    break Ok(());
+                }
+            }
+            "ready" => {
+                if poll.tasks.len() > 1 {
+                    break Err("service returned more than one pending task".to_string());
+                }
+                send_watch_events(config, &base, key, &mut watches)?;
+                if let Some(task) = poll.tasks.into_iter().next() {
+                    if task.id.is_empty()
+                        || !task
+                            .id
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                    {
+                        break Err("service returned an invalid task id".to_string());
+                    }
+                    let path = format!("{base}/tasks/{}", task.id);
+                    let body = if serde_json::to_vec(&task.params)
+                        .map_or(true, |bytes| bytes.len() > MAX_TASK_BYTES)
+                    {
+                        json!({"ok": false, "error": "task_too_large"})
+                    } else if let Err(error) = validate_task(&task.kind, &task.params) {
+                        json!({"ok": false, "error": error})
+                    } else {
+                        match execute_task(
+                            config,
+                            key,
+                            &base,
+                            &task,
+                            host,
+                            &mut watches,
+                            &mut mounts,
+                        ) {
+                            Ok(result) if task_result_succeeded(&task.kind, &result) => {
+                                json!({"ok": true, "result": result})
+                            }
+                            Ok(result) => {
+                                json!({"ok": false, "error": "operation_failed", "result": result})
+                            }
+                            Err(error) => json!({"ok": false, "error": error}),
+                        }
+                    };
+                    post_receipt(config, key, &format!("{path}/receipt"), &body, host)?;
+                } else if wait_or_stop(host, POLL_DELAY) {
+                    break Ok(());
+                }
+            }
+            "denied" if poll.tasks.is_empty() => break Err("service access was denied".to_string()),
+            "expired" if poll.tasks.is_empty() => {
+                break Err("service connection has expired".to_string())
+            }
+            "closed" if poll.tasks.is_empty() => break Ok(()),
+            _ => break Err("service returned an unknown connection state".to_string()),
+        }
+    })();
+    watches.clear();
+    let close = post_signed(
         config,
-        &device_key,
-        &response.operation_id,
-        &source_sha256,
-        &mut mount_manager,
-        host,
-    )?;
+        &format!("{base}/close"),
+        key,
+        &json!({"closed": true}),
+    );
+    result.and(close)
+}
+
+pub(crate) fn validate_task(kind: &str, params: &Value) -> Result<(), String> {
+    let object = params
+        .as_object()
+        .ok_or_else(|| "invalid_params".to_string())?;
+    let required: &[&str] = match kind {
+        "process.exec" => &["executable", "args"],
+        "fs.read" => &["root", "paths", "maxFileBytes", "maxTotalBytes"],
+        "fs.write" => &["root", "files"],
+        "fs.list" => &["root", "paths"],
+        "fs.read_ranges" => &["root", "ranges"],
+        "fs.patch" => &["root", "patches"],
+        "fs.move" => &["root", "moves"],
+        "fs.remove" => &["root", "removals"],
+        "fs.upload" => &["root", "path", "expectedSha256", "expectedSize"],
+        "fs.download" => &["root", "path", "maxBytes"],
+        "fs.watch" => &["root", "path", "watchId"],
+        "fs.mount" | "fs.unmount" => &["root", "mount"],
+        "http.request" => &[
+            "method",
+            "url",
+            "responseEncoding",
+            "maxResponseBytes",
+            "timeoutMs",
+        ],
+        _ => return Err("unsupported_task".to_string()),
+    };
+    if required.iter().any(|key| !object.contains_key(*key)) {
+        return Err("invalid_params".to_string());
+    }
+    let allowed: &[&str] = match kind {
+        "process.exec" => &[
+            "executable",
+            "args",
+            "cwd",
+            "env",
+            "timeoutSeconds",
+            "maxOutputBytes",
+            "elevated",
+        ],
+        "fs.read" => &[
+            "root",
+            "protectedPath",
+            "paths",
+            "maxFileBytes",
+            "maxTotalBytes",
+        ],
+        "fs.write" => &["root", "protectedPath", "files"],
+        "fs.list" => &["root", "protectedPath", "paths"],
+        "fs.read_ranges" => &["root", "protectedPath", "ranges"],
+        "fs.patch" => &["root", "protectedPath", "patches"],
+        "fs.move" => &["root", "protectedPath", "moves"],
+        "fs.remove" => &["root", "protectedPath", "removals"],
+        "fs.upload" => &[
+            "root",
+            "protectedPath",
+            "path",
+            "expectedSha256",
+            "expectedSize",
+        ],
+        "fs.download" => &[
+            "root",
+            "protectedPath",
+            "path",
+            "maxBytes",
+            "expectedSize",
+            "expectedSha256",
+        ],
+        "fs.watch" => &["root", "path", "watchId", "recursive"],
+        "fs.mount" | "fs.unmount" => &["root", "protectedPath", "mount"],
+        "http.request" => &[
+            "method",
+            "url",
+            "headers",
+            "body",
+            "responseEncoding",
+            "maxResponseBytes",
+            "timeoutMs",
+        ],
+        _ => return Err("unsupported_task".to_string()),
+    };
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err("invalid_params".to_string());
+    }
+    if let Some(root) = object.get("root") {
+        if !root
+            .as_str()
+            .is_some_and(|value| Path::new(value).is_absolute())
+        {
+            return Err("invalid_root".to_string());
+        }
+    }
+    if let Some(protected) = object.get("protectedPath") {
+        if !protected.is_null() && !protected.is_string() {
+            return Err("invalid_params".to_string());
+        }
+    }
+    if kind == "process.exec" {
+        let executable = object["executable"].as_str().ok_or("invalid_params")?;
+        let args: Vec<String> =
+            serde_json::from_value(object["args"].clone()).map_err(|_| "invalid_params")?;
+        if executable.is_empty()
+            || executable.contains('\0')
+            || args.len() > 256
+            || executable
+                .len()
+                .saturating_add(args.iter().map(String::len).sum::<usize>())
+                > 64 * 1024
+        {
+            return Err("invalid_params".to_string());
+        }
+        if object
+            .get("cwd")
+            .is_some_and(|value| !value.is_string() && !value.is_null())
+            || object
+                .get("elevated")
+                .is_some_and(|value| !value.is_boolean())
+            || object
+                .get("timeoutSeconds")
+                .is_some_and(|value| !value.is_u64())
+            || object
+                .get("maxOutputBytes")
+                .is_some_and(|value| !value.is_u64())
+        {
+            return Err("invalid_params".to_string());
+        }
+        if let Some(environment) = object.get("env") {
+            if !environment.is_object() || environment.as_object().unwrap().len() > 64 {
+                return Err("invalid_environment".to_string());
+            }
+            for (name, value) in environment.as_object().unwrap() {
+                if name.is_empty()
+                    || name.contains(['=', '\0'])
+                    || !value.is_string()
+                    || value.as_str().unwrap().contains('\0')
+                {
+                    return Err("invalid_environment".to_string());
+                }
+            }
+        }
+    }
     Ok(())
 }
 
-fn new_device_signing_key() -> SigningKey {
-    SigningKey::generate(&mut OsRng)
-}
-
-fn require_protocol_v3(version: Option<u8>) -> Result<(), String> {
-    if version == Some(CONNECTOR_PROTOCOL_VERSION) {
-        Ok(())
-    } else {
-        Err("authorization service protocol is not supported; update the connector and service together".to_string())
+pub(crate) fn task_result_succeeded(kind: &str, result: &Value) -> bool {
+    if kind == "http.request" {
+        return result.get("error").is_none_or(Value::is_null);
     }
-}
-
-fn sanitized_device_name() -> String {
-    sanitize_device_name(
-        &sysinfo::System::host_name()
-            .or_else(|| env::var("COMPUTERNAME").ok())
-            .unwrap_or_default(),
-    )
-}
-
-fn sanitize_device_name(value: &str) -> String {
-    value
-        .chars()
-        .filter(|character| !character.is_control())
-        .take(512)
-        .collect()
-}
-
-fn wait_for_writeback(
-    config: &Config,
-    device_key: &SigningKey,
-    operation_id: &str,
-    expected_source_sha256: &str,
-    mount_manager: &mut mounts::MountManager,
-    host: &dyn ConnectorHost,
-) -> Result<(), String> {
-    let path = format!("/api/v2/connector/operations/{operation_id}");
-    let mut last_reported_sha256 = expected_source_sha256.to_string();
-    loop {
-        if host.should_stop() {
-            return Ok(());
-        }
-        match report_session_change(
-            config,
-            device_key,
-            operation_id,
-            &last_reported_sha256,
-            mount_manager,
-        ) {
-            Ok(SessionWatchResult::Unchanged) | Ok(SessionWatchResult::WritebackPending) => {}
-            Ok(SessionWatchResult::Accepted(source_sha256)) => {
-                last_reported_sha256 = source_sha256;
-            }
-            Err(_) => {
-                if wait_or_stop(host, Duration::from_secs(2)) {
-                    return Ok(());
-                }
-                continue;
-            }
-        }
-        let Some(response) = get_signed_poll::<ConnectorOperationResponse>(
-            &config.server_url,
-            &path,
-            device_key,
-            host,
-        )?
-        else {
-            return Ok(());
-        };
-        require_protocol_v3(response.protocol_version)?;
-        match response.state.as_str() {
-            "waiting" | "editor_active" | "temporary_pending_activation" => {
-                if host.should_stop() {
-                    return Ok(());
-                }
-                if let Some(task) = response.directory_tasks.into_iter().next() {
-                    if host.should_stop() {
-                        return Ok(());
-                    }
-                    execute_directory_task_with_mounts(
-                        config,
-                        device_key,
-                        operation_id,
-                        &task,
-                        &mut last_reported_sha256,
-                        mount_manager,
-                        host,
-                    )?;
-                    continue;
-                }
-                if wait_or_stop(host, Duration::from_secs(2)) {
-                    return Ok(());
-                }
-            }
-            "ready_for_writeback" => {
-                let ciphertext = response
-                    .ciphertext
-                    .ok_or_else(|| "writeback response has no ciphertext".to_string())?;
-                let source_sha256 = response
-                    .source_sha256
-                    .ok_or_else(|| "writeback response has no source hash".to_string())?;
-                let expires_at = response
-                    .expires_at
-                    .ok_or_else(|| "writeback response has no expiry".to_string())?
-                    .parse::<u128>()
-                    .map_err(|_| "writeback expiry is invalid".to_string())?;
-                if expires_at <= unix_timestamp_millis() {
-                    return Err("writeback response has expired".to_string());
-                }
-                let ciphertext = URL_SAFE_NO_PAD
-                    .decode(ciphertext)
-                    .map_err(|_| "writeback ciphertext is invalid".to_string())?;
-                let current = read_session_ciphertext(&config.session_path)?;
-                if sha256_base64url(&current) != source_sha256 {
-                    let observed_sha256 = sha256_base64url(&current);
-                    let conflict = ConnectorReceipt {
-                        source_sha256,
-                        written_sha256: None,
-                        error: Some("source_changed"),
-                        observed_sha256: Some(observed_sha256.clone()),
-                    };
-                    let (receipt_status, body) = post_signed_json_status(
-                        &config.server_url,
-                        &format!("{path}/receipt"),
-                        device_key,
-                        &conflict,
-                    )?;
-                    let ack: SessionSnapshotAck = serde_json::from_value(body)
-                        .map_err(|_| "writeback conflict acknowledgement is invalid".to_string())?;
-                    if receipt_status != 200
-                        || ack.state != "writeback_conflict"
-                        || ack.source_sha256.as_deref() != Some(observed_sha256.as_str())
-                    {
-                        return Err("writeback conflict was not accepted".to_string());
-                    }
-                    match submit_session_snapshot_with_mounts(
-                        config,
-                        device_key,
-                        operation_id,
-                        &current,
-                        mount_manager,
-                    )? {
-                        SessionWatchResult::Accepted(source_sha256) => {
-                            last_reported_sha256 = source_sha256;
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
-                let written_sha256 = match replace_session_if_unchanged(
-                    &config.session_path,
-                    &source_sha256,
-                    &ciphertext,
-                ) {
-                    Ok(hash) => hash,
-                    Err(_) => {
-                        let current = read_session_ciphertext(&config.session_path)?;
-                        let observed_sha256 = sha256_base64url(&current);
-                        if observed_sha256 == source_sha256 {
-                            return Err("the updated session could not be written".to_string());
-                        }
-                        let conflict = ConnectorReceipt {
-                            source_sha256,
-                            written_sha256: None,
-                            error: Some("source_changed"),
-                            observed_sha256: Some(observed_sha256.clone()),
-                        };
-                        let (receipt_status, body) = post_signed_json_status(
-                            &config.server_url,
-                            &format!("{path}/receipt"),
-                            device_key,
-                            &conflict,
-                        )?;
-                        let ack: SessionSnapshotAck =
-                            serde_json::from_value(body).map_err(|_| {
-                                "writeback conflict acknowledgement is invalid".to_string()
-                            })?;
-                        if receipt_status != 200
-                            || ack.state != "writeback_conflict"
-                            || ack.source_sha256.as_deref() != Some(observed_sha256.as_str())
-                        {
-                            return Err("writeback conflict was not accepted".to_string());
-                        }
-                        match submit_session_snapshot_with_mounts(
-                            config,
-                            device_key,
-                            operation_id,
-                            &current,
-                            mount_manager,
-                        )? {
-                            SessionWatchResult::Accepted(source_sha256) => {
-                                last_reported_sha256 = source_sha256;
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-                };
-                let receipt = ConnectorReceipt {
-                    source_sha256,
-                    written_sha256: Some(written_sha256.clone()),
-                    error: None,
-                    observed_sha256: None,
-                };
-                let (receipt_status, body) = post_signed_json_status(
-                    &config.server_url,
-                    &format!("{path}/receipt"),
-                    device_key,
-                    &receipt,
-                )?;
-                let ack: SessionSnapshotAck = serde_json::from_value(body)
-                    .map_err(|_| "writeback acknowledgement is invalid".to_string())?;
-                if receipt_status != 200
-                    || ack.state != "writeback_completed"
-                    || ack.source_sha256.as_deref() != Some(written_sha256.as_str())
-                {
-                    return Err("writeback completion was not accepted".to_string());
-                }
-                last_reported_sha256 = written_sha256;
-                continue;
-            }
-            "expired" | "rejected" => {
-                return Err("the authorization operation is no longer available".to_string())
-            }
-            _ => {
-                return Err("authorization service returned an unknown operation state".to_string())
-            }
-        }
+    if kind == "process.exec" {
+        return result.get("approved").and_then(Value::as_bool) == Some(true);
     }
-}
-
-fn wait_or_stop(host: &dyn ConnectorHost, duration: Duration) -> bool {
-    let deadline = std::time::Instant::now() + duration;
-    while !host.should_stop() {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return false;
-        }
-        thread::sleep(remaining.min(COMMAND_POLL_INTERVAL));
+    if let Some(files) = result.get("files").and_then(Value::as_array) {
+        return result.get("failed").and_then(Value::as_bool) != Some(true)
+            && files.iter().all(|file| {
+                file.get("error").is_none_or(Value::is_null)
+                    && file.get("ok").and_then(Value::as_bool) != Some(false)
+            });
     }
     true
 }
 
-enum SessionWatchResult {
-    Unchanged,
-    Accepted(String),
-    WritebackPending,
-}
-
-fn report_session_change(
-    config: &Config,
-    device_key: &SigningKey,
-    operation_id: &str,
-    last_reported_sha256: &str,
-    mount_manager: &mounts::MountManager,
-) -> Result<SessionWatchResult, String> {
-    let ciphertext = read_session_ciphertext(&config.session_path)?;
-    let source_sha256 = sha256_base64url(&ciphertext);
-    if source_sha256 == last_reported_sha256 {
-        return Ok(SessionWatchResult::Unchanged);
-    }
-    submit_session_snapshot_with_mounts(
-        config,
-        device_key,
-        operation_id,
-        &ciphertext,
-        mount_manager,
-    )
-}
-
-fn submit_session_snapshot_with_mounts(
-    config: &Config,
-    device_key: &SigningKey,
-    operation_id: &str,
-    ciphertext: &[u8],
-    mount_manager: &mounts::MountManager,
-) -> Result<SessionWatchResult, String> {
-    let source_sha256 = sha256_base64url(ciphertext);
-    let root = sv2_root(&config.session_path)?;
-    let directory_manifest = directory_manifest(&root, &mount_manager.active_paths())?;
-    let body = serde_json::json!({
-        "ciphertext": URL_SAFE_NO_PAD.encode(ciphertext),
-        "sourceSha256": source_sha256,
-        "directoryManifest": directory_manifest,
-    });
-    post_session_snapshot(config, device_key, operation_id, &source_sha256, &body)
-}
-
-#[cfg(test)]
-fn submit_session_snapshot(
-    config: &Config,
-    device_key: &SigningKey,
-    operation_id: &str,
-    ciphertext: &[u8],
-) -> Result<SessionWatchResult, String> {
-    let source_sha256 = sha256_base64url(ciphertext);
-    let body = serde_json::json!({
-        "ciphertext": URL_SAFE_NO_PAD.encode(ciphertext),
-        "sourceSha256": source_sha256,
-    });
-    post_session_snapshot(config, device_key, operation_id, &source_sha256, &body)
-}
-
-fn post_session_snapshot(
-    config: &Config,
-    device_key: &SigningKey,
-    operation_id: &str,
-    source_sha256: &str,
-    body: &serde_json::Value,
-) -> Result<SessionWatchResult, String> {
-    let path = format!("/api/v2/connector/operations/{operation_id}/session-snapshot");
-    let (status, value) = post_signed_json_status(&config.server_url, &path, device_key, &body)?;
-    if status == 409 {
-        return Ok(SessionWatchResult::WritebackPending);
-    }
-    let ack: SessionSnapshotAck = serde_json::from_value(value)
-        .map_err(|_| "session snapshot acknowledgement is invalid".to_string())?;
-    if status == 200
-        && ack.state == "accepted"
-        && ack.source_sha256.as_deref() == Some(source_sha256)
-    {
-        return Ok(SessionWatchResult::Accepted(source_sha256.to_string()));
-    }
-    Err("session snapshot was not accepted".to_string())
-}
-
-fn read_session_ciphertext(path: &Path) -> Result<Vec<u8>, String> {
-    let ciphertext =
-        fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    if ciphertext.is_empty()
-        || ciphertext.len() > MAX_SESSION_BYTES
-        || !ciphertext.len().is_multiple_of(8)
-    {
-        return Err("session ciphertext has an invalid size".to_string());
-    }
-    Ok(ciphertext)
-}
-
-fn sv2_root(session_path: &Path) -> Result<PathBuf, String> {
-    session_path
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .ok_or_else(|| "cannot resolve the SV2 data directory".to_string())
-}
-
-fn directory_manifest(
-    root: &Path,
-    skipped_paths: &[PathBuf],
-) -> Result<Vec<DirectoryEntry>, String> {
-    let root = fs::canonicalize(root)
-        .map_err(|error| format!("cannot access SV2 data directory: {error}"))?;
-    let mut entries = Vec::new();
-    collect_directory_entries(&root, &root, skipped_paths, &mut entries)?;
-    entries.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok(entries)
-}
-
-fn collect_directory_entries(
-    root: &Path,
-    directory: &Path,
-    skipped_paths: &[PathBuf],
-    entries: &mut Vec<DirectoryEntry>,
-) -> Result<(), String> {
-    for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
-        let file_type = entry.file_type().map_err(|error| error.to_string())?;
-        if file_type.is_symlink() {
-            continue;
-        }
-        let path = entry.path();
-        if skipped_paths
-            .iter()
-            .any(|skipped| path_is_same_or_under(&path, skipped))
-        {
-            continue;
-        }
-        if file_type.is_dir() {
-            collect_directory_entries(root, &path, skipped_paths, entries)?;
-            continue;
-        }
-        if !file_type.is_file() {
-            continue;
-        }
-        if entries.len() >= MAX_DIRECTORY_ENTRIES {
-            return Err("SV2 data directory contains too many files to report".to_string());
-        }
-        let relative = path
-            .strip_prefix(root)
-            .map_err(|_| "SV2 path escaped its root".to_string())?;
-        let size = entry.metadata().map_err(|error| error.to_string())?.len();
-        entries.push(DirectoryEntry {
-            path: relative.to_string_lossy().replace('\\', "/"),
-            size,
-            sha256: sha256_file(&path)?,
-        });
-    }
-    Ok(())
-}
-
-fn path_is_same_or_under(path: &Path, parent: &Path) -> bool {
-    #[cfg(windows)]
-    {
-        let path = path.to_string_lossy().to_ascii_lowercase();
-        let parent = parent.to_string_lossy().to_ascii_lowercase();
-        path == parent || path.starts_with(&format!("{}\\", parent.trim_end_matches('\\')))
-    }
-    #[cfg(not(windows))]
-    {
-        path == parent || path.starts_with(parent)
-    }
-}
-
-fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut file = File::open(path).map_err(|error| error.to_string())?;
-    let mut hash = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
-        if read == 0 {
-            break;
-        }
-        hash.update(&buffer[..read]);
-    }
-    Ok(URL_SAFE_NO_PAD.encode(hash.finalize()))
-}
-
-fn installed_applications() -> Vec<String> {
-    #[cfg(target_os = "macos")]
-    {
-        let mut applications = Vec::new();
-        let locations = [
-            Some(PathBuf::from("/Applications")),
-            dirs::home_dir().map(|path| path.join("Applications")),
-        ];
-        for location in locations.into_iter().flatten() {
-            if let Ok(entries) = fs::read_dir(location) {
-                for entry in entries.flatten() {
-                    if let Some(name) = entry.file_name().to_str() {
-                        if name.ends_with(".app") && is_sv2_application(name) {
-                            applications.push(name.to_string());
-                        }
-                    }
-                }
-            }
-        }
-        applications.sort();
-        applications.dedup();
-        return applications;
-    }
-    #[cfg(windows)]
-    {
-        use winreg::{
-            enums::{
-                HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY,
-            },
-            RegKey,
-        };
-        let mut applications = Vec::new();
-        for hive in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
-            let root = RegKey::predef(hive);
-            for view in [KEY_READ | KEY_WOW64_64KEY, KEY_READ | KEY_WOW64_32KEY] {
-                if let Ok(uninstall) = root.open_subkey_with_flags(
-                    "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
-                    view,
-                ) {
-                    for key in uninstall.enum_keys().flatten() {
-                        if let Ok(entry) = uninstall.open_subkey(key) {
-                            if let Ok(name) = entry.get_value::<String, _>("DisplayName") {
-                                if is_sv2_application(&name) {
-                                    applications.push(name);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        applications.sort();
-        applications.dedup();
-        return applications;
-    }
-    #[cfg(not(any(target_os = "macos", windows)))]
-    Vec::new()
-}
-
-fn is_sv2_application(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    name.contains("synthesizer v studio 2")
-        || name.contains("synthv-studio2")
-        || name.contains("sv2")
-}
-
-#[cfg(test)]
-fn execute_directory_task(
+fn execute_task(
     config: &Config,
     key: &SigningKey,
-    operation_id: &str,
-    task: &DirectoryTask,
-    last_reported_sha256: &mut String,
+    connection: &str,
+    task: &RemoteTask,
     host: &dyn ConnectorHost,
-) -> Result<(), String> {
-    let root = sv2_root(&config.session_path)?;
-    let mut mount_manager =
-        mounts::MountManager::new(&root, &config.session_path, &config.server_url);
-    execute_directory_task_with_mounts(
-        config,
-        key,
-        operation_id,
-        task,
-        last_reported_sha256,
-        &mut mount_manager,
-        host,
-    )
-}
-
-fn execute_directory_task_with_mounts(
-    config: &Config,
-    key: &SigningKey,
-    operation_id: &str,
-    task: &DirectoryTask,
-    last_reported_sha256: &mut String,
-    mount_manager: &mut mounts::MountManager,
-    host: &dyn ConnectorHost,
-) -> Result<(), String> {
-    if host.should_stop() {
-        return Ok(());
-    }
-    let root = sv2_root(&config.session_path)?;
-    let base = format!(
-        "/api/v2/connector/operations/{operation_id}/directory-tasks/{}",
-        task.id
-    );
+    watches: &mut HashMap<
+        String,
+        (
+            notify::RecommendedWatcher,
+            mpsc::Receiver<notify::Result<notify::Event>>,
+            PathBuf,
+        ),
+    >,
+    mounts: &mut HashMap<PathBuf, mounts::MountManager>,
+) -> Result<Value, String> {
+    let params = &task.params;
     match task.kind.as_str() {
-        "upload_file" => {
-            let result = (|| {
-                let relative = task
-                    .relative_path
-                    .as_deref()
-                    .ok_or(FileTransferError::Failed("invalid_task"))?;
-                let expected_sha256 = task
-                    .expected_sha256
-                    .as_deref()
-                    .ok_or(FileTransferError::Failed("invalid_task"))?;
-                let expected_size = task
-                    .expected_size
-                    .ok_or(FileTransferError::Failed("invalid_task"))?;
-                let (_path, file) = file_tasks::verify_stream_file(
-                    &root,
-                    &config.session_path,
-                    relative,
-                    expected_sha256,
-                    expected_size,
-                )
-                .map_err(FileTransferError::Failed)?;
-                let mut reporter = FileProgressReporter::new(config, key, &base);
-                stream_upload_file(
-                    config,
-                    key,
-                    &format!("{base}/content"),
-                    file,
-                    expected_sha256,
-                    expected_size,
-                    relative,
-                    &mut reporter,
-                )
-            })();
-            complete_file_transfer(
-                config,
-                key,
-                &format!("{base}/complete"),
-                result,
-                serde_json::json!({"sha256": task.expected_sha256, "size": task.expected_size}),
-                host,
-            )
-        }
-        "download_file" => {
-            let result = (|| {
-                let relative = task
-                    .relative_path
-                    .as_deref()
-                    .ok_or(FileTransferError::Failed("invalid_task"))?;
-                let expected_sha256 = task
-                    .expected_sha256
-                    .as_deref()
-                    .ok_or(FileTransferError::Failed("invalid_task"))?;
-                let expected_size = task
-                    .expected_size
-                    .ok_or(FileTransferError::Failed("invalid_task"))?;
-                if expected_size > file_tasks::MAX_STREAM_BYTES {
-                    return Err(FileTransferError::Failed("file_too_large"));
-                }
-                let target = file_tasks::safe_path(&root, relative, true)
-                    .map_err(FileTransferError::Failed)?;
-                if file_tasks::targets_session_path(&root, &target, &config.session_path) {
-                    return Err(FileTransferError::Failed("session_path_forbidden"));
-                }
-                let parent = target
-                    .parent()
-                    .ok_or(FileTransferError::Failed("unsafe_path"))?;
-                file_tasks::prepare_parent(&root, parent).map_err(FileTransferError::Failed)?;
-                let mut temporary = tempfile::Builder::new()
-                    .prefix(".boxy-")
-                    .tempfile_in(parent)
-                    .map_err(|_| FileTransferError::Failed("write_failed"))?;
-                let mut reporter = FileProgressReporter::new(config, key, &base);
-                stream_download_file(
-                    config,
-                    key,
-                    &format!("{base}/content"),
-                    temporary.as_file_mut(),
-                    expected_sha256,
-                    expected_size,
-                    relative,
-                    &mut reporter,
-                )?;
-                temporary
-                    .as_file()
-                    .sync_all()
-                    .map_err(|_| FileTransferError::Failed("write_failed"))?;
-                file_tasks::install_stream_file(
-                    &root,
-                    &config.session_path,
-                    relative,
-                    temporary,
-                    expected_sha256,
-                    expected_size,
-                )
-                .map_err(FileTransferError::Failed)
-            })();
-            complete_file_transfer(
-                config,
-                key,
-                &format!("{base}/complete"),
-                result,
-                serde_json::json!({"sha256": task.expected_sha256, "size": task.expected_size}),
-                host,
-            )
-        }
-        "move_files" => {
-            let result = file_tasks::move_files(&root, &config.session_path, &task.moves);
-            complete_task(
-                config,
-                key,
-                &format!("{base}/complete"),
-                serde_json::to_value(result).map_err(|error| error.to_string())?,
-                host,
-            )
-        }
-        "remove_files" => {
-            let result = file_tasks::remove_files(&root, &config.session_path, &task.removals);
-            complete_task(
-                config,
-                key,
-                &format!("{base}/complete"),
-                serde_json::to_value(result).map_err(|error| error.to_string())?,
-                host,
-            )
-        }
-        "list_files" => {
-            let result = file_tasks::list_files(&root, &task.paths, &mount_manager.active_paths());
-            complete_task(
-                config,
-                key,
-                &format!("{base}/complete"),
-                serde_json::to_value(result).map_err(|error| error.to_string())?,
-                host,
-            )
-        }
-        "read_ranges" => {
-            let result = file_tasks::read_ranges(&root, &config.session_path, &task.ranges, || {
-                host.should_stop()
-            });
-            complete_task(
-                config,
-                key,
-                &format!("{base}/complete"),
-                serde_json::to_value(result).map_err(|error| error.to_string())?,
-                host,
-            )
-        }
-        "file_patch" => {
-            let result =
-                file_tasks::patch_files(&root, &config.session_path, &task.patches, || {
-                    host.should_stop()
-                });
-            complete_task(
-                config,
-                key,
-                &format!("{base}/complete"),
-                serde_json::to_value(result).map_err(|error| error.to_string())?,
-                host,
-            )
-        }
-        "mount_files" => {
-            let result = task
-                .mount
-                .as_ref()
-                .ok_or("invalid_mount_spec")
-                .and_then(|spec| mount_manager.mount(spec));
-            let body = match result {
-                Ok(_) => {
-                    serde_json::json!({"path": task.mount.as_ref().map(|spec| spec.path.as_str()).unwrap_or_default(), "ok": true, "mounted": true})
-                }
-                Err(error) => {
-                    serde_json::json!({"path": task.mount.as_ref().map(|spec| spec.path.as_str()).unwrap_or_default(), "ok": false, "error": error})
-                }
-            };
-            complete_task(config, key, &format!("{base}/complete"), body, host)
-        }
-        "unmount_files" => {
-            let result = task
-                .mount
-                .as_ref()
-                .ok_or("invalid_mount_spec")
-                .and_then(|spec| mount_manager.unmount(spec));
-            let body = match result {
-                Ok(_) => {
-                    serde_json::json!({"path": task.mount.as_ref().map(|spec| spec.path.as_str()).unwrap_or_default(), "ok": true, "mounted": false})
-                }
-                Err(error) => {
-                    serde_json::json!({"path": task.mount.as_ref().map(|spec| spec.path.as_str()).unwrap_or_default(), "ok": false, "error": error})
-                }
-            };
-            complete_task(config, key, &format!("{base}/complete"), body, host)
-        }
-        "read" => {
-            let path = task_path(
-                &root,
-                task.relative_path
-                    .as_deref()
-                    .ok_or_else(|| "read task has no path".to_string())?,
-            )?;
-            let bytes = fs::read(&path)
-                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-            put_task_content(config, key, &format!("{base}/content"), &bytes)?;
-            complete_task(
-                config,
-                key,
-                &format!("{base}/complete"),
-                serde_json::json!({"sha256": sha256_base64url(&bytes), "size": bytes.len()}),
-                host,
-            )
-        }
-        "write" => {
-            let bytes = get_task_content(config, key, &format!("{base}/content"))?;
-            if task
-                .expected_sha256
-                .as_deref()
-                .is_some_and(|hash| hash != sha256_base64url(&bytes))
-            {
-                return Err("directory task content hash mismatch".to_string());
+        "process.exec" => execute_process(params, host),
+        "http.request" => execute_http(params),
+        "fs.watch" => register_watch(params, watches),
+        "fs.mount" | "fs.unmount" => execute_mount(config, params, &task.kind, mounts),
+        kind if kind.starts_with("fs.") => {
+            if let Ok((root, _)) = task_root(params) {
+                host.set_resource_root(&root);
             }
-            atomic_write(
-                &task_path(
-                    &root,
-                    task.relative_path
-                        .as_deref()
-                        .ok_or_else(|| "write task has no path".to_string())?,
-                )?,
-                &bytes,
-            )?;
-            complete_task(
-                config,
-                key,
-                &format!("{base}/complete"),
-                serde_json::json!({"sha256": sha256_base64url(&bytes), "size": bytes.len()}),
-                host,
-            )
+            execute_file_task(config, key, connection, task, kind, host)
         }
-        "download" => {
-            let bytes = get_task_content(config, key, &format!("{base}/content"))?;
-            let name = task
-                .relative_path
-                .as_deref()
-                .and_then(|path| Path::new(path).file_name())
-                .ok_or_else(|| "download task has no file name".to_string())?;
-            let target = dirs::download_dir()
-                .ok_or_else(|| "cannot resolve Downloads folder".to_string())?
-                .join(name);
-            atomic_write(&target, &bytes)?;
-            complete_task(
-                config,
-                key,
-                &format!("{base}/complete"),
-                serde_json::json!({"sha256": sha256_base64url(&bytes), "size": bytes.len()}),
-                host,
-            )
-        }
-        "machine_material" => complete_task(
-            config,
-            key,
-            &format!("{base}/complete"),
-            serde_json::to_value(machine_report()?).map_err(|error| error.to_string())?,
-            host,
-        ),
-        "command" => execute_command_task(config, key, &base, task, host),
-        "host_block" => {
-            let result = match task.mode.as_deref() {
-                Some("status") => Ok(network_block::status()),
-                Some("firewall") => task
-                    .blocked
-                    .ok_or_else(|| "network block task has no blocked state".to_string())
-                    .and_then(network_block::set_blocked),
-                Some("cleanup") if task.blocked == Some(false) => network_block::cleanup_hosts(),
-                _ => Err("network block mode is invalid".to_string()),
-            };
-            let result = match result {
-                Ok(status) => serde_json::to_value(status).map_err(|error| error.to_string())?,
-                Err(error) => serde_json::json!({
-                    "failed": true,
-                    "error": error,
-                    "status": network_block::status(),
-                }),
-            };
-            complete_task(config, key, &format!("{base}/complete"), result, host)
-        }
-        "sv2_action" => {
-            let action = task
-                .action
-                .as_deref()
-                .ok_or_else(|| "sv2 task has no action".to_string())?;
-            let result = match action {
-                "launch" => session_io::launch_sv2()?,
-                "close" => session_io::close_sv2()?,
-                _ => return Err("sv2 task action is invalid".to_string()),
-            };
-            complete_task(
-                config,
-                key,
-                &format!("{base}/complete"),
-                serde_json::to_value(result).map_err(|error| error.to_string())?,
-                host,
-            )
-        }
-        "open_folder" => {
-            session_io::open_session_folder(&config.session_path)?;
-            complete_task(
-                config,
-                key,
-                &format!("{base}/complete"),
-                serde_json::json!({ "ok": true }),
-                host,
-            )
-        }
-        "product_inspect" => complete_task(
-            config,
-            key,
-            &format!("{base}/complete"),
-            serde_json::json!({ "databases": product_database::inspect() }),
-            host,
-        ),
-        "product_fetch" => {
-            let mut results = Vec::new();
-            let mut attempts = Vec::new();
-            let mut reporter = progress::ProductProgressReporter::new(
-                &config.server_url,
-                key,
-                &base,
-                task.items.len(),
-            );
-            for (completed_items, item) in task.items.iter().enumerate() {
-                let mut report = |event: product_database::DownloadProgress| {
-                    let stage = match event.stage {
-                        product_database::DownloadProgressStage::Downloading => "downloading",
-                        product_database::DownloadProgressStage::Installing => "installing",
-                    };
-                    reporter.report(
-                        stage,
-                        &item.id,
-                        &event.filename,
-                        event.downloaded_bytes,
-                        event.total_bytes,
-                        completed_items,
-                        event.file_index,
-                        event.file_count,
-                    );
-                };
-                match product_database::fetch(item, &mut attempts, &mut report) {
-                    Ok(result) => results
-                        .push(serde_json::to_value(result).map_err(|error| error.to_string())?),
-                    Err(_) => results
-                        .push(serde_json::json!({ "id": item.id, "error": "download_failed" })),
-                }
-            }
-            for (index, attempt) in attempts.iter_mut().enumerate() {
-                attempt.sequence = index + 1;
-            }
-            complete_task(
-                config,
-                key,
-                &format!("{base}/complete"),
-                serde_json::json!({
-                    "action": task.action,
-                    "productId": task.product_id,
-                    "items": results,
-                    "upstreamAttempts": attempts,
-                }),
-                host,
-            )
-        }
-        "product_delete" => {
-            let id = task
-                .product_id
-                .as_deref()
-                .ok_or_else(|| "product delete task has no id".to_string())?;
-            product_database::delete(id)?;
-            complete_task(
-                config,
-                key,
-                &format!("{base}/complete"),
-                serde_json::json!({ "id": id, "installed": false }),
-                host,
-            )
-        }
-        "http_request" => {
-            if let Some(expected) = task.expected_session_sha256.as_deref() {
-                let current = read_session_ciphertext(&config.session_path)?;
-                let current_sha256 = sha256_base64url(&current);
-                if expected != current_sha256 {
-                    match submit_session_snapshot_with_mounts(
-                        config,
-                        key,
-                        operation_id,
-                        &current,
-                        mount_manager,
-                    ) {
-                        Ok(SessionWatchResult::Accepted(source_sha256)) => {
-                            *last_reported_sha256 = source_sha256;
-                        }
-                        _ => return Ok(()),
-                    }
-                    let result = HttpRequestResult::session_changed();
-                    return complete_task(
-                        config,
-                        key,
-                        &format!("{base}/complete"),
-                        serde_json::to_value(result).map_err(|error| error.to_string())?,
-                        host,
-                    );
-                }
-            }
-            let request = task
-                .request
-                .as_ref()
-                .ok_or_else(|| "HTTP request task has no request".to_string())?;
-            let result = execute_http_request(request);
-            complete_task(
-                config,
-                key,
-                &format!("{base}/complete"),
-                serde_json::to_value(result).map_err(|error| error.to_string())?,
-                host,
-            )
-        }
-        "read_files" => {
-            let root = sv2_root(&config.session_path)?;
-            let result = file_tasks::read_files(
-                &root,
-                &task.paths,
-                task.max_file_bytes.unwrap_or(0),
-                task.max_total_bytes.unwrap_or(0),
-            );
-            complete_task(
-                config,
-                key,
-                &format!("{base}/complete"),
-                serde_json::to_value(result).map_err(|error| error.to_string())?,
-                host,
-            )
-        }
-        "write_files" => {
-            let root = sv2_root(&config.session_path)?;
-            let result = file_tasks::write_files(&root, &config.session_path, &task.files);
-            complete_task(
-                config,
-                key,
-                &format!("{base}/complete"),
-                serde_json::to_value(result).map_err(|error| error.to_string())?,
-                host,
-            )
-        }
-        _ => Err("unsupported directory task".to_string()),
-    }
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct FileProgressBody<'a> {
-    stage: &'a str,
-    filename: &'a str,
-    downloaded_bytes: u64,
-    total_bytes: u64,
-    file_index: usize,
-    file_count: usize,
-}
-
-struct FileProgressReporter<'a> {
-    config: &'a Config,
-    key: &'a SigningKey,
-    path: String,
-    last_report: Option<std::time::Instant>,
-    last_bytes: u64,
-}
-
-enum FileTransferError {
-    Failed(&'static str),
-    Cancelled,
-    Service(String),
-}
-
-fn complete_file_transfer(
-    config: &Config,
-    key: &SigningKey,
-    complete_path: &str,
-    result: Result<(), FileTransferError>,
-    success_body: serde_json::Value,
-    host: &dyn ConnectorHost,
-) -> Result<(), String> {
-    let body = match result {
-        Ok(()) => success_body,
-        Err(FileTransferError::Cancelled) => serde_json::json!({"cancelled": true}),
-        Err(FileTransferError::Failed(error)) => {
-            serde_json::json!({"failed": true, "error": error})
-        }
-        Err(FileTransferError::Service(error)) => return Err(error),
-    };
-    complete_task(config, key, complete_path, body, host)
-}
-
-fn classify_transfer_response(error: ureq::Error, action: &str) -> FileTransferError {
-    match error {
-        ureq::Error::Status(410, _) => FileTransferError::Cancelled,
-        ureq::Error::Status(status, _) if (400..500).contains(&status) => {
-            FileTransferError::Failed("content_rejected")
-        }
-        error => FileTransferError::Service(format!("cannot {action} file content: {error}")),
-    }
-}
-
-impl<'a> FileProgressReporter<'a> {
-    fn new(config: &'a Config, key: &'a SigningKey, task_base: &str) -> Self {
-        Self {
-            config,
-            key,
-            path: format!("{task_base}/progress"),
-            last_report: None,
-            last_bytes: 0,
-        }
-    }
-
-    fn report(&mut self, stage: &str, filename: &str, bytes: u64, total: u64) {
-        let now = std::time::Instant::now();
-        if bytes != total
-            && self
-                .last_report
-                .is_some_and(|last| now.duration_since(last) < Duration::from_secs(1))
-        {
-            return;
-        }
-        if bytes == self.last_bytes && bytes != total {
-            return;
-        }
-        self.last_report = Some(now);
-        self.last_bytes = bytes;
-        let (nonce, signature) = request_signature(self.key, "POST", &self.path);
-        let filename = Path::new(filename)
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
-        let body = FileProgressBody {
-            stage,
-            filename: &filename,
-            downloaded_bytes: bytes,
-            total_bytes: total,
-            file_index: 1,
-            file_count: 1,
-        };
-        let _ = ureq::post(&format!("{}{}", self.config.server_url, self.path))
-            .timeout(Duration::from_secs(2))
-            .set("Content-Type", "application/json")
-            .set("X-Connector-Nonce", &nonce)
-            .set("X-Connector-Signature", &signature)
-            .send_json(body);
-    }
-}
-
-fn stream_upload_file(
-    config: &Config,
-    key: &SigningKey,
-    path: &str,
-    file: fs::File,
-    expected_hash: &str,
-    expected_size: u64,
-    filename: &str,
-    reporter: &mut FileProgressReporter<'_>,
-) -> Result<(), FileTransferError> {
-    use sha2::Digest;
-    const UPLOAD_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
-    if expected_size == 0 {
-        return Err(FileTransferError::Failed("invalid_size"));
-    }
-    let state = std::sync::Arc::new(std::sync::Mutex::new((Sha256::new(), 0u64)));
-    let mut reader = UploadReader {
-        inner: file,
-        state: state.clone(),
-        reporter,
-        filename,
-        total: expected_size,
-    };
-    let mut start = 0u64;
-    while start < expected_size {
-        let chunk_size = (expected_size - start).min(UPLOAD_CHUNK_BYTES);
-        let end = start + chunk_size - 1;
-        let transferred_before = state
-            .lock()
-            .map_err(|_| FileTransferError::Failed("content_mismatch"))?
-            .1;
-        let short_chunk = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let chunk_reader = ChunkReader {
-            reader: &mut reader,
-            remaining: chunk_size,
-            short_chunk: short_chunk.clone(),
-        };
-        let (nonce, signature) = request_signature(key, "PUT", path);
-        let response = ureq::put(&format!("{}{}", config.server_url, path))
-            .timeout(Duration::from_secs(300))
-            .set("Content-Length", &chunk_size.to_string())
-            .set(
-                "Content-Range",
-                &format!("bytes {start}-{end}/{expected_size}"),
-            )
-            .set("X-Connector-Nonce", &nonce)
-            .set("X-Connector-Signature", &signature)
-            .send(chunk_reader);
-        match response {
-            Ok(_) => {}
-            Err(_error) if short_chunk.load(std::sync::atomic::Ordering::Relaxed) => {
-                return Err(FileTransferError::Failed("content_mismatch"));
-            }
-            Err(error) => return Err(classify_transfer_response(error, "upload")),
-        }
-        let transferred_after = state
-            .lock()
-            .map_err(|_| FileTransferError::Failed("content_mismatch"))?
-            .1;
-        if transferred_after.saturating_sub(transferred_before) != chunk_size {
-            return Err(FileTransferError::Failed("content_mismatch"));
-        }
-        start += chunk_size;
-    }
-    let mut extra = [0u8; 1];
-    if reader
-        .inner
-        .read(&mut extra)
-        .map_err(|_| FileTransferError::Failed("read_failed"))?
-        != 0
-    {
-        return Err(FileTransferError::Failed("content_mismatch"));
-    }
-    let (digest, size) = state
-        .lock()
-        .map_err(|_| FileTransferError::Failed("content_mismatch"))?
-        .clone();
-    let actual_hash = URL_SAFE_NO_PAD.encode(digest.finalize());
-    if size != expected_size || actual_hash != expected_hash {
-        return Err(FileTransferError::Failed("content_mismatch"));
-    }
-    reporter.report("uploading", filename, size, expected_size);
-    Ok(())
-}
-
-struct ChunkReader<'a, 'b, 'c> {
-    reader: &'a mut UploadReader<'b, 'c>,
-    remaining: u64,
-    short_chunk: std::sync::Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl Read for ChunkReader<'_, '_, '_> {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        if self.remaining == 0 || buffer.is_empty() {
-            return Ok(0);
-        }
-        let limit = buffer.len().min(self.remaining as usize);
-        let count = self.reader.read(&mut buffer[..limit])?;
-        if count == 0 {
-            self.short_chunk
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "upload source ended before its declared size",
-            ));
-        }
-        self.remaining -= count as u64;
-        Ok(count)
-    }
-}
-
-struct UploadReader<'a, 'c> {
-    inner: fs::File,
-    state: std::sync::Arc<std::sync::Mutex<(Sha256, u64)>>,
-    reporter: &'a mut FileProgressReporter<'c>,
-    filename: &'a str,
-    total: u64,
-}
-
-impl Read for UploadReader<'_, '_> {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        use sha2::Digest;
-        let count = self.inner.read(buffer)?;
-        if count > 0 {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| std::io::Error::other("upload digest unavailable"))?;
-            state.0.update(&buffer[..count]);
-            state.1 = state.1.saturating_add(count as u64);
-            if state.1 < self.total {
-                self.reporter
-                    .report("uploading", self.filename, state.1, self.total);
-            }
-        }
-        Ok(count)
-    }
-}
-
-fn stream_download_file(
-    config: &Config,
-    key: &SigningKey,
-    path: &str,
-    output: &mut fs::File,
-    expected_hash: &str,
-    expected_size: u64,
-    filename: &str,
-    reporter: &mut FileProgressReporter<'_>,
-) -> Result<(), FileTransferError> {
-    use sha2::Digest;
-    let (nonce, signature) = request_signature(key, "GET", path);
-    let response = ureq::get(&format!("{}{}", config.server_url, path))
-        .timeout(Duration::from_secs(300))
-        .set("X-Connector-Nonce", &nonce)
-        .set("X-Connector-Signature", &signature)
-        .call()
-        .map_err(|error| classify_transfer_response(error, "download"))?;
-    let mut reader = response.into_reader();
-    let mut digest = Sha256::new();
-    let mut downloaded = 0u64;
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let count = reader.read(&mut buffer).map_err(|error| {
-            FileTransferError::Service(format!("cannot read downloaded file: {error}"))
-        })?;
-        if count == 0 {
-            break;
-        }
-        downloaded = downloaded
-            .checked_add(count as u64)
-            .ok_or(FileTransferError::Failed("file_too_large"))?;
-        if downloaded > expected_size || downloaded > file_tasks::MAX_STREAM_BYTES {
-            return Err(FileTransferError::Failed("size_mismatch"));
-        }
-        digest.update(&buffer[..count]);
-        output
-            .write_all(&buffer[..count])
-            .map_err(|_| FileTransferError::Failed("write_failed"))?;
-        if downloaded < expected_size {
-            reporter.report("downloading", filename, downloaded, expected_size);
-        }
-    }
-    if downloaded != expected_size || URL_SAFE_NO_PAD.encode(digest.finalize()) != expected_hash {
-        return Err(FileTransferError::Failed("content_mismatch"));
-    }
-    reporter.report("downloading", filename, downloaded, expected_size);
-    Ok(())
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct HttpRequestResult {
-    status: u16,
-    response_body: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_body_base64: Option<String>,
-    response_headers: std::collections::BTreeMap<String, Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<&'static str>,
-    upstream_attempts: Vec<UpstreamAttempt>,
-}
-
-impl HttpRequestResult {
-    fn session_changed() -> Self {
-        Self {
-            status: 599,
-            response_body: String::new(),
-            response_body_base64: None,
-            response_headers: std::collections::BTreeMap::new(),
-            error: Some("session_changed"),
-            upstream_attempts: Vec::new(),
+        _ => {
+            let _ = (key, connection);
+            Err("unsupported_task".to_string())
         }
     }
 }
 
-impl Drop for HttpRequestResult {
-    fn drop(&mut self) {
-        self.response_body.zeroize();
-        if let Some(body) = &mut self.response_body_base64 {
-            body.zeroize();
-        }
-        for values in self.response_headers.values_mut() {
-            for value in values {
-                value.zeroize();
-            }
-        }
+fn task_root(params: &Value) -> Result<(PathBuf, Option<PathBuf>), String> {
+    let root = PathBuf::from(params["root"].as_str().ok_or("invalid_root")?);
+    let root = fs::canonicalize(root).map_err(|_| "invalid_root")?;
+    if !root.is_dir() {
+        return Err("invalid_root".to_string());
     }
-}
-
-fn execute_http_request(request: &http_request::HttpRequestSpec) -> HttpRequestResult {
-    let mut response = http_request::execute(request);
-    let (response_body, response_body_base64) =
-        if request.response_encoding == "base64" || response.error == Some("invalid_response") {
-            (String::new(), Some(URL_SAFE_NO_PAD.encode(&response.body)))
+    let protected = params
+        .get("protectedPath")
+        .and_then(Value::as_str)
+        .map(PathBuf::from);
+    if let Some(path) = &protected {
+        let absolute = if path.is_absolute() {
+            path.clone()
         } else {
-            (
-                std::str::from_utf8(&response.body)
-                    .map(str::to_string)
-                    .unwrap_or_default(),
-                None,
-            )
+            root.join(path)
         };
-    HttpRequestResult {
-        status: response.status,
-        response_body,
-        response_body_base64,
-        response_headers: std::mem::take(&mut response.headers),
-        error: response.error,
-        upstream_attempts: response.attempt.take().into_iter().collect(),
+        let absolute = fs::canonicalize(absolute).map_err(|_| "invalid_protected_path")?;
+        if !absolute.starts_with(&root) {
+            return Err("invalid_protected_path".to_string());
+        }
+        return Ok((root, Some(absolute)));
     }
+    Ok((root, None))
 }
-fn execute_command_task(
+
+fn execute_file_task(
     config: &Config,
     key: &SigningKey,
-    base: &str,
-    task: &DirectoryTask,
+    connection: &str,
+    task: &RemoteTask,
+    kind: &str,
     host: &dyn ConnectorHost,
-) -> Result<(), String> {
-    let command = task
-        .command
+) -> Result<Value, String> {
+    let params = &task.params;
+    let (root, protected) = task_root(params)?;
+    let protected = protected
         .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "command task has no command".to_string())?;
-    let shell = task.shell.as_deref().unwrap_or(default_shell());
-    let root = sv2_root(&config.session_path)?;
-    let cwd = match task.cwd.as_deref() {
-        Some(path) => task_path(&root, path)?,
-        None => root,
-    };
-    if !host.approve_command(command, shell, &cwd) {
-        if host.should_stop() {
-            return complete_task(
-                config,
-                key,
-                &format!("{base}/complete"),
-                serde_json::json!({ "cancelled": true }),
-                host,
-            );
+        .unwrap_or(Path::new(".boxy-no-protected-path"));
+    match kind {
+        "fs.read" => {
+            let paths: Vec<String> =
+                serde_json::from_value(params["paths"].clone()).map_err(|_| "invalid_params")?;
+            let max_file = params["maxFileBytes"].as_u64().ok_or("invalid_params")? as usize;
+            let max_total = params["maxTotalBytes"].as_u64().ok_or("invalid_params")? as usize;
+            serde_json::to_value(file_tasks::read_files(&root, &paths, max_file, max_total))
+                .map_err(|e| e.to_string())
         }
-        return complete_task(
-            config,
-            key,
-            &format!("{base}/complete"),
-            serde_json::json!({ "denied": true, "command": command }),
-            host,
-        );
+        "fs.read_ranges" => {
+            let ranges: Vec<file_tasks::RangeReadTaskEntry> =
+                serde_json::from_value(params["ranges"].clone()).map_err(|_| "invalid_params")?;
+            serde_json::to_value(file_tasks::read_ranges(&root, protected, &ranges, || {
+                host.should_stop()
+            }))
+            .map_err(|e| e.to_string())
+        }
+        "fs.patch" => {
+            let patches: Vec<file_tasks::FilePatchTaskEntry> =
+                serde_json::from_value(params["patches"].clone()).map_err(|_| "invalid_params")?;
+            serde_json::to_value(file_tasks::patch_files(&root, protected, &patches, || {
+                host.should_stop()
+            }))
+            .map_err(|e| e.to_string())
+        }
+        "fs.write" => {
+            let files: Vec<file_tasks::WriteFileTaskEntry> =
+                serde_json::from_value(params["files"].clone()).map_err(|_| "invalid_params")?;
+            serde_json::to_value(file_tasks::write_files(&root, protected, &files))
+                .map_err(|e| e.to_string())
+        }
+        "fs.list" => {
+            let paths: Vec<String> =
+                serde_json::from_value(params["paths"].clone()).map_err(|_| "invalid_params")?;
+            serde_json::to_value(file_tasks::list_files(&root, &paths, &[]))
+                .map_err(|e| e.to_string())
+        }
+        "fs.move" => {
+            let moves: Vec<file_tasks::MoveEntry> =
+                serde_json::from_value(params["moves"].clone()).map_err(|_| "invalid_params")?;
+            serde_json::to_value(file_tasks::move_files(&root, protected, &moves))
+                .map_err(|e| e.to_string())
+        }
+        "fs.remove" => {
+            let removals: Vec<file_tasks::RemovalEntry> =
+                serde_json::from_value(params["removals"].clone()).map_err(|_| "invalid_params")?;
+            serde_json::to_value(file_tasks::remove_files(&root, protected, &removals))
+                .map_err(|e| e.to_string())
+        }
+        "fs.upload" | "fs.download" => {
+            transfer_file(config, key, connection, &root, protected, task, kind)
+        }
+        _ => Err("unsupported_task".to_string()),
     }
-    if host.should_stop() {
-        return complete_task(
-            config,
-            key,
-            &format!("{base}/complete"),
-            serde_json::json!({ "cancelled": true }),
-            host,
-        );
-    }
-    let timeout = Duration::from_secs(
-        task.timeout_seconds
-            .unwrap_or(300)
-            .clamp(1, MAX_COMMAND_SECONDS),
-    );
-    let Some(outcome) = run_shell_command(shell, command, &cwd, timeout, host)? else {
-        return complete_task(
-            config,
-            key,
-            &format!("{base}/complete"),
-            serde_json::json!({ "command": command, "shell": shell, "cancelled": true }),
-            host,
-        );
-    };
-    let body = serde_json::json!({
-        "command": command,
-        "shell": shell,
-        "exitCode": outcome.exit_code,
-        "timedOut": outcome.timed_out,
-        "stdout": outcome.stdout,
-        "stderr": outcome.stderr,
-    });
-    complete_task(config, key, &format!("{base}/complete"), body, host)
 }
 
-struct CommandResult {
-    exit_code: Option<i32>,
-    timed_out: bool,
-    stdout: String,
-    stderr: String,
+fn transfer_file(
+    config: &Config,
+    key: &SigningKey,
+    connection: &str,
+    root: &Path,
+    protected: &Path,
+    task: &RemoteTask,
+    kind: &str,
+) -> Result<Value, String> {
+    use std::io::Seek;
+    let relative = task.params["path"].as_str().ok_or("invalid_params")?;
+    let content_path = format!("{connection}/tasks/{}/content", task.id);
+    if kind == "fs.upload" {
+        let expected_hash = task.params["expectedSha256"]
+            .as_str()
+            .ok_or("invalid_params")?;
+        let expected_size = task.params["expectedSize"]
+            .as_u64()
+            .ok_or("invalid_params")?;
+        if expected_size > file_tasks::MAX_STREAM_BYTES {
+            return Err("file_too_large".to_string());
+        }
+        let (_, mut file) =
+            file_tasks::verify_stream_file(root, protected, relative, expected_hash, expected_size)
+                .map_err(str::to_string)?;
+        file.rewind().map_err(|error| error.to_string())?;
+        let (nonce, signature) = request_signature(key, "POST", &content_path);
+        let response = ureq::post(&format!("{}{}", config.server_url, content_path))
+            .timeout(Duration::from_secs(120))
+            .set("Content-Length", &expected_size.to_string())
+            .set("X-Connector-Nonce", &nonce)
+            .set("X-Connector-Signature", &signature)
+            .send(file);
+        match response {
+            Ok(_) => Ok(json!({"path":relative,"sha256":expected_hash,"size":expected_size})),
+            Err(ureq::Error::Status(status, response)) => Err(format!(
+                "content upload rejected ({status}): {}",
+                response.into_string().unwrap_or_default()
+            )),
+            Err(error) => Err(format!("content upload failed: {error}")),
+        }
+    } else {
+        let max_bytes = task.params["maxBytes"]
+            .as_u64()
+            .filter(|value| *value > 0 && *value <= file_tasks::MAX_STREAM_BYTES)
+            .ok_or("invalid_max_bytes")?;
+        let expected_hash = task.params.get("expectedSha256").and_then(Value::as_str);
+        let expected_size = task.params.get("expectedSize").and_then(Value::as_u64);
+        if expected_size.is_some_and(|size| size > max_bytes) {
+            return Err("invalid_expected_size".to_string());
+        }
+        let (nonce, signature) = request_signature(key, "GET", &content_path);
+        let response = ureq::get(&format!("{}{}", config.server_url, content_path))
+            .timeout(Duration::from_secs(120))
+            .set("X-Connector-Nonce", &nonce)
+            .set("X-Connector-Signature", &signature)
+            .call()
+            .map_err(|error| format!("content download failed: {error}"))?;
+        let mut temporary = tempfile::Builder::new()
+            .prefix("boxy-download-")
+            .tempfile()
+            .map_err(|e| e.to_string())?;
+        let mut reader = response.into_reader().take(max_bytes.saturating_add(1));
+        let size =
+            std::io::copy(&mut reader, temporary.as_file_mut()).map_err(|e| e.to_string())?;
+        if size > max_bytes {
+            return Err("file_too_large".to_string());
+        }
+        if expected_size.is_some_and(|expected| size != expected) {
+            return Err("size_mismatch".to_string());
+        }
+        temporary
+            .as_file_mut()
+            .rewind()
+            .map_err(|e| e.to_string())?;
+        let (hash, size) =
+            file_tasks::hash_reader(temporary.as_file_mut()).map_err(str::to_string)?;
+        if expected_hash.is_some_and(|expected| hash != expected) {
+            return Err("content_mismatch".to_string());
+        }
+        temporary
+            .as_file_mut()
+            .rewind()
+            .map_err(|e| e.to_string())?;
+        file_tasks::install_stream_file(root, protected, relative, temporary, &hash, size)
+            .map_err(str::to_string)?;
+        Ok(json!({"path":relative,"sha256":hash,"size":size}))
+    }
 }
 
-fn run_shell_command(
-    shell: &str,
-    command: &str,
-    cwd: &Path,
-    timeout: Duration,
-    host: &dyn ConnectorHost,
-) -> Result<Option<CommandResult>, String> {
-    let mut process = shell_process(shell, command);
-    process
-        .current_dir(cwd)
+fn execute_http(params: &Value) -> Result<Value, String> {
+    let request: http_request::HttpRequestSpec =
+        serde_json::from_value(params.clone()).map_err(|_| "invalid_params")?;
+    let response = http_request::execute(&request);
+    Ok(
+        json!({"status":response.status,"headers":response.headers,"bodyBase64":URL_SAFE_NO_PAD.encode(&response.body),"error":response.error,"attempt":response.attempt}),
+    )
+}
+
+fn execute_process(params: &Value, host: &dyn ConnectorHost) -> Result<Value, String> {
+    let executable = params["executable"].as_str().ok_or("invalid_params")?;
+    let args: Vec<String> =
+        serde_json::from_value(params["args"].clone()).map_err(|_| "invalid_params")?;
+    let cwd = params.get("cwd").and_then(Value::as_str).map(PathBuf::from);
+    let elevated = params
+        .get("elevated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !host.approve_process(executable, &args, cwd.as_deref()) {
+        return Ok(json!({"approved":false}));
+    }
+    let timeout = params
+        .get("timeoutSeconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(60)
+        .clamp(1, MAX_PROCESS_SECONDS);
+    let output_limit = params
+        .get("maxOutputBytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(MAX_OUTPUT_BYTES as u64)
+        .clamp(1, MAX_OUTPUT_BYTES as u64) as usize;
+    let mut environment = BTreeMap::new();
+    if let Some(envs) = params.get("env").and_then(Value::as_object) {
+        if envs.len() > 64 {
+            return Err("invalid_environment".to_string());
+        }
+        let mut total = 0usize;
+        for (name, value) in envs {
+            let value = value.as_str().ok_or("invalid_environment")?;
+            if name.is_empty() || name.contains(['=', '\0']) || value.contains('\0') {
+                return Err("invalid_environment".to_string());
+            }
+            total = total.saturating_add(name.len()).saturating_add(value.len());
+            if total > 32 * 1024 {
+                return Err("invalid_environment".to_string());
+            }
+            environment.insert(name.clone(), value.to_string());
+        }
+    }
+    if elevated {
+        let (exit_code, timed_out, stdout, stderr, output_truncated) = run_elevated_process(
+            executable,
+            &args,
+            cwd.as_deref(),
+            &environment,
+            timeout,
+            output_limit,
+            host,
+        )?;
+        return Ok(
+            json!({"approved":true,"exitCode":exit_code,"timedOut":timed_out,"stdout":String::from_utf8_lossy(&stdout),"stderr":String::from_utf8_lossy(&stderr),"outputTruncated":output_truncated,"elevated":true}),
+        );
+    }
+    let mut command = Command::new(executable);
+    command
+        .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = process
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    command.envs(&environment);
+    #[cfg(windows)]
+    windows_process::configure_background(&mut command);
+    let mut child = command
         .spawn()
-        .map_err(|error| format!("cannot start the command: {error}"))?;
-    let Some(stdout) = child.stdout.take() else {
-        terminate_process_tree(&mut child);
-        let _ = child.wait();
-        return Err("command stdout pipe is unavailable".to_string());
-    };
-    let Some(stderr) = child.stderr.take() else {
-        terminate_process_tree(&mut child);
-        let _ = child.wait();
-        return Err("command stderr pipe is unavailable".to_string());
-    };
-    let (output_tx, output_rx) = std::sync::mpsc::channel();
-    let stdout_tx = output_tx.clone();
-    thread::spawn(move || {
-        let _ = stdout_tx.send((true, read_bounded_output(stdout)));
-    });
-    thread::spawn(move || {
-        let _ = output_tx.send((false, read_bounded_output(stderr)));
-    });
-    let deadline = SystemTime::now() + timeout;
+        .map_err(|error| format!("process_start:{error}"))?;
+    let stdout = child.stdout.take().ok_or("output_unavailable")?;
+    let stderr = child.stderr.take().ok_or("output_unavailable")?;
+    let stdout_limit = output_limit / 2;
+    let stderr_limit = output_limit - stdout_limit;
+    let out = thread::spawn(move || read_limited(stdout, stdout_limit));
+    let err = thread::spawn(move || read_limited(stderr, stderr_limit));
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout);
     let mut timed_out = false;
     loop {
         if host.should_stop() {
             terminate_process_tree(&mut child);
-            let _ = child.wait();
-            return Ok(None);
+            return Err("cancelled".to_string());
         }
-        match child.try_wait() {
-            Err(error) => {
-                terminate_process_tree(&mut child);
-                let _ = child.wait();
-                return Err(error.to_string());
-            }
-            Ok(Some(_)) => break,
-            Ok(None) if SystemTime::now() >= deadline => {
-                terminate_process_tree(&mut child);
-                timed_out = true;
-                break;
-            }
-            Ok(None) => thread::sleep(COMMAND_POLL_INTERVAL),
-        }
-    }
-    let status = child
-        .wait()
-        .map_err(|error| format!("cannot wait for the command: {error}"))?;
-    let mut stdout = None;
-    let mut stderr = None;
-    while stdout.is_none() || stderr.is_none() {
-        if host.should_stop() {
-            return Ok(None);
-        }
-        if SystemTime::now() >= deadline {
-            timed_out = true;
+        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
             break;
         }
-        match output_rx.recv_timeout(COMMAND_POLL_INTERVAL) {
-            Ok((true, result)) => {
-                stdout = Some(
-                    result.map_err(|error| format!("cannot read the command output: {error}"))?,
-                );
-            }
-            Ok((false, result)) => {
-                stderr = Some(
-                    result.map_err(|error| format!("cannot read the command output: {error}"))?,
-                );
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("cannot read the command output".to_string());
-            }
+        if std::time::Instant::now() >= deadline {
+            timed_out = true;
+            terminate_process_tree(&mut child);
+            break;
         }
+        thread::sleep(Duration::from_millis(40));
     }
-    Ok(Some(CommandResult {
-        exit_code: status.code(),
-        timed_out,
-        stdout: stdout
-            .map(|bytes| truncate_output(&bytes))
-            .unwrap_or_default(),
-        stderr: stderr
-            .map(|bytes| truncate_output(&bytes))
-            .unwrap_or_default(),
-    }))
+    let status = child.wait().map_err(|e| e.to_string())?;
+    let (stdout, out_truncated) = out.join().unwrap_or_default();
+    let (stderr, err_truncated) = err.join().unwrap_or_default();
+    Ok(
+        json!({"approved":true,"exitCode":status.code(),"timedOut":timed_out,"stdout":String::from_utf8_lossy(&stdout),"stderr":String::from_utf8_lossy(&stderr),"outputTruncated":out_truncated||err_truncated,"elevated":false}),
+    )
 }
 
-fn read_bounded_output(mut reader: impl Read) -> std::io::Result<Vec<u8>> {
-    let mut captured = Vec::with_capacity(MAX_COMMAND_OUTPUT_BYTES + 1);
-    let mut buffer = [0u8; 8192];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            return Ok(captured);
-        }
-        let remaining = MAX_COMMAND_OUTPUT_BYTES + 1 - captured.len();
-        captured.extend_from_slice(&buffer[..read.min(remaining)]);
-    }
+fn read_limited(mut reader: impl Read, limit: usize) -> (Vec<u8>, bool) {
+    let mut bytes = Vec::with_capacity(limit.min(8192));
+    let _ = reader
+        .by_ref()
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes);
+    let truncated = bytes.len() > limit;
+    bytes.truncate(limit);
+    (bytes, truncated)
 }
 
-fn shell_process(shell: &str, command: &str) -> Command {
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ElevatedRequest {
+    executable: String,
+    args: Vec<String>,
+    cwd: Option<PathBuf>,
+    env: BTreeMap<String, String>,
+    timeout_seconds: u64,
+    output_limit: usize,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    result_path: PathBuf,
+    cancel_path: PathBuf,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ElevatedResult {
+    exit_code: Option<i32>,
+    timed_out: bool,
+    output_truncated: bool,
+    cancelled: bool,
+}
+
+fn run_elevated_process(
+    executable: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+    environment: &BTreeMap<String, String>,
+    timeout: u64,
+    output_limit: usize,
+    host: &dyn ConnectorHost,
+) -> Result<(Option<i32>, bool, Vec<u8>, Vec<u8>, bool), String> {
+    if host.should_stop() {
+        return Err("cancelled".to_string());
+    }
     #[cfg(windows)]
     {
-        let mut process = match shell {
-            "powershell" => {
-                let mut process = Command::new("powershell");
-                process.args(["-NoProfile", "-NonInteractive", "-Command", command]);
-                process
-            }
-            _ => {
-                let mut process = Command::new("cmd");
-                process.args(["/C", command]);
-                process
-            }
-        };
-        windows_process::configure_background(&mut process);
-        process
+        run_elevated_windows(
+            executable,
+            args,
+            cwd,
+            environment,
+            timeout,
+            output_limit,
+            host,
+        )
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     {
-        #[cfg(target_os = "macos")]
-        use std::os::unix::process::CommandExt;
-
-        let mut process = Command::new(shell);
-        process.args(["-c", command]);
-        #[cfg(target_os = "macos")]
-        process.process_group(0);
-        process
+        run_elevated_macos(
+            executable,
+            args,
+            cwd,
+            environment,
+            timeout,
+            output_limit,
+            host,
+        )
     }
 }
 
-fn terminate_process_tree(child: &mut std::process::Child) {
+#[cfg(windows)]
+fn run_elevated_windows(
+    executable: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+    environment: &BTreeMap<String, String>,
+    timeout: u64,
+    output_limit: usize,
+    host: &dyn ConnectorHost,
+) -> Result<(Option<i32>, bool, Vec<u8>, Vec<u8>, bool), String> {
+    use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, GetLastError, WAIT_OBJECT_0},
+        System::Threading::{GetExitCodeProcess, WaitForSingleObject},
+        UI::Shell::{
+            ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+        },
+    };
+    let directory = tempfile::Builder::new()
+        .prefix("boxy-elevated-")
+        .tempdir()
+        .map_err(|e| e.to_string())?;
+    let stdout_path = directory.path().join("stdout");
+    let stderr_path = directory.path().join("stderr");
+    let result_path = directory.path().join("result.json");
+    let cancel_path = directory.path().join("cancel");
+    fs::write(&stdout_path, []).map_err(|e| e.to_string())?;
+    fs::write(&stderr_path, []).map_err(|e| e.to_string())?;
+    let request = ElevatedRequest {
+        executable: executable.to_string(),
+        args: args.to_vec(),
+        cwd: cwd.map(Path::to_path_buf),
+        env: environment.clone(),
+        timeout_seconds: timeout,
+        output_limit,
+        stdout_path: stdout_path.clone(),
+        stderr_path: stderr_path.clone(),
+        result_path: result_path.clone(),
+        cancel_path,
+    };
+    let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&request).map_err(|e| e.to_string())?);
+    if payload.len() > 24_000 {
+        return Err("elevated_request_too_large".to_string());
+    }
+    let executable = env::current_exe().map_err(|e| e.to_string())?;
+    let wide = |value: &OsStr| value.encode_wide().chain(Some(0)).collect::<Vec<_>>();
+    let verb = wide(OsStr::new("runas"));
+    let file = wide(executable.as_os_str());
+    let parameters = wide(OsStr::new(&format!("--elevated-exec {payload}")));
+    let directory_path = executable.parent().map(|path| wide(path.as_os_str()));
+    let mut info = SHELLEXECUTEINFOW::default();
+    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+    info.lpVerb = verb.as_ptr();
+    info.lpFile = file.as_ptr();
+    info.lpParameters = parameters.as_ptr();
+    info.lpDirectory = directory_path
+        .as_ref()
+        .map_or(std::ptr::null(), |path| path.as_ptr());
+    info.nShow = 0;
+    if unsafe { ShellExecuteExW(&mut info) } == 0 || info.hProcess.is_null() {
+        let error = unsafe { GetLastError() };
+        return Err(if error == 1223 {
+            "system authorization was cancelled".to_string()
+        } else {
+            format!("elevated process could not start (Windows error {error})")
+        });
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout.saturating_add(15));
+    let mut cancelled = false;
+    loop {
+        if host.should_stop() && !cancelled {
+            fs::write(&request.cancel_path, []).map_err(|e| e.to_string())?;
+            cancelled = true;
+        }
+        let waited = unsafe { WaitForSingleObject(info.hProcess, 100) };
+        if waited == WAIT_OBJECT_0 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            unsafe {
+                windows_sys::Win32::System::Threading::TerminateProcess(info.hProcess, 1);
+                CloseHandle(info.hProcess);
+            }
+            return Err("elevated process helper did not complete".to_string());
+        }
+    }
+    let mut helper_code = 1u32;
+    let read_code = unsafe { GetExitCodeProcess(info.hProcess, &mut helper_code) } != 0;
+    unsafe {
+        CloseHandle(info.hProcess);
+    }
+    if !read_code || helper_code != 0 {
+        return Err("elevated process helper failed".to_string());
+    }
+    let result: ElevatedResult =
+        serde_json::from_slice(&fs::read(result_path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    if cancelled || result.cancelled {
+        return Err("cancelled".to_string());
+    }
+    Ok((
+        result.exit_code,
+        result.timed_out,
+        fs::read(stdout_path).map_err(|e| e.to_string())?,
+        fs::read(stderr_path).map_err(|e| e.to_string())?,
+        result.output_truncated,
+    ))
+}
+
+#[cfg(windows)]
+fn run_elevated_child(request: ElevatedRequest) -> Result<(), String> {
+    let mut command = Command::new(&request.executable);
+    command
+        .args(&request.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .envs(&request.env);
+    if let Some(cwd) = &request.cwd {
+        command.current_dir(cwd);
+    }
+    windows_process::configure_background(&mut command);
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let stdout = child.stdout.take().ok_or("elevated_stdout_unavailable")?;
+    let stderr = child.stderr.take().ok_or("elevated_stderr_unavailable")?;
+    let out_limit = request.output_limit / 2;
+    let err_limit = request.output_limit - out_limit;
+    let out = thread::spawn(move || read_limited(stdout, out_limit));
+    let err = thread::spawn(move || read_limited(stderr, err_limit));
+    let deadline = std::time::Instant::now() + Duration::from_secs(request.timeout_seconds);
+    let mut timed_out = false;
+    let mut cancelled = false;
+    loop {
+        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+            break;
+        }
+        if request.cancel_path.exists() {
+            cancelled = true;
+            terminate_process_tree(&mut child);
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            timed_out = true;
+            terminate_process_tree(&mut child);
+            break;
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+    let status = child.wait().map_err(|e| e.to_string())?;
+    let (stdout, out_truncated) = out.join().unwrap_or_default();
+    let (stderr, err_truncated) = err.join().unwrap_or_default();
+    fs::write(&request.stdout_path, stdout).map_err(|e| e.to_string())?;
+    fs::write(&request.stderr_path, stderr).map_err(|e| e.to_string())?;
+    let result = ElevatedResult {
+        exit_code: status.code(),
+        timed_out,
+        output_truncated: out_truncated || err_truncated,
+        cancelled,
+    };
+    fs::write(
+        request.result_path,
+        serde_json::to_vec(&result).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn run_elevated_macos(
+    executable: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+    environment: &BTreeMap<String, String>,
+    timeout: u64,
+    output_limit: usize,
+    host: &dyn ConnectorHost,
+) -> Result<(Option<i32>, bool, Vec<u8>, Vec<u8>, bool), String> {
+    use std::os::unix::process::CommandExt;
+    let mut command_parts = Vec::new();
+    if let Some(cwd) = cwd {
+        command_parts.push(format!("cd {} &&", shell_quote(&cwd.to_string_lossy())));
+    }
+    if !environment.is_empty() {
+        command_parts.push("env".to_string());
+        for (name, value) in environment {
+            command_parts.push(shell_quote(&format!("{name}={value}")));
+        }
+    }
+    command_parts.push(shell_quote(executable));
+    command_parts.extend(args.iter().map(|arg| shell_quote(arg)));
+    let command_line = format!(
+        "{} 2>&1; code=$?; printf '\\n__BOXY_EXIT_CODE:%s' \"$code\"; exit 0",
+        command_parts.join(" ")
+    );
+    let encoded = base64::engine::general_purpose::STANDARD.encode(command_line);
+    let shell_command = format!("/usr/bin/printf '%s' '{encoded}' | /usr/bin/base64 -D | /bin/sh");
+    let script = format!(
+        "do shell script {} with administrator privileges",
+        applescript_quote(&shell_command)
+    );
+    let mut child = Command::new("/usr/bin/osascript")
+        .args(["-e", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let out_limit = output_limit;
+    let out = thread::spawn(move || {
+        read_limited(child.stdout.take().unwrap(), out_limit.saturating_add(64))
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout + 15);
+    let status = loop {
+        if host.should_stop() {
+            terminate_process_tree(&mut child);
+            return Err("cancelled".to_string());
+        }
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            terminate_process_tree(&mut child);
+            break child.wait().map_err(|e| e.to_string())?;
+        }
+        thread::sleep(Duration::from_millis(40));
+    };
+    let (mut stdout, truncated) = out.join().unwrap_or_default();
+    let stderr = child
+        .stderr
+        .take()
+        .map(|mut stream| {
+            let mut bytes = Vec::new();
+            let _ = stream.take(output_limit as u64).read_to_end(&mut bytes);
+            bytes
+        })
+        .unwrap_or_default();
+    if !status.success() {
+        return Err(String::from_utf8_lossy(&stderr).into_owned());
+    }
+    let output = String::from_utf8_lossy(&stdout).to_string();
+    let marker = "__BOXY_EXIT_CODE:";
+    let (body, code) = output
+        .rsplit_once(marker)
+        .ok_or("elevated result is unavailable")?;
+    let exit_code = code
+        .trim()
+        .parse::<i32>()
+        .map_err(|_| "elevated result is invalid")?;
+    stdout = body.as_bytes().to_vec();
+    let was_truncated = truncated || stdout.len() > output_limit;
+    stdout.truncate(output_limit);
+    Ok((Some(exit_code), false, stdout, Vec::new(), was_truncated))
+}
+
+#[cfg(target_os = "macos")]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(target_os = "macos")]
+fn applescript_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn terminate_process_tree(child: &mut Child) {
     #[cfg(windows)]
     {
         let mut command = Command::new("taskkill.exe");
-        command.args(["/T", "/F", "/PID", &child.id().to_string()]);
-        command.stdout(Stdio::null()).stderr(Stdio::null());
+        command
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         windows_process::configure_background(&mut command);
         let _ = command.status();
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     unsafe {
         libc::kill(-(child.id() as i32), libc::SIGKILL);
     }
     let _ = child.kill();
 }
 
-fn default_shell() -> &'static str {
-    #[cfg(windows)]
-    {
-        "cmd"
+fn register_watch(
+    params: &Value,
+    watches: &mut HashMap<
+        String,
+        (
+            notify::RecommendedWatcher,
+            mpsc::Receiver<notify::Result<notify::Event>>,
+            PathBuf,
+        ),
+    >,
+) -> Result<Value, String> {
+    let (root, _) = task_root(params)?;
+    let relative = params["path"].as_str().ok_or("invalid_params")?;
+    let path = file_tasks::safe_path(&root, relative, false).map_err(str::to_string)?;
+    let id = params["watchId"]
+        .as_str()
+        .ok_or("invalid_params")?
+        .to_string();
+    if id.is_empty() || id.len() > 128 || watches.contains_key(&id) {
+        return Err("invalid_watch".to_string());
     }
-    #[cfg(not(windows))]
-    {
-        "sh"
-    }
-}
-
-fn truncate_output(bytes: &[u8]) -> String {
-    let text = String::from_utf8_lossy(bytes);
-    if text.len() <= MAX_COMMAND_OUTPUT_BYTES {
-        return text.to_string();
-    }
-    let mut boundary = MAX_COMMAND_OUTPUT_BYTES;
-    while boundary > 0 && !text.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    format!("{}\n[output truncated]", &text[..boundary])
-}
-
-fn task_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
-    if relative.is_empty()
-        || relative.starts_with('/')
-        || relative.contains('\\')
-        || relative
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part == "..")
-    {
-        return Err("directory task path is unsafe".to_string());
-    }
-    Ok(root.join(relative))
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| "target path has no parent folder".to_string())?;
-    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    let mut temporary = tempfile::Builder::new()
-        .prefix(".boxy-")
-        .tempfile_in(parent)
-        .map_err(|error| format!("cannot create temporary file: {error}"))?;
-    temporary
-        .write_all(bytes)
-        .and_then(|_| temporary.as_file().sync_all())
-        .map_err(|error| format!("cannot write temporary file: {error}"))?;
-    temporary
-        .persist(path)
-        .map(|_| ())
-        .map_err(|error| format!("cannot replace {}: {}", path.display(), error.error))
-}
-
-fn replace_session_if_unchanged(
-    path: &Path,
-    expected_sha256: &str,
-    ciphertext: &[u8],
-) -> Result<String, String> {
-    if ciphertext.is_empty()
-        || ciphertext.len() > MAX_SESSION_BYTES
-        || !ciphertext.len().is_multiple_of(8)
-    {
-        return Err("writeback ciphertext has an invalid size".to_string());
-    }
-    let current = read_session_ciphertext(path)?;
-    if sha256_base64url(&current) != expected_sha256 {
-        return Err(
-            "session changed while authorization was open; no write was performed".to_string(),
-        );
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| "session path has no parent folder".to_string())?;
-    let mut temporary = tempfile::Builder::new()
-        .prefix(".boxy-session-")
-        .tempfile_in(parent)
-        .map_err(|error| format!("cannot create temporary session file: {error}"))?;
-    temporary
-        .write_all(ciphertext)
-        .and_then(|_| temporary.as_file().sync_all())
-        .map_err(|error| format!("cannot write temporary session file: {error}"))?;
-    let current = read_session_ciphertext(path)?;
-    if sha256_base64url(&current) != expected_sha256 {
-        return Err(
-            "session changed while authorization was open; no write was performed".to_string(),
-        );
-    }
-    temporary
-        .persist(path)
-        .map_err(|error| format!("cannot replace session: {}", error.error))?;
-    let written = read_session_ciphertext(path)?;
-    if written != ciphertext {
-        return Err("written session verification failed".to_string());
-    }
-    Ok(sha256_base64url(&written))
-}
-
-fn machine_report() -> Result<MachineReport, String> {
-    #[cfg(target_os = "macos")]
-    {
-        let output = Command::new("/usr/sbin/ioreg")
-            .args(["-rd1", "-c", "IOPlatformExpertDevice"])
-            .output()
-            .map_err(|error| format!("cannot read the native device identity: {error}"))?;
-        if !output.status.success() || output.stdout.len() > 64 * 1024 {
-            return Err("native device identity is unavailable".to_string());
-        }
-        let text = String::from_utf8(output.stdout)
-            .map_err(|_| "native device identity is not UTF-8".to_string())?;
-        let uuid = ioreg_property(&text, "IOPlatformUUID")
-            .ok_or_else(|| "native device UUID is unavailable".to_string())?;
-        let sv_device_hash = ioreg_property(&text, "IOPlatformSerialNumber")
-            .filter(|serial| !serial.is_empty())
-            .unwrap_or(uuid);
-        let model = command_output("/usr/sbin/sysctl", &["-n", "hw.model"]);
-        let virtual_machine = ["virtual", "vmware", "parallels", "qemu", "virtualbox"]
-            .iter()
-            .any(|needle| model.to_ascii_lowercase().contains(needle));
-        return Ok(MachineReport {
-            platform: "macos".to_string(),
-            machine_material: uuid.to_string(),
-            details: DeviceDetails {
-                operating_system: command_output("/usr/bin/sw_vers", &["-productVersion"]),
-                architecture: env::consts::ARCH.to_string(),
-                model,
+    let recursive = params
+        .get("recursive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let (sender, receiver) = mpsc::channel();
+    let mut watcher = notify::recommended_watcher(sender).map_err(|error| error.to_string())?;
+    watcher
+        .watch(
+            &path,
+            if recursive {
+                RecursiveMode::Recursive
+            } else {
+                RecursiveMode::NonRecursive
             },
-            is_virtual_machine: virtual_machine,
-            hardware_device_id: uuid.to_ascii_lowercase(),
-            sv_device_hash: sv_device_hash.to_string(),
-        });
-    }
-    #[cfg(windows)]
-    {
-        let raw = read_raw_smbios()?;
-        let printable = String::from_utf8_lossy(&raw).to_ascii_lowercase();
-        let is_virtual_machine = [
-            "virtualbox",
-            "vmware",
-            "qemu",
-            "kvm",
-            "hyper-v",
-            "parallels",
-        ]
-        .iter()
-        .any(|needle| printable.contains(needle));
-        return Ok(MachineReport {
-            platform: "windows".to_string(),
-            hardware_device_id: device_ids::hardware_uuid(&raw)?,
-            sv_device_hash: device_ids::sv_device_hash()?,
-            machine_material: URL_SAFE_NO_PAD.encode(raw),
-            details: DeviceDetails {
-                operating_system: "Windows".to_string(),
-                architecture: env::consts::ARCH.to_string(),
-                model: "SMBIOS device".to_string(),
-            },
-            is_virtual_machine,
-        });
-    }
-    #[cfg(not(any(target_os = "macos", windows)))]
-    Err("the connector currently supports macOS and Windows".to_string())
-}
-
-#[cfg(target_os = "macos")]
-fn ioreg_property<'a>(text: &'a str, property: &str) -> Option<&'a str> {
-    let prefix = format!("\"{property}\" = \"");
-    text.lines().find_map(|line| {
-        line.trim()
-            .strip_prefix(&prefix)
-            .and_then(|value| value.strip_suffix('"'))
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn command_output(command: &str, arguments: &[&str]) -> String {
-    Command::new(command)
-        .args(arguments)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|output| output.trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
-#[cfg(windows)]
-fn read_raw_smbios() -> Result<Vec<u8>, String> {
-    use windows_sys::Win32::System::SystemInformation::GetSystemFirmwareTable;
-    const PROVIDER_RSMB: u32 = u32::from_be_bytes(*b"RSMB");
-    const TABLE_RSDT: u32 = u32::from_be_bytes(*b"RSDT");
-    let required =
-        unsafe { GetSystemFirmwareTable(PROVIDER_RSMB, TABLE_RSDT, std::ptr::null_mut(), 0) }
-            as usize;
-    if !(8..=MAX_SESSION_BYTES).contains(&required) {
-        return Err("native SMBIOS data has an invalid size".to_string());
-    }
-    let mut raw = vec![0u8; required];
-    let received = unsafe {
-        GetSystemFirmwareTable(
-            PROVIDER_RSMB,
-            TABLE_RSDT,
-            raw.as_mut_ptr(),
-            u32::try_from(raw.len()).map_err(|_| "native SMBIOS data is too large".to_string())?,
         )
-    } as usize;
-    if !(8..=required).contains(&received) {
-        return Err("native SMBIOS data is unavailable".to_string());
+        .map_err(|error| error.to_string())?;
+    watches.insert(id.clone(), (watcher, receiver, root));
+    Ok(json!({"watchId":id,"registered":true}))
+}
+
+fn send_watch_events(
+    config: &Config,
+    connection: &str,
+    key: &SigningKey,
+    watches: &mut HashMap<
+        String,
+        (
+            notify::RecommendedWatcher,
+            mpsc::Receiver<notify::Result<notify::Event>>,
+            PathBuf,
+        ),
+    >,
+) -> Result<(), String> {
+    let mut events = Vec::new();
+    for (watch_id, (_, rx, root)) in watches.iter() {
+        while let Ok(Ok(event)) = rx.try_recv() {
+            for path in event.paths {
+                let Ok(relative) = path.strip_prefix(root) else {
+                    continue;
+                };
+                let Ok((sha256, _)) = file_tasks::hash_path(&path) else {
+                    continue;
+                };
+                events.push(json!({"watchId":watch_id,"path":relative.to_string_lossy().replace('\\',"/"),"sha256":sha256,"kind":"changed"}));
+                if events.len() >= 256 {
+                    break;
+                }
+            }
+        }
     }
-    raw.truncate(received);
-    Ok(raw)
+    if !events.is_empty() {
+        post_signed(
+            config,
+            &format!("/api/connections/{connection}/events"),
+            key,
+            &json!({"events":events}),
+        )?;
+    }
+    Ok(())
+}
+
+fn execute_mount(
+    config: &Config,
+    params: &Value,
+    kind: &str,
+    managers: &mut HashMap<PathBuf, mounts::MountManager>,
+) -> Result<Value, String> {
+    let (root, protected) = task_root(params)?;
+    let protected = protected.unwrap_or_else(|| root.join(".boxy-protected-placeholder"));
+    let manager = managers
+        .entry(root.clone())
+        .or_insert_with(|| mounts::MountManager::new(&root, &protected, &config.server_url));
+    if kind == "fs.mount" {
+        let spec: mounts::MountSpec =
+            serde_json::from_value(params["mount"].clone()).map_err(|_| "invalid_params")?;
+        let path = manager.mount(&spec).map_err(str::to_string)?;
+        Ok(json!({"mounted":true,"path":path}))
+    } else {
+        let spec: mounts::MountSpec =
+            serde_json::from_value(params["mount"].clone()).map_err(|_| "invalid_params")?;
+        manager.unmount(&spec).map_err(str::to_string)?;
+        Ok(json!({"mounted":false}))
+    }
 }
 
 fn post_json<T: Serialize, R: for<'de> Deserialize<'de>>(
-    server: &str,
+    config: &Config,
     path: &str,
     body: &T,
 ) -> Result<R, String> {
-    let response = ureq::post(&format!("{server}{path}"))
+    let response = ureq::post(&format!("{}{}", config.server_url, path))
         .timeout(Duration::from_secs(30))
         .set("Content-Type", "application/json")
-        .send_json(serde_json::to_value(body).map_err(|error| error.to_string())?);
-    parse_response(response)
+        .send_json(serde_json::to_value(body).map_err(|e| e.to_string())?);
+    match response {
+        Ok(response) => response.into_json().map_err(|e| e.to_string()),
+        Err(ureq::Error::Status(status, response)) => Err(format!(
+            "service rejected request ({status}): {}",
+            response.into_string().unwrap_or_default()
+        )),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
-fn get_signed_poll<R: for<'de> Deserialize<'de>>(
-    server: &str,
+fn get_signed<R: for<'de> Deserialize<'de>>(
+    config: &Config,
     path: &str,
     key: &SigningKey,
     host: &dyn ConnectorHost,
-) -> Result<Option<R>, String> {
-    let mut failures = 0;
-    loop {
-        if host.should_stop() {
-            return Ok(None);
-        }
+) -> Result<R, String> {
+    while !host.should_stop() {
         let (nonce, signature) = request_signature(key, "GET", path);
-        let response = ureq::get(&format!("{server}{path}"))
+        match ureq::get(&format!("{}{}", config.server_url, path))
             .timeout(Duration::from_secs(30))
             .set("X-Connector-Nonce", &nonce)
             .set("X-Connector-Signature", &signature)
-            .call();
-        let retry = match response {
+            .call()
+        {
             Ok(response) => {
-                let mut body = Vec::new();
-                match response.into_reader().read_to_end(&mut body) {
-                    Ok(_) => {
-                        return serde_json::from_slice(&body).map(Some).map_err(|_| {
-                            "authorization service returned invalid poll JSON".to_string()
-                        });
-                    }
-                    Err(error) if retryable_poll_read_error(&error) => true,
-                    Err(_) => {
-                        return Err(
-                            "authorization service poll response could not be read".to_string()
-                        );
-                    }
+                let mut bytes = Vec::new();
+                response
+                    .into_reader()
+                    .take((MAX_TASK_BYTES + 1) as u64)
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| e.to_string())?;
+                if bytes.len() > MAX_TASK_BYTES {
+                    return Err("service poll response is too large".to_string());
+                }
+                return serde_json::from_slice(&bytes)
+                    .map_err(|e| format!("service returned invalid poll JSON: {e}"));
+            }
+            Err(ureq::Error::Status(408 | 429 | 502 | 503 | 504, _))
+            | Err(ureq::Error::Transport(_)) => {
+                if wait_or_stop(host, Duration::from_secs(1)) {
+                    break;
                 }
             }
-            Err(ureq::Error::Status(status, _)) if retryable_poll_status(status) => true,
-            Err(ureq::Error::Transport(_)) => true,
             Err(ureq::Error::Status(status, response)) => {
-                let mut detail = String::new();
-                let _ = response
-                    .into_reader()
-                    .take(4096)
-                    .read_to_string(&mut detail);
                 return Err(format!(
-                    "authorization service rejected poll ({status}): {}",
-                    detail.trim()
-                ));
-            }
-        };
-        if retry {
-            failures += 1;
-            if failures > MAX_POLL_RETRIES {
-                return Err(
-                    "authorization service poll failed after repeated temporary network errors"
-                        .to_string(),
-                );
-            }
-            let delay = poll_retry_delay(failures);
-            if wait_or_stop(host, delay) {
-                return Ok(None);
+                    "service rejected poll ({status}): {}",
+                    response.into_string().unwrap_or_default()
+                ))
             }
         }
     }
+    Err("connection closed".to_string())
 }
 
-fn retryable_poll_status(status: u16) -> bool {
-    matches!(status, 408 | 429 | 502 | 503 | 504)
-}
-
-fn retryable_poll_read_error(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        std::io::ErrorKind::ConnectionAborted
-            | std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::BrokenPipe
-            | std::io::ErrorKind::TimedOut
-            | std::io::ErrorKind::UnexpectedEof
-    )
-}
-
-fn poll_retry_delay(failures: u32) -> Duration {
-    POLL_RETRY_BASE_DELAY
-        .saturating_mul(1_u32 << failures.saturating_sub(1).min(8))
-        .min(POLL_RETRY_MAX_DELAY)
-}
-
-fn post_signed_json_status<T: Serialize>(
-    server: &str,
+fn post_signed<T: Serialize>(
+    config: &Config,
     path: &str,
     key: &SigningKey,
     body: &T,
-) -> Result<(u16, serde_json::Value), String> {
+) -> Result<(), String> {
+    let serialized = serde_json::to_vec(body).map_err(|e| e.to_string())?;
     let (nonce, signature) = request_signature(key, "POST", path);
-    let response = ureq::post(&format!("{server}{path}"))
+    let response = ureq::post(&format!("{}{}", config.server_url, path))
         .timeout(Duration::from_secs(30))
         .set("Content-Type", "application/json")
         .set("X-Connector-Nonce", &nonce)
         .set("X-Connector-Signature", &signature)
-        .send_json(serde_json::to_value(body).map_err(|error| error.to_string())?);
-    let (status, response) = match response {
-        Ok(response) => (response.status(), response),
-        Err(ureq::Error::Status(status, response)) => (status, response),
-        Err(_) => return Err("authorization service request failed".to_string()),
-    };
-    let value = response
-        .into_json()
-        .map_err(|_| "authorization service returned invalid JSON".to_string())?;
-    Ok((status, value))
-}
-
-fn put_task_content(
-    config: &Config,
-    key: &SigningKey,
-    path: &str,
-    bytes: &[u8],
-) -> Result<(), String> {
-    let (nonce, signature) = request_signature(key, "PUT", path);
-    match ureq::put(&format!("{}{}", config.server_url, path))
-        .timeout(Duration::from_secs(30))
-        .set("Content-Length", &bytes.len().to_string())
-        .set("X-Connector-Nonce", &nonce)
-        .set("X-Connector-Signature", &signature)
-        .send_bytes(bytes)
-    {
+        .send_bytes(&serialized);
+    match response {
         Ok(_) => Ok(()),
-        Err(error) => Err(format!("cannot upload directory content: {error}")),
+        Err(ureq::Error::Status(status, response)) => Err(format!(
+            "service rejected request ({status}): {}",
+            response.into_string().unwrap_or_default()
+        )),
+        Err(error) => Err(error.to_string()),
     }
 }
 
-fn get_task_content(config: &Config, key: &SigningKey, path: &str) -> Result<Vec<u8>, String> {
-    let (nonce, signature) = request_signature(key, "GET", path);
-    let response = ureq::get(&format!("{}{}", config.server_url, path))
-        .timeout(Duration::from_secs(30))
-        .set("X-Connector-Nonce", &nonce)
-        .set("X-Connector-Signature", &signature)
-        .call()
-        .map_err(|error| format!("cannot download directory content: {error}"))?;
-    let mut bytes = Vec::new();
-    response
-        .into_reader()
-        .take(2 * 1024 * 1024 * 1024)
-        .read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
-    Ok(bytes)
-}
-
-fn complete_task(
+fn post_receipt(
     config: &Config,
     key: &SigningKey,
     path: &str,
-    mut body: serde_json::Value,
+    body: &Value,
     host: &dyn ConnectorHost,
 ) -> Result<(), String> {
-    let serialized_result = serde_json::to_vec(&body).map_err(|error| error.to_string());
-    zeroize_json(&mut body);
-    let serialized = Zeroizing::new(serialized_result?);
-    post_signed_receipt(&config.server_url, path, key, &serialized, host)
-}
-
-fn post_signed_receipt(
-    server: &str,
-    path: &str,
-    key: &SigningKey,
-    serialized: &[u8],
-    host: &dyn ConnectorHost,
-) -> Result<(), String> {
+    let serialized = Zeroizing::new(serde_json::to_vec(body).map_err(|e| e.to_string())?);
     let mut retries = 0;
     loop {
         if retries > 0 && host.should_stop() {
-            return Err("directory task receipt was interrupted".to_string());
+            return Err("receipt interrupted".to_string());
         }
         let (nonce, signature) = request_signature(key, "POST", path);
-        let response = ureq::post(&format!("{server}{path}"))
+        let response = ureq::post(&format!("{}{}", config.server_url, path))
             .timeout(Duration::from_secs(30))
             .set("Content-Type", "application/json")
             .set("X-Connector-Nonce", &nonce)
             .set("X-Connector-Signature", &signature)
-            .send_bytes(serialized);
-
-        let retry = match response {
+            .send_bytes(&serialized);
+        match response {
             Ok(response) => {
-                let mut response_body = Vec::new();
-                match response.into_reader().read_to_end(&mut response_body) {
-                    Ok(_) => {
-                        let _: serde_json::Value =
-                            serde_json::from_slice(&response_body).map_err(|_| {
-                                "authorization service returned invalid JSON".to_string()
-                            })?;
-                        return Ok(());
-                    }
-                    Err(error) if retryable_poll_read_error(&error) => true,
-                    Err(_) => {
-                        return Err("authorization service response could not be read".to_string());
-                    }
+                let _: Value = response.into_json().map_err(|e| e.to_string())?;
+                return Ok(());
+            }
+            Err(ureq::Error::Status(425, _)) | Err(ureq::Error::Transport(_)) if retries < 5 => {
+                retries += 1;
+                if wait_or_stop(host, Duration::from_millis(250 * retries as u64)) {
+                    return Err("receipt interrupted".to_string());
                 }
             }
-            Err(ureq::Error::Transport(error))
-                if matches!(
-                    error.kind(),
-                    ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Dns | ureq::ErrorKind::Io
-                ) =>
-            {
-                true
-            }
-            Err(ureq::Error::Status(425, response)) => {
-                let _ = response.into_string();
-                true
-            }
             Err(ureq::Error::Status(status, response)) => {
-                let detail = response.into_string().unwrap_or_default();
                 return Err(format!(
-                    "authorization service rejected the receipt ({status}): {detail}"
-                ));
+                    "receipt rejected ({status}): {}",
+                    response.into_string().unwrap_or_default()
+                ))
             }
-            Err(_) => return Err("authorization service receipt request failed".to_string()),
-        };
-
-        if retry {
-            retries += 1;
-            if retries > MAX_RECEIPT_RETRIES {
-                return Err(
-                    "authorization service receipt failed after repeated temporary network errors"
-                        .to_string(),
-                );
-            }
-            if wait_or_stop(host, poll_retry_delay(retries)) {
-                return Err("directory task receipt was interrupted".to_string());
-            }
+            Err(error) => return Err(error.to_string()),
         }
     }
 }
 
-fn zeroize_json(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::String(value) => value.zeroize(),
-        serde_json::Value::Array(values) => {
-            for value in values {
-                zeroize_json(value);
-            }
-        }
-        serde_json::Value::Object(values) => {
-            for (mut key, mut value) in std::mem::take(values) {
-                key.zeroize();
-                zeroize_json(&mut value);
-            }
-        }
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
-    }
-}
-
-pub(crate) fn request_signature(key: &SigningKey, method: &str, path: &str) -> (String, String) {
+fn request_signature(key: &SigningKey, method: &str, path: &str) -> (String, String) {
     let nonce = format!("{}-{}", unix_timestamp(), random_suffix());
-    let signed = format!("{method}\n{path}\n{nonce}");
+    let message = format!("{method}\n{path}\n{nonce}");
     (
         nonce,
-        URL_SAFE_NO_PAD.encode(key.sign(signed.as_bytes()).to_bytes()),
+        URL_SAFE_NO_PAD.encode(key.sign(message.as_bytes()).to_bytes()),
     )
 }
 
 fn random_suffix() -> String {
     let mut bytes = [0u8; 16];
-    let mut rng = OsRng;
-    rng.fill_bytes(&mut bytes);
+    OsRng.fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
-fn parse_response<R: for<'de> Deserialize<'de>>(
-    response: Result<ureq::Response, ureq::Error>,
-) -> Result<R, String> {
-    match response {
-        Ok(response) => response
-            .into_json()
-            .map_err(|error| format!("authorization service returned invalid JSON: {error}")),
-        Err(ureq::Error::Status(status, response)) => {
-            let detail = response.into_string().unwrap_or_default();
-            Err(format!(
-                "authorization service rejected the request ({status}): {detail}"
-            ))
+fn wait_or_stop(host: &dyn ConnectorHost, duration: Duration) -> bool {
+    let deadline = std::time::Instant::now() + duration;
+    while !host.should_stop() {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return false;
         }
-        Err(error) => Err(format!("authorization service request failed: {error}")),
+        thread::sleep(left.min(Duration::from_millis(100)));
     }
+    true
+}
+
+fn validate_browser_url(server: &str, browser: &str) -> Result<Url, String> {
+    let service = Url::parse(server).map_err(|_| "invalid service URL")?;
+    let browser = Url::parse(browser).map_err(|_| "invalid browser URL")?;
+    if service.origin() != browser.origin()
+        || !browser.username().is_empty()
+        || browser.password().is_some()
+        || browser.fragment().is_some()
+    {
+        return Err("service returned a browser URL outside its origin".to_string());
+    }
+    Ok(browser)
+}
+
+fn zeroize_json(value: &mut Value) {
+    match value {
+        Value::String(s) => s.zeroize(),
+        Value::Array(values) => values.iter_mut().for_each(zeroize_json),
+        Value::Object(values) => {
+            for (_, value) in values.iter_mut() {
+                zeroize_json(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn sha256_base64url(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(bytes))
 }
 
-fn unix_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
-}
-
-fn unix_timestamp_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0)
-}
-
-fn validate_browser_url(server_url: &str, browser_url: &str) -> Result<Url, String> {
-    let service =
-        Url::parse(server_url).map_err(|_| "authorization service URL is invalid".to_string())?;
-    let browser =
-        Url::parse(browser_url).map_err(|_| "authorization browser URL is invalid".to_string())?;
-    if service.origin() != browser.origin()
-        || !browser.username().is_empty()
-        || browser.password().is_some()
-        || browser.fragment().is_some()
-    {
-        return Err(
-            "authorization browser URL is not issued by the configured service".to_string(),
-        );
-    }
-    let route_id = browser
-        .path()
-        .strip_prefix("/d_")
-        .and_then(|path| path.strip_suffix('/'));
-    if !route_id.is_some_and(|id| {
-        id.len() == 32
-            && id
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    }) {
-        return Err("authorization browser URL has an invalid device route".to_string());
-    }
-    let mut parameters = browser.query_pairs();
-    let Some((name, authorization)) = parameters.next() else {
-        return Err("authorization browser URL has no access parameter".to_string());
-    };
-    if name != "authorization"
-        || parameters.next().is_some()
-        || !is_capability_id(authorization.as_ref())
-    {
-        return Err("authorization browser URL has an invalid access parameter".to_string());
-    }
-    Ok(browser)
-}
-
-fn is_capability_id(value: &str) -> bool {
-    value.len() == 43
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-}
-
-#[cfg(test)]
-#[path = "../../test/connector_regression.rs"]
-mod connector_regression;
-
 #[cfg(test)]
 #[path = "../../test/core_runner.rs"]
-mod core_runner_tests;
-
-#[cfg(test)]
-#[path = "../../test/local_images.rs"]
-mod local_images_tests;
-
-#[cfg(test)]
-#[path = "../../test/progress.rs"]
-mod progress_tests;
+mod tests;

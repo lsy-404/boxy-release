@@ -45,13 +45,13 @@ fn cloud_navigation_accepts_https_and_loopback_without_business_host_rules() {
 #[test]
 fn remote_pages_cannot_navigate_to_local_files_or_native_protocols() {
     for url in [
-        "file:///C:/private/session",
+        "file:///C:/private/private-data",
         "tauri://localhost/",
-        "asset://localhost/private/session",
+        "asset://localhost/private/private-data",
         "http://public.example/editor",
         "javascript:alert(1)",
         "data:text/html,test",
-        "blob:file:///private/session",
+        "blob:file:///private/private-data",
     ] {
         assert!(!allowed_navigation(&Url::parse(url).unwrap()), "{url}");
     }
@@ -66,8 +66,8 @@ fn cleanup_removes_owned_profile_and_preserves_neighboring_files() {
         .unwrap();
     let profile = runtime.path().join("webview");
     std::fs::create_dir(&profile).unwrap();
-    std::fs::write(profile.join("Cookies"), b"session-state").unwrap();
-    let output = parent.path().join("saved-session.bin");
+    std::fs::write(profile.join("Cookies"), b"private-data-state").unwrap();
+    let output = parent.path().join("saved-private-data.bin");
     std::fs::write(&output, b"user-output").unwrap();
     let runtime_path = runtime.path().to_owned();
     cleanup_runtime(runtime).unwrap();

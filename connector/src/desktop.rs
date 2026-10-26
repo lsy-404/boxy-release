@@ -22,14 +22,14 @@ struct RuntimeState {
     finished: AtomicBool,
     next_window: AtomicU64,
     worker: Mutex<Option<thread::JoinHandle<i32>>>,
-    local_image_policy: Mutex<Option<LocalImagePolicy>>,
+    local_resource_policy: Mutex<Option<LocalResourcePolicy>>,
     #[cfg(windows)]
     profile: std::path::PathBuf,
 }
 
 #[derive(Clone)]
-struct LocalImagePolicy {
-    session_path: std::path::PathBuf,
+struct LocalResourcePolicy {
+    roots: Vec<std::path::PathBuf>,
     server_origin: String,
 }
 
@@ -69,8 +69,14 @@ impl ConnectorHost for DesktopHost {
             .map_err(|_| "cannot open the cloud editor window".to_string())?
     }
 
-    fn approve_command(&self, command: &str, shell: &str, cwd: &Path) -> bool {
-        let description = format!("Shell: {shell}\nDirectory: {}\n\n{command}", cwd.display());
+    fn approve_process(&self, executable: &str, args: &[String], cwd: Option<&Path>) -> bool {
+        let directory = cwd
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "default".to_string());
+        let description = format!(
+            "Program: {executable}\nArguments: {}\nDirectory: {directory}",
+            args.join(" ")
+        );
         let (sender, receiver) = mpsc::sync_channel(1);
         let state = self.state.clone();
         if self
@@ -95,6 +101,14 @@ impl ConnectorHost for DesktopHost {
 
     fn should_stop(&self) -> bool {
         self.state.stopping.load(Ordering::Acquire)
+    }
+
+    fn set_resource_root(&self, root: &Path) {
+        if let Some(policy) = self.state.local_resource_policy.lock().unwrap().as_mut() {
+            if !policy.roots.iter().any(|existing| existing == root) {
+                policy.roots.push(root.to_path_buf());
+            }
+        }
     }
 }
 
@@ -122,8 +136,8 @@ fn application_builder(state: Arc<RuntimeState>) -> tauri::Builder<tauri::Wry> {
                 let response = if label != "editor" || has_query {
                     local_image_error(403)
                 } else {
-                    match state.local_image_policy.lock().unwrap().clone() {
-                        Some(policy) => local_image_response(
+                    match state.local_resource_policy.lock().unwrap().clone() {
+                        Some(policy) => local_resource_response(
                             &policy,
                             &method,
                             request_host.as_deref(),
@@ -150,7 +164,7 @@ pub fn run(options: LaunchOptions) -> Result<i32, String> {
         finished: AtomicBool::new(false),
         next_window: AtomicU64::new(1),
         worker: Mutex::new(None),
-        local_image_policy: Mutex::new(None),
+        local_resource_policy: Mutex::new(None),
         #[cfg(windows)]
         profile: runtime.path().join("webview"),
     });
@@ -161,13 +175,7 @@ pub fn run(options: LaunchOptions) -> Result<i32, String> {
         .setup(move |app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Regular);
-            if let Some(server) = setup_state.options.server_url.clone() {
-                begin_connection(app.handle(), &setup_state, &server, None)
-                    .map_err(std::io::Error::other)?;
-            } else {
-                build_service_selection(app.handle(), &setup_state)
-                    .map_err(std::io::Error::other)?;
-            }
+            build_service_selection(app.handle(), &setup_state).map_err(std::io::Error::other)?;
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -253,8 +261,8 @@ fn begin_connection(
             return Err(format!("invalid selected server URL: {error}"));
         }
     };
-    *state.local_image_policy.lock().unwrap() = Some(LocalImagePolicy {
-        session_path: config.session_path.clone(),
+    *state.local_resource_policy.lock().unwrap() = Some(LocalResourcePolicy {
+        roots: Vec::new(),
         server_origin,
     });
     if state.stopping.load(Ordering::Acquire) {
@@ -335,7 +343,7 @@ fn build_service_selection(app: &AppHandle, state: &Arc<RuntimeState>) -> Result
         "service-selection",
         WebviewUrl::App("index.html".into()),
     )
-    .title("Boxy")
+    .title("")
     .inner_size(560.0, 420.0)
     .min_inner_size(440.0, 360.0)
     .incognito(true)
@@ -437,11 +445,11 @@ fn build_window(
             builder = builder.use_https_scheme(true);
         }
         #[cfg(windows)]
-        let image_base = "https://boxy-local.localhost/";
+        let resource_base = "https://boxy-local.localhost/";
         #[cfg(not(windows))]
-        let image_base = "boxy-local://localhost/";
+        let resource_base = "boxy-local://localhost/";
         builder = builder.initialization_script(format!(
-            "Object.defineProperty(window, '__BOXY_LOCAL_IMAGE_BASE__', {{ value: {image_base:?}, writable: false, configurable: false }});"
+            "Object.defineProperty(window, '__BOXY_LOCAL_RESOURCE_BASE__', {{ value: {resource_base:?}, writable: false, configurable: false }});"
         ));
     }
     let window = builder.build().map_err(|error| error.to_string())?;
@@ -458,8 +466,8 @@ fn build_window(
     Ok(window)
 }
 
-fn local_image_response(
-    policy: &LocalImagePolicy,
+fn local_resource_response(
+    policy: &LocalResourcePolicy,
     method: &tauri::http::Method,
     host: Option<&str>,
     path: &str,
@@ -472,19 +480,23 @@ fn local_image_response(
     {
         return local_image_error(403);
     }
-    let Ok(image) = boxy::local_images::read(&policy.session_path, path) else {
+    let Some(resource) = policy
+        .roots
+        .iter()
+        .find_map(|root| boxy::local_resources::read(root, path).ok())
+    else {
         return local_image_error(404);
     };
     tauri::http::Response::builder()
         .status(200)
-        .header(tauri::http::header::CONTENT_TYPE, image.mime)
+        .header(tauri::http::header::CONTENT_TYPE, resource.mime)
         .header(
             tauri::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
             policy.server_origin.as_str(),
         )
         .header(tauri::http::header::VARY, "Origin")
         .header(tauri::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
-        .body(image.bytes)
+        .body(resource.bytes)
         .unwrap()
 }
 

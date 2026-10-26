@@ -1,20 +1,17 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Boxy</title>
+  <title></title>
   <link rel="stylesheet" href="style.css">
   <script defer src="selection.js"></script>
 </head>
 <body>
   <main>
-    <h1>Boxy</h1>
-    <p>输入要连接的服务域名，自动使用 HTTPS。</p>
     <form id="service-form">
-      <label for="service-url">服务地址</label>
-      <input id="service-url" name="service-url" type="text" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" required autofocus>
-      <button id="connect" type="submit">连接</button>
+      <label class="visually-hidden" for="service-url">Service address</label>
+      <input id="service-url" name="service-url" type="text" inputmode="url" autocomplete="url" autocapitalize="off" spellcheck="false" required autofocus aria-label="Service address">
       <p id="error" role="alert" aria-live="polite"></p>
     </form>
   </main>

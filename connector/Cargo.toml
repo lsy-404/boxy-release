@@ -1,6 +1,6 @@
 [package]
 name = "boxy"
-version = "2.2.11"
+version = "2.3.0"
 edition = "2021"
 license = "Apache-2.0"
 publish = false
@@ -13,7 +13,7 @@ desktop = ["dep:tauri", "dep:tauri-build"]
 base64 = "0.22"
 dirs = "6"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-iana-time-zone = "0.1"
+notify = "8"
 percent-encoding = "2"
 rand_core = { version = "0.6", features = ["getrandom"] }
 rfd = "0.17"
@@ -32,22 +32,13 @@ zeroize = "1.9"
 tauri-build = { version = "=2.7.3", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-winreg = "0.55"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
-    "Win32_System_Diagnostics_Debug",
-    "Win32_System_Memory",
     "Win32_System_Registry",
-    "Win32_System_SystemInformation",
     "Win32_System_Threading",
-    "Win32_UI_Controls",
     "Win32_UI_Shell",
-    "Win32_UI_WindowsAndMessaging",
 ] }
-xxhash-rust = { version = "0.8", features = ["xxh32"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -57,19 +48,6 @@ name = "boxy"
 path = "src/main.rs"
 required-features = ["desktop"]
 
-[[example]]
-name = "desktop_render_smoke"
-path = "../test/desktop_render_smoke.rs"
-required-features = ["desktop"]
-
-[[test]]
-name = "host_block_status"
-path = "../test/connector/host_block_status.test.rs"
-
 [[test]]
 name = "launch_options"
 path = "../test/launch_options.rs"
-
-[[test]]
-name = "windows_folder_launch"
-path = "../test/windows_folder_launch.rs"

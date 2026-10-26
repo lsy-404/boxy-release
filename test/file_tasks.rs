@@ -34,6 +34,7 @@ fn write_entry(path: &str, body: &[u8], overwrite: bool) -> WriteFileTaskEntry {
         content_base64: URL_SAFE_NO_PAD.encode(body),
         sha256: None,
         overwrite,
+        expected_existing_sha256: None,
     }
 }
 
@@ -82,38 +83,56 @@ fn enforces_actual_aggregate_read_budget_and_uses_unpadded_base64url() {
 #[test]
 fn writes_are_atomic_bounded_and_require_explicit_overwrite() {
     let temp = Temp::new();
-    let session = temp.0.join("sessions/session");
-    fs::create_dir_all(session.parent().unwrap()).unwrap();
-    fs::write(&session, b"session").unwrap();
+    let protected = temp.0.join("protecteds/protected");
+    fs::create_dir_all(protected.parent().unwrap()).unwrap();
+    fs::write(&protected, b"protected").unwrap();
 
     let files = [write_entry("cache/new.bin", &[4, 5], false)];
-    let result = write_files(&temp.0, &session, &files);
+    let result = write_files(&temp.0, &protected, &files);
     assert_eq!(result.files[0].ok, Some(true));
     assert_eq!(fs::read(temp.0.join("cache/new.bin")).unwrap(), [4, 5]);
 
     let overwrite_denied = [write_entry("cache/new.bin", &[6], false)];
     assert_eq!(
-        write_files(&temp.0, &session, &overwrite_denied).files[0].error,
+        write_files(&temp.0, &protected, &overwrite_denied).files[0].error,
         Some("file_exists")
     );
     let overwrite_allowed = [write_entry("cache/new.bin", &[6], true)];
     assert_eq!(
-        write_files(&temp.0, &session, &overwrite_allowed).files[0].ok,
+        write_files(&temp.0, &protected, &overwrite_allowed).files[0].ok,
         Some(true)
     );
     assert_eq!(fs::read(temp.0.join("cache/new.bin")).unwrap(), [6]);
 
-    let session_write = [write_entry("sessions/session", b"changed", true)];
+    let protected_write = [write_entry("protecteds/protected", b"changed", true)];
     assert_eq!(
-        write_files(&temp.0, &session, &session_write).files[0].error,
-        Some("session_path_forbidden")
+        write_files(&temp.0, &protected, &protected_write).files[0].error,
+        Some("protected_path_forbidden")
     );
-    assert_eq!(fs::read(&session).unwrap(), b"session");
+    assert_eq!(fs::read(&protected).unwrap(), b"protected");
+}
+
+#[test]
+fn protected_write_requires_a_matching_existing_hash() {
+    let temp = Temp::new();
+    let protected = temp.0.join("protected");
+    fs::write(&protected, b"old-value").unwrap();
+    let mut matching = write_entry("protected", b"new-value", true);
+    matching.expected_existing_sha256 = Some(crate::sha256_base64url(b"old-value"));
+    let result = write_files(&temp.0, &protected, &[matching]);
+    assert_eq!(result.files[0].ok, Some(true));
+    assert_eq!(fs::read(&protected).unwrap(), b"new-value");
+
+    let mut stale = write_entry("protected", b"stale-write", true);
+    stale.expected_existing_sha256 = Some(crate::sha256_base64url(b"old-value"));
+    let result = write_files(&temp.0, &protected, &[stale]);
+    assert_eq!(result.files[0].error, Some("source_changed"));
+    assert_eq!(fs::read(&protected).unwrap(), b"new-value");
 }
 
 #[test]
 fn rejects_windows_streams_and_reserved_path_components() {
-    let root = PathBuf::from("/sv2");
+    let root = PathBuf::from("/scope");
     for unsafe_path in [
         "cache/file:stream",
         "CON.txt",
@@ -128,14 +147,14 @@ fn rejects_windows_streams_and_reserved_path_components() {
 #[test]
 fn validates_complete_write_batch_before_any_file_is_written() {
     let temp = Temp::new();
-    let session = temp.0.join("sessions/session");
-    fs::create_dir_all(session.parent().unwrap()).unwrap();
-    fs::write(&session, b"session").unwrap();
+    let protected = temp.0.join("protecteds/protected");
+    fs::create_dir_all(protected.parent().unwrap()).unwrap();
+    fs::write(&protected, b"protected").unwrap();
     let files = [
         write_entry("cache/first.bin", b"first", false),
         write_entry("../escape", b"second", false),
     ];
-    let result = write_files(&temp.0, &session, &files);
+    let result = write_files(&temp.0, &protected, &files);
     assert_eq!(result.files.len(), 2);
     assert!(!temp.0.join("cache/first.bin").exists());
     assert_eq!(result.files[1].error, Some("unsafe_path"));
@@ -144,13 +163,13 @@ fn validates_complete_write_batch_before_any_file_is_written() {
 #[test]
 fn enforces_file_and_total_limits_and_hashes() {
     let temp = Temp::new();
-    let session = temp.0.join("session");
-    fs::write(&session, b"session").unwrap();
+    let protected = temp.0.join("protected");
+    fs::write(&protected, b"protected").unwrap();
     let oversized = vec![b'x'; MAX_FILE_BYTES + 1];
     assert_eq!(
         write_files(
             &temp.0,
-            &session,
+            &protected,
             &[write_entry("big.bin", &oversized, false)]
         )
         .files[0]
@@ -160,7 +179,7 @@ fn enforces_file_and_total_limits_and_hashes() {
     let mut mismatch = write_entry("wrong.bin", b"bytes", false);
     mismatch.sha256 = Some("incorrect".into());
     assert_eq!(
-        write_files(&temp.0, &session, &[mismatch]).files[0].error,
+        write_files(&temp.0, &protected, &[mismatch]).files[0].error,
         Some("hash_mismatch")
     );
     let paths = vec!["large.bin".into()];
@@ -174,15 +193,15 @@ fn enforces_file_and_total_limits_and_hashes() {
 #[test]
 fn patches_a_staged_file_and_returns_its_updated_hash() {
     let temp = Temp::new();
-    let root = temp.0.join("sv2");
+    let root = temp.0.join("scope");
     let relative = "server-content/install/version/model.dnni";
     let target = root.join(relative);
     fs::create_dir_all(target.parent().unwrap()).unwrap();
     let mut original = vec![b'a'; 1024];
     original[8] = 0x41;
     fs::write(&target, &original).unwrap();
-    let session = root.join("session");
-    fs::write(&session, b"session").unwrap();
+    let protected = root.join("protected");
+    fs::write(&protected, b"protected").unwrap();
     let (sha256, size) = hash_path(&target).unwrap();
     let patch = FilePatchTaskEntry {
         path: relative.into(),
@@ -195,7 +214,7 @@ fn patches_a_staged_file_and_returns_its_updated_hash() {
         }],
     };
 
-    let result = patch_files(&root, &session, &[patch], || false);
+    let result = patch_files(&root, &protected, &[patch], || false);
 
     assert_eq!(result.failed, None);
     assert_eq!(result.files.len(), 1);
@@ -219,29 +238,29 @@ fn rejects_symlink_components_for_reads_and_writes() {
     symlink(&outside, root.join("alias")).unwrap();
     let read = read_files(&root, &["alias".into()], 100, 100);
     assert_eq!(read.files[0].error, Some("unsafe_path"));
-    let session = root.join("session");
-    fs::write(&session, b"session").unwrap();
-    let write = write_files(&root, &session, &[write_entry("alias", b"replace", true)]);
+    let protected = root.join("protected");
+    fs::write(&protected, b"protected").unwrap();
+    let write = write_files(&root, &protected, &[write_entry("alias", b"replace", true)]);
     assert_eq!(write.files[0].error, Some("unsafe_path"));
     assert_eq!(fs::read(outside).unwrap(), b"outside");
 }
 
 #[test]
-fn rejects_hard_link_aliases_of_the_active_session() {
+fn rejects_hard_link_aliases_of_the_active_protected() {
     let temp = Temp::new();
-    let session = temp.0.join("session");
+    let protected = temp.0.join("protected");
     let alias = temp.0.join("alias");
-    fs::write(&session, b"session").unwrap();
-    fs::hard_link(&session, &alias).unwrap();
+    fs::write(&protected, b"protected").unwrap();
+    fs::hard_link(&protected, &alias).unwrap();
 
     let result = write_files(
         &temp.0,
-        &session,
+        &protected,
         &[write_entry("alias", b"replacement", true)],
     );
 
-    assert_eq!(result.files[0].error, Some("session_path_forbidden"));
-    assert_eq!(fs::read(&session).unwrap(), b"session");
+    assert_eq!(result.files[0].error, Some("protected_path_forbidden"));
+    assert_eq!(fs::read(&protected).unwrap(), b"protected");
 }
 
 #[cfg(windows)]

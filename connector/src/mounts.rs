@@ -79,7 +79,7 @@ struct ActiveMount {
 
 pub(crate) struct MountManager {
     root: PathBuf,
-    session_path: PathBuf,
+    protected_path: PathBuf,
     server_url: String,
     binary_path: Option<PathBuf>,
     extracted_binary: Option<tempfile::TempDir>,
@@ -88,14 +88,14 @@ pub(crate) struct MountManager {
 }
 
 impl MountManager {
-    pub(crate) fn new(root: &Path, session_path: &Path, server_url: &str) -> Self {
+    pub(crate) fn new(root: &Path, protected_path: &Path, server_url: &str) -> Self {
         let registry_dir = dirs::cache_dir()
             .unwrap_or_else(env::temp_dir)
             .join("boxy")
             .join("mounts");
         let mut manager = Self {
             root: root.to_path_buf(),
-            session_path: session_path.to_path_buf(),
+            protected_path: protected_path.to_path_buf(),
             server_url: server_url.to_string(),
             binary_path: None,
             extracted_binary: None,
@@ -113,26 +113,12 @@ impl MountManager {
         self.binary_path.is_some() && platform_mount_available()
     }
 
-    pub(crate) fn active_paths(&self) -> Vec<PathBuf> {
-        self.active
-            .iter()
-            .filter_map(|mount| {
-                if registry_process_matches(&mount.entry) {
-                    resolve_registered_mount(&self.root, &self.session_path, &mount.entry, true)
-                        .ok()
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
     pub(crate) fn mount(&mut self, spec: &MountSpec) -> Result<PathBuf, &'static str> {
         if !self.capability_available() {
             return Err("mount_unavailable");
         }
         validate_mount_spec(spec, &self.server_url)?;
-        validate_guard(&self.root, &self.session_path, spec)?;
+        validate_guard(&self.root, &self.protected_path, spec)?;
         let path = self.resolve_mount_path(spec)?;
         let identity_hash = identity_fingerprint(spec);
         let spec_hash = spec_fingerprint(spec);
@@ -143,8 +129,12 @@ impl MountManager {
         {
             let existing = &mut self.active[index];
             if existing.entry.identity_hash == identity_hash {
-                let registered_path =
-                    resolve_registered_mount(&self.root, &self.session_path, &existing.entry, true);
+                let registered_path = resolve_registered_mount(
+                    &self.root,
+                    &self.protected_path,
+                    &existing.entry,
+                    true,
+                );
                 if existing.entry.spec_hash == spec_hash
                     && path_equal(&path, &existing.entry.mount_path)
                     && registered_path
@@ -157,7 +147,7 @@ impl MountManager {
                 if active_process_owned(existing) {
                     let stoppable_path = resolve_registered_mount(
                         &self.root,
-                        &self.session_path,
+                        &self.protected_path,
                         &existing.entry,
                         false,
                     );
@@ -187,7 +177,7 @@ impl MountManager {
         {
             return Err("mount_conflict");
         }
-        prepare_mountpoint(&self.root, &self.session_path, spec)?;
+        prepare_mountpoint(&self.root, &self.protected_path, spec)?;
         let binary = self.binary_path.as_ref().ok_or("mount_unavailable")?;
         let mut command = mount_command(binary, spec, &path)?;
         let mut child = match command
@@ -283,10 +273,10 @@ impl MountManager {
             {
                 return Err("mount_conflict");
             }
-            validate_guard(&self.root, &self.session_path, spec)?;
+            validate_guard(&self.root, &self.protected_path, spec)?;
             let registered_path = resolve_registered_mount(
                 &self.root,
-                &self.session_path,
+                &self.protected_path,
                 &self.active[index].entry,
                 false,
             )?;
@@ -309,7 +299,7 @@ impl MountManager {
         if unmanaged_mount_present(&mount_path) {
             return Err("mount_not_owned");
         }
-        validate_guard(&self.root, &self.session_path, spec)?;
+        validate_guard(&self.root, &self.protected_path, spec)?;
         Ok(mount_path)
     }
 
@@ -354,8 +344,8 @@ impl MountManager {
 
     fn resolve_mount_path(&self, spec: &MountSpec) -> Result<PathBuf, &'static str> {
         let path = file_tasks::safe_mount_path_parent(&self.root, &spec.path)?;
-        if file_tasks::targets_session_path(&self.root, &path, &self.session_path) {
-            return Err("session_path_forbidden");
+        if file_tasks::targets_protected_path(&self.root, &path, &self.protected_path) {
+            return Err("protected_path_forbidden");
         }
         Ok(path)
     }
@@ -378,7 +368,7 @@ impl MountManager {
                 continue;
             }
             let Ok(path) =
-                resolve_registered_mount(&self.root, &self.session_path, &registry, true)
+                resolve_registered_mount(&self.root, &self.protected_path, &registry, true)
             else {
                 continue;
             };
@@ -398,7 +388,7 @@ impl Drop for MountManager {
         let mut retain_helper = false;
         for active in &mut self.active {
             let path =
-                resolve_registered_mount(&self.root, &self.session_path, &active.entry, false);
+                resolve_registered_mount(&self.root, &self.protected_path, &active.entry, false);
             let stopped = path.is_ok_and(|path| {
                 active_process_owned(active) && stop_mount(&path, active).is_ok()
             });
@@ -546,10 +536,14 @@ fn validate_remote_url(value: &str, server: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn validate_guard(root: &Path, session_path: &Path, spec: &MountSpec) -> Result<(), &'static str> {
+fn validate_guard(
+    root: &Path,
+    protected_path: &Path,
+    spec: &MountSpec,
+) -> Result<(), &'static str> {
     validate_guard_values(
         root,
-        session_path,
+        protected_path,
         &spec.path,
         &spec.guard_path,
         &spec.guard_sha256,
@@ -559,7 +553,7 @@ fn validate_guard(root: &Path, session_path: &Path, spec: &MountSpec) -> Result<
 
 fn validate_guard_values(
     root: &Path,
-    session_path: &Path,
+    protected_path: &Path,
     relative_path: &str,
     relative_guard: &str,
     expected_sha256: &str,
@@ -567,14 +561,14 @@ fn validate_guard_values(
 ) -> Result<(), &'static str> {
     let mount = file_tasks::safe_mount_path_parent(root, relative_path)?;
     let guard = file_tasks::safe_path(root, relative_guard, false)?;
-    if file_tasks::targets_session_path(root, &mount, session_path)
-        || file_tasks::targets_session_path(root, &guard, session_path)
+    if file_tasks::targets_protected_path(root, &mount, protected_path)
+        || file_tasks::targets_protected_path(root, &guard, protected_path)
         || !path_equal(
             mount.parent().ok_or("unsafe_path")?,
             guard.parent().ok_or("unsafe_path")?,
         )
     {
-        return Err("session_path_forbidden");
+        return Err("protected_path_forbidden");
     }
     let metadata = fs::symlink_metadata(&guard).map_err(|_| "guard_mismatch")?;
     if !metadata.is_file() || metadata.len() != expected_size {
@@ -589,19 +583,19 @@ fn validate_guard_values(
 
 fn resolve_registered_mount(
     root: &Path,
-    session_path: &Path,
+    protected_path: &Path,
     entry: &MountRegistryEntry,
     require_mounted: bool,
 ) -> Result<PathBuf, &'static str> {
     let path = file_tasks::safe_mount_path_parent(root, &entry.path)?;
     if !path_equal(&path, &entry.mount_path)
-        || file_tasks::targets_session_path(root, &path, session_path)
+        || file_tasks::targets_protected_path(root, &path, protected_path)
     {
         return Err("unsafe_path");
     }
     validate_guard_values(
         root,
-        session_path,
+        protected_path,
         &entry.path,
         &entry.guard_path,
         &entry.guard_sha256,
@@ -616,16 +610,16 @@ fn resolve_registered_mount(
     Ok(path)
 }
 
-fn prepare_mountpoint(root: &Path, session: &Path, spec: &MountSpec) -> Result<(), &'static str> {
-    validate_guard(root, session, spec)?;
+fn prepare_mountpoint(root: &Path, protected: &Path, spec: &MountSpec) -> Result<(), &'static str> {
+    validate_guard(root, protected, spec)?;
     let path = file_tasks::safe_mount_path_parent(root, &spec.path)?;
     let parent = path.parent().ok_or("unsafe_path")?;
     let parent_meta = fs::symlink_metadata(parent).map_err(|_| "unsafe_path")?;
     if !parent_meta.is_dir() || unsafe_link(&parent_meta) {
         return Err("unsafe_path");
     }
-    if file_tasks::targets_session_path(root, &path, session) {
-        return Err("session_path_forbidden");
+    if file_tasks::targets_protected_path(root, &path, protected) {
+        return Err("protected_path_forbidden");
     }
     #[cfg(windows)]
     {

@@ -1,170 +1,25 @@
-use std::{
-    env, fs,
-    path::{Path, PathBuf},
-};
+use std::env;
 
-use rfd::FileDialog;
 use url::Url;
 
-#[derive(Clone, Debug)]
-pub struct LaunchOptions {
-    pub server_url: Option<String>,
-    pub session_path: PathBuf,
-    pub session_path_explicit: bool,
-}
+#[derive(Clone, Debug, Default)]
+pub struct LaunchOptions;
 
-pub(crate) struct LaunchArguments {
-    pub(crate) server_url: Option<String>,
-    pub(crate) session_path: Option<PathBuf>,
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub server_url: String,
 }
 
 impl LaunchOptions {
-    pub(crate) fn from_environment_and_args(default_session_path: PathBuf) -> Result<Self, String> {
-        let arguments = parse_arguments(env::args().skip(1))?;
-        let configured_server = env::var("BOXY_API_URL").ok();
-        let executable = env::current_exe().ok();
-        let server_url = resolve_server_url(
-            arguments.server_url.as_deref(),
-            configured_server.as_deref(),
-            executable.as_deref(),
-        )?;
-        let session_path_explicit = arguments.session_path.is_some();
-        Ok(Self {
-            server_url,
-            session_path: arguments.session_path.unwrap_or(default_session_path),
-            session_path_explicit,
-        })
-    }
-}
-
-pub(crate) fn parse_arguments(
-    arguments: impl IntoIterator<Item = String>,
-) -> Result<LaunchArguments, String> {
-    let mut server_url = None;
-    let mut session_path = None;
-    let mut arguments = arguments.into_iter();
-    while let Some(argument) = arguments.next() {
-        match argument.as_str() {
-            "--server" => {
-                server_url = Some(
-                    arguments
-                        .next()
-                        .ok_or_else(|| "--server requires a URL".to_string())?,
-                )
-            }
-            "--session" => {
-                session_path = Some(PathBuf::from(
-                    arguments
-                        .next()
-                        .ok_or_else(|| "--session requires a path".to_string())?,
-                ))
-            }
-            "--help" | "-h" => {
-                return Err("usage: boxy [--server URL] [--session PATH]".to_string())
-            }
-            _ => return Err(format!("unknown argument: {argument}")),
+    pub(crate) fn from_environment_and_args() -> Result<Self, String> {
+        if env::args().len() > 1 {
+            return Err("Boxy accepts the service address in its startup field.".to_string());
         }
-    }
-    Ok(LaunchArguments {
-        server_url,
-        session_path,
-    })
-}
-
-pub(crate) fn resolve_server_url(
-    command_line: Option<&str>,
-    environment: Option<&str>,
-    executable: Option<&Path>,
-) -> Result<Option<String>, String> {
-    if let Some(value) = command_line.or(environment) {
-        return validate_service_url(value).map(Some);
-    }
-    executable
-        .and_then(inferred_service_url)
-        .map(|value| validate_service_url(&value))
-        .transpose()
-}
-
-pub(crate) fn validate_selected_service_url(value: &str) -> Result<String, String> {
-    validate_service_url(value)
-}
-
-pub(crate) fn resolve_session_path(path: PathBuf, explicit: bool) -> Result<PathBuf, String> {
-    if validate_session_path(&path).is_ok() {
-        return Ok(path);
-    }
-    if explicit {
-        return Err("The selected SV2 session path is not an existing file.".to_string());
-    }
-
-    let mut picker = FileDialog::new().set_title("Select Synthesizer V session");
-    if let Some(parent) = path.parent().filter(|parent| parent.is_dir()) {
-        picker = picker.set_directory(parent);
-    }
-    let selected = picker
-        .pick_file()
-        .ok_or_else(|| "A Synthesizer V session file must be selected.".to_string())?;
-    validate_session_path(&selected)?;
-    Ok(selected)
-}
-
-fn validate_session_path(path: &Path) -> Result<(), String> {
-    if fs::metadata(path)
-        .map(|metadata| metadata.is_file())
-        .unwrap_or(false)
-    {
-        Ok(())
-    } else {
-        Err("The selected SV2 session path is not an existing file.".to_string())
+        Ok(Self)
     }
 }
 
-pub(crate) fn inferred_service_url(executable: &Path) -> Option<String> {
-    let app_name = executable.ancestors().find_map(|path| {
-        let name = path.file_name()?.to_str()?;
-        name.to_ascii_lowercase()
-            .ends_with(".app")
-            .then(|| name.to_ascii_lowercase())
-    });
-    let name = app_name.or_else(|| {
-        let name = executable.file_name()?.to_str()?.to_ascii_lowercase();
-        name.ends_with(".exe").then_some(name)
-    })?;
-    let stem = name
-        .strip_suffix(".app")
-        .or_else(|| name.strip_suffix(".exe"))?;
-    let mut hostname = None;
-    for candidate in stem.split(|character: char| {
-        !character.is_ascii_alphanumeric() && character != '-' && character != '.'
-    }) {
-        if valid_hostname(candidate)
-            && hostname.is_none_or(|current: &str| candidate.len() > current.len())
-        {
-            hostname = Some(candidate);
-        }
-    }
-    Some(format!("https://{}", hostname?))
-}
-
-fn valid_hostname(candidate: &str) -> bool {
-    let labels: Vec<_> = candidate.split('.').collect();
-    labels.len() >= 2
-        && candidate.len() <= 248
-        && labels.iter().all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        })
-        && labels.last().is_some_and(|suffix| {
-            suffix.len() >= 2 && suffix.bytes().all(|byte| byte.is_ascii_alphabetic())
-        })
-}
-
-fn validate_service_url(value: &str) -> Result<String, String> {
+pub(crate) fn validate_service_url(value: &str) -> Result<String, String> {
     let value = value.trim();
     let value = if value.contains("://") {
         value.to_string()

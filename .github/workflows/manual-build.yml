@@ -93,7 +93,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           cargo test --locked -p boxy
           node --test test/package_portable.test.mjs
-          node --test test/tauri_webview_fixture.test.mjs
+          node --test test/connector_v23_ui.test.mjs
 
       - name: Build client source
         shell: pwsh
@@ -116,14 +116,6 @@ jobs:
           if ($extras.Count -ne 0) { throw "Windows package contains files beside the executable: $($extras.Name -join ', ')" }
           if (Get-ChildItem -LiteralPath (Split-Path -Parent $exe) -Filter "*.dll" -Force) { throw "Windows package contains an adjacent loader DLL." }
           if (Get-ChildItem -LiteralPath (Split-Path -Parent $exe) -Directory -Force | Where-Object { $_.Name -match "WebView2|runtime" }) { throw "Windows package contains a WebView2 runtime directory." }
-
-      - name: Smoke test packaged Boxy
-        shell: pwsh
-        run: pwsh -NoProfile -File test/windows_startup_smoke.ps1 -Executable dist/boxy-windows-x64.exe -IncludeOpenFolder -IncludeLocalImage
-
-      - name: Smoke test service selection
-        shell: pwsh
-        run: pwsh -NoProfile -File test/windows_service_selection_smoke.ps1 -Executable dist/boxy-windows-x64.exe
 
       - name: Upload Boxy for Windows
         env:
@@ -154,11 +146,7 @@ jobs:
         run: |
           cargo test --locked -p boxy
           node --test test/package_portable.test.mjs
-          node --test test/tauri_webview_fixture.test.mjs
-
-      - name: Smoke test macOS WKWebView selection
-        timeout-minutes: 3
-        run: bash test/macos_webview_render_smoke.sh
+          node --test test/connector_v23_ui.test.mjs
 
       - name: Build client source
         run: |

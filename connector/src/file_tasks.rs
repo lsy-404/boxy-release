@@ -14,7 +14,7 @@ use zeroize::Zeroizing;
 const MAX_ITEMS: usize = 64;
 const MAX_FILE_BYTES: usize = 512 * 1024;
 const MAX_TOTAL_BYTES: usize = 1024 * 1024;
-pub(crate) const MAX_STREAM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub(crate) const MAX_STREAM_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_TREE_ENTRIES: usize = 100_000;
 const MAX_MANIFEST_PATHS: usize = 16;
 const MAX_MANIFEST_FILES: usize = 1024;
@@ -147,6 +147,8 @@ pub(crate) struct WriteFileTaskEntry {
     pub(crate) content_base64: String,
     pub(crate) sha256: Option<String>,
     pub(crate) overwrite: bool,
+    #[serde(default)]
+    pub(crate) expected_existing_sha256: Option<String>,
 }
 
 impl Drop for WriteFileTaskEntry {
@@ -257,7 +259,7 @@ pub(crate) fn read_files(
 
 pub(crate) fn read_ranges(
     root: &Path,
-    session_path: &Path,
+    protected_path: &Path,
     ranges: &[RangeReadTaskEntry],
     should_stop: impl Fn() -> bool,
 ) -> RangeReadResult {
@@ -286,7 +288,7 @@ pub(crate) fn read_ranges(
 
     let files = ranges
         .iter()
-        .map(|range| read_one_range(root, session_path, range, &should_stop))
+        .map(|range| read_one_range(root, protected_path, range, &should_stop))
         .collect::<Vec<_>>();
     let failed = files.iter().any(|file| !file.ok).then_some(true);
     RangeReadResult { files, failed }
@@ -307,7 +309,7 @@ fn failed_range_entry(range: &RangeReadTaskEntry, error: &'static str) -> RangeR
 
 fn read_one_range(
     root: &Path,
-    session_path: &Path,
+    protected_path: &Path,
     range: &RangeReadTaskEntry,
     should_stop: &impl Fn() -> bool,
 ) -> RangeReadResultEntry {
@@ -329,12 +331,12 @@ fn read_one_range(
             return Err("invalid_range");
         }
         let (path, mut file, stamp) =
-            open_guarded_file(root, session_path, &range.path, Some(range.size))?;
+            open_guarded_file(root, protected_path, &range.path, Some(range.size))?;
         file.seek(std::io::SeekFrom::Start(range.offset))
             .map_err(|_| "read_failed")?;
         let mut bytes = Zeroizing::new(vec![0; range.length as usize]);
         read_exact_cancellable(&mut file, &mut bytes, should_stop)?;
-        ensure_file_unchanged(root, session_path, &range.path, &path, &file, &stamp)?;
+        ensure_file_unchanged(root, protected_path, &range.path, &path, &file, &stamp)?;
         let digest = URL_SAFE_NO_PAD.encode(Sha256::digest(&bytes[..]));
         Ok((stamp.size, digest, URL_SAFE_NO_PAD.encode(&bytes[..])))
     })();
@@ -377,7 +379,7 @@ fn read_exact_cancellable(
 
 pub(crate) fn patch_files(
     root: &Path,
-    session_path: &Path,
+    protected_path: &Path,
     patches: &[FilePatchTaskEntry],
     should_stop: impl Fn() -> bool,
 ) -> FilePatchResult {
@@ -444,7 +446,7 @@ pub(crate) fn patch_files(
                 Ok((patch, _)) => patch,
                 Err(error) => return failed_patch_entry(&input.path, error),
             };
-            match apply_file_patch(root, session_path, &patch, &should_stop) {
+            match apply_file_patch(root, protected_path, &patch, &should_stop) {
                 Ok((sha256, already_applied)) => FilePatchResultEntry {
                     path: input.path.clone(),
                     size: Some(input.size),
@@ -566,19 +568,19 @@ fn valid_sha256(value: &str) -> bool {
 
 fn apply_file_patch(
     root: &Path,
-    session_path: &Path,
+    protected_path: &Path,
     patch: &DecodedPatch,
     should_stop: &impl Fn() -> bool,
 ) -> Result<(String, bool), &'static str> {
     let (path, mut source, stamp) =
-        open_guarded_file(root, session_path, &patch.path, Some(patch.size))?;
+        open_guarded_file(root, protected_path, &patch.path, Some(patch.size))?;
     let mut sink = std::io::sink();
     let (original_sha256, result_sha256, all_after) =
         stream_patch(&mut source, patch, &mut sink, should_stop)?;
     if original_sha256 != patch.sha256 {
         return Err("original_hash_mismatch");
     }
-    ensure_file_unchanged(root, session_path, &patch.path, &path, &source, &stamp)?;
+    ensure_file_unchanged(root, protected_path, &patch.path, &path, &source, &stamp)?;
     if should_stop() {
         return Err("cancelled");
     }
@@ -597,7 +599,7 @@ fn apply_file_patch(
     if original_sha256 != patch.sha256 {
         return Err("original_hash_mismatch");
     }
-    ensure_file_unchanged(root, session_path, &patch.path, &path, &source, &stamp)?;
+    ensure_file_unchanged(root, protected_path, &patch.path, &path, &source, &stamp)?;
     if should_stop() {
         return Err("cancelled");
     }
@@ -609,7 +611,7 @@ fn apply_file_patch(
         .set_permissions(stamp.permissions.clone())
         .map_err(|_| "write_failed")?;
     temporary.as_file().sync_all().map_err(|_| "write_failed")?;
-    ensure_file_unchanged(root, session_path, &patch.path, &path, &source, &stamp)?;
+    ensure_file_unchanged(root, protected_path, &patch.path, &path, &source, &stamp)?;
     if should_stop() {
         return Err("cancelled");
     }
@@ -732,13 +734,13 @@ fn read_patch_segment(
 
 fn open_guarded_file(
     root: &Path,
-    session_path: &Path,
+    protected_path: &Path,
     relative: &str,
     expected_size: Option<u64>,
 ) -> Result<(PathBuf, File, FileStamp), &'static str> {
     let path = safe_path(root, relative, false)?;
-    if conflicts_with_session(root, &path, session_path) {
-        return Err("session_path_forbidden");
+    if conflicts_with_protected(root, &path, protected_path) {
+        return Err("protected_path_forbidden");
     }
     let path_metadata = fs::symlink_metadata(&path).map_err(|_| "file_unavailable")?;
     if !path_metadata.is_file() || is_unsafe_link(&path_metadata) {
@@ -755,8 +757,8 @@ fn open_guarded_file(
     if !path_metadata.is_file() || is_unsafe_link(&path_metadata) {
         return Err("unsafe_path");
     }
-    if conflicts_with_session(root, &path, session_path) {
-        return Err("session_path_forbidden");
+    if conflicts_with_protected(root, &path, protected_path) {
+        return Err("protected_path_forbidden");
     }
     if !same_file_handle_as_path(&file, &path) {
         return Err("file_changed");
@@ -780,15 +782,15 @@ fn open_guarded_file(
 
 fn ensure_file_unchanged(
     root: &Path,
-    session_path: &Path,
+    protected_path: &Path,
     relative: &str,
     path: &Path,
     file: &File,
     stamp: &FileStamp,
 ) -> Result<(), &'static str> {
     let current = safe_path(root, relative, false)?;
-    if current != path || conflicts_with_session(root, &current, session_path) {
-        return Err("session_path_forbidden");
+    if current != path || conflicts_with_protected(root, &current, protected_path) {
+        return Err("protected_path_forbidden");
     }
     let path_metadata = fs::symlink_metadata(&current).map_err(|_| "file_changed")?;
     if !path_metadata.is_file() || is_unsafe_link(&path_metadata) {
@@ -847,7 +849,7 @@ fn same_file_handle_as_path(file: &File, path: &Path) -> bool {
 
 pub(crate) fn write_files(
     root: &Path,
-    session_path: &Path,
+    protected_path: &Path,
     files: &[WriteFileTaskEntry],
 ) -> FileTaskResult {
     if files.len() > MAX_ITEMS {
@@ -899,8 +901,17 @@ pub(crate) fn write_files(
         if path.exists() && !task.overwrite {
             global_error = Some("file_exists");
         }
-        if targets_session(root, &path, session_path) {
-            global_error = Some("session_path_forbidden");
+        let protected = targets_protected(root, &path, protected_path);
+        let expected_existing = task.expected_existing_sha256.as_deref();
+        if protected && expected_existing.is_none() {
+            global_error = Some("protected_path_forbidden");
+        }
+        if let Some(expected) = expected_existing {
+            if !valid_sha256(expected) || !task.overwrite {
+                global_error = Some("invalid_expected_hash");
+            } else if hash_path(&path).map_or(true, |(actual, _)| actual != expected) {
+                global_error = Some("source_changed");
+            }
         }
         planned.push(Ok(PlannedWrite { task, path, bytes }));
     }
@@ -937,6 +948,7 @@ pub(crate) fn write_files(
                 &plan.path,
                 &plan.bytes,
                 plan.task.overwrite,
+                plan.task.expected_existing_sha256.as_deref(),
             ) {
                 Ok(()) => results.push(FileTaskEntry {
                     path: plan.task.path.clone(),
@@ -946,13 +958,17 @@ pub(crate) fn write_files(
                     ok: Some(true),
                     error: None,
                 }),
-                Err(_) => results.push(FileTaskEntry {
+                Err(error) => results.push(FileTaskEntry {
                     path: plan.task.path.clone(),
                     size: None,
                     sha256: None,
                     content_base64: None,
                     ok: Some(false),
-                    error: Some("write_failed"),
+                    error: Some(if error == "source_changed" {
+                        "source_changed"
+                    } else {
+                        "write_failed"
+                    }),
                 }),
             },
         }
@@ -1080,41 +1096,47 @@ fn is_unsafe_link(metadata: &fs::Metadata) -> bool {
     false
 }
 
-fn targets_session(root: &Path, path: &Path, session_path: &Path) -> bool {
+fn targets_protected(root: &Path, path: &Path, protected_path: &Path) -> bool {
+    if !protected_path.exists() {
+        return false;
+    }
     let Ok(root) = root.canonicalize() else {
         return true;
     };
-    let Ok(session) = session_path.canonicalize() else {
+    let Ok(protected) = protected_path.canonicalize() else {
         return true;
     };
     let Ok(relative) = path.strip_prefix(&root) else {
         return true;
     };
     let target = root.join(relative);
-    if same_file_identity(&target, &session) {
+    if same_file_identity(&target, &protected) {
         return true;
     }
     #[cfg(windows)]
     {
         target
             .to_string_lossy()
-            .eq_ignore_ascii_case(&session.to_string_lossy())
+            .eq_ignore_ascii_case(&protected.to_string_lossy())
     }
     #[cfg(not(windows))]
     {
-        target == session
+        target == protected
     }
 }
 
-pub(crate) fn targets_session_path(root: &Path, path: &Path, session_path: &Path) -> bool {
-    conflicts_with_session(root, path, session_path)
+pub(crate) fn targets_protected_path(root: &Path, path: &Path, protected_path: &Path) -> bool {
+    conflicts_with_protected(root, path, protected_path)
 }
 
-fn conflicts_with_session(root: &Path, path: &Path, session_path: &Path) -> bool {
-    if targets_session(root, path, session_path) {
+fn conflicts_with_protected(root: &Path, path: &Path, protected_path: &Path) -> bool {
+    if !protected_path.exists() {
+        return false;
+    }
+    if targets_protected(root, path, protected_path) {
         return true;
     }
-    let (Ok(root), Ok(session)) = (root.canonicalize(), session_path.canonicalize()) else {
+    let (Ok(root), Ok(protected)) = (root.canonicalize(), protected_path.canonicalize()) else {
         return true;
     };
     let Ok(relative) = path.strip_prefix(&root) else {
@@ -1124,18 +1146,14 @@ fn conflicts_with_session(root: &Path, path: &Path, session_path: &Path) -> bool
     #[cfg(windows)]
     {
         let target = target.to_string_lossy().to_ascii_lowercase();
-        let session = session.to_string_lossy().to_ascii_lowercase();
-        target.starts_with(&format!("{}\\", session))
-            || session.starts_with(&format!("{}\\", target))
+        let protected = protected.to_string_lossy().to_ascii_lowercase();
+        target.starts_with(&format!("{}\\", protected))
+            || protected.starts_with(&format!("{}\\", target))
     }
     #[cfg(not(windows))]
     {
-        target.starts_with(&session) || session.starts_with(&target)
+        target.starts_with(&protected) || protected.starts_with(&target)
     }
-}
-
-pub(crate) fn prepare_parent(root: &Path, parent: &Path) -> Result<(), &'static str> {
-    create_safe_directories(root, parent)
 }
 
 #[derive(Deserialize)]
@@ -1186,6 +1204,7 @@ pub(crate) struct ManifestResult {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ManifestEntry {
     pub(crate) path: String,
+    pub(crate) kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1269,11 +1288,28 @@ fn collect_manifest_path(
         return;
     }
     if is_unsafe_link(&metadata) {
-        push_manifest_error(state, relative, "unsafe_path");
+        if add_manifest_path_bytes(state, relative).is_ok() {
+            state.files.push(ManifestEntry {
+                path: relative.to_string(),
+                kind: "symlink",
+                size: None,
+                sha256: None,
+                error: Some("unsafe_path"),
+            });
+        }
     } else if metadata.is_dir() {
         if depth >= MAX_MANIFEST_DEPTH {
             push_manifest_error(state, relative, "tree_too_deep");
             return;
+        }
+        if add_manifest_path_bytes(state, relative).is_ok() {
+            state.files.push(ManifestEntry {
+                path: relative.to_string(),
+                kind: "directory",
+                size: Some(metadata.len()),
+                sha256: None,
+                error: None,
+            });
         }
         let entries = match fs::read_dir(&path) {
             Ok(entries) => entries,
@@ -1321,6 +1357,7 @@ fn collect_manifest_path(
                 state.file_count += 1;
                 state.files.push(ManifestEntry {
                     path: relative.to_string(),
+                    kind: "file",
                     size: Some(size),
                     sha256: Some(sha256),
                     error: None,
@@ -1353,6 +1390,7 @@ fn add_manifest_path_bytes(state: &mut ManifestState, relative: &str) -> Result<
     if state.path_bytes.saturating_add(relative.len()) > MAX_MANIFEST_PATH_BYTES {
         state.files.push(ManifestEntry {
             path: String::new(),
+            kind: "unknown",
             size: None,
             sha256: None,
             error: Some("path_output_too_large"),
@@ -1373,6 +1411,7 @@ fn push_manifest_error(state: &mut ManifestState, relative: &str, error: &'stati
     }
     state.files.push(ManifestEntry {
         path: relative.to_string(),
+        kind: "unknown",
         size: None,
         sha256: None,
         error: Some(error),
@@ -1381,7 +1420,7 @@ fn push_manifest_error(state: &mut ManifestState, relative: &str, error: &'stati
 
 pub(crate) fn verify_stream_file(
     root: &Path,
-    session_path: &Path,
+    protected_path: &Path,
     relative: &str,
     expected_sha256: &str,
     expected_size: u64,
@@ -1390,8 +1429,8 @@ pub(crate) fn verify_stream_file(
         return Err("file_too_large");
     }
     let path = safe_path(root, relative, false)?;
-    if conflicts_with_session(root, &path, session_path) {
-        return Err("session_path_forbidden");
+    if conflicts_with_protected(root, &path, protected_path) {
+        return Err("protected_path_forbidden");
     }
     let metadata = fs::symlink_metadata(&path).map_err(|_| "file_unavailable")?;
     if !metadata.is_file() || is_unsafe_link(&metadata) {
@@ -1430,15 +1469,15 @@ pub(crate) fn hash_reader(reader: &mut impl Read) -> Result<(String, u64), &'sta
 
 pub(crate) fn install_stream_file(
     root: &Path,
-    session_path: &Path,
+    protected_path: &Path,
     relative: &str,
     temporary: tempfile::NamedTempFile,
     expected_sha256: &str,
     expected_size: u64,
 ) -> Result<(), &'static str> {
     let target = safe_path(root, relative, true)?;
-    if conflicts_with_session(root, &target, session_path) {
-        return Err("session_path_forbidden");
+    if conflicts_with_protected(root, &target, protected_path) {
+        return Err("protected_path_forbidden");
     }
     let actual = fs::symlink_metadata(&target);
     if let Ok(metadata) = actual {
@@ -1487,7 +1526,11 @@ fn create_safe_directories(root: &Path, parent: &Path) -> Result<(), &'static st
     Ok(())
 }
 
-pub(crate) fn move_files(root: &Path, session_path: &Path, items: &[MoveEntry]) -> OperationResult {
+pub(crate) fn move_files(
+    root: &Path,
+    protected_path: &Path,
+    items: &[MoveEntry],
+) -> OperationResult {
     if items.len() > MAX_ITEMS {
         return OperationResult {
             files: items
@@ -1512,7 +1555,7 @@ pub(crate) fn move_files(root: &Path, session_path: &Path, items: &[MoveEntry]) 
             if !seen_sources.insert(source) || !seen_targets.insert(target) {
                 Err("duplicate_path")
             } else {
-                preflight_move(root, session_path, item)
+                preflight_move(root, protected_path, item)
             }
         })
         .collect::<Vec<_>>();
@@ -1533,7 +1576,7 @@ pub(crate) fn move_files(root: &Path, session_path: &Path, items: &[MoveEntry]) 
     let mut files = Vec::with_capacity(items.len().min(MAX_ITEMS));
     let mut failed = false;
     for item in items {
-        let result = move_one(root, session_path, item);
+        let result = move_one(root, protected_path, item);
         failed |= result.is_err();
         files.push(OperationEntry {
             path: item.to.clone(),
@@ -1558,17 +1601,21 @@ fn path_key(path: &str) -> String {
     }
 }
 
-fn preflight_move(root: &Path, session_path: &Path, item: &MoveEntry) -> Result<(), &'static str> {
+fn preflight_move(
+    root: &Path,
+    protected_path: &Path,
+    item: &MoveEntry,
+) -> Result<(), &'static str> {
     let root = root.canonicalize().map_err(|_| "file_unavailable")?;
     let source = safe_path(&root, &item.from, true)?;
     let target = safe_path(&root, &item.to, true)?;
     if source == target || source.starts_with(&target) || target.starts_with(&source) {
         return Err("overlapping_paths");
     }
-    if conflicts_with_session(&root, &source, session_path)
-        || conflicts_with_session(&root, &target, session_path)
+    if conflicts_with_protected(&root, &source, protected_path)
+        || conflicts_with_protected(&root, &target, protected_path)
     {
-        return Err("session_path_forbidden");
+        return Err("protected_path_forbidden");
     }
     if !source.exists() {
         let metadata = fs::symlink_metadata(&target).map_err(|_| "file_unavailable")?;
@@ -1615,14 +1662,14 @@ fn preflight_move(root: &Path, session_path: &Path, item: &MoveEntry) -> Result<
     Ok(())
 }
 
-fn move_one(root: &Path, session_path: &Path, item: &MoveEntry) -> Result<(), &'static str> {
-    preflight_move(root, session_path, item)?;
+fn move_one(root: &Path, protected_path: &Path, item: &MoveEntry) -> Result<(), &'static str> {
+    preflight_move(root, protected_path, item)?;
     let source = safe_path(root, &item.from, true)?;
     let target = safe_path(root, &item.to, true)?;
-    if conflicts_with_session(root, &source, session_path)
-        || conflicts_with_session(root, &target, session_path)
+    if conflicts_with_protected(root, &source, protected_path)
+        || conflicts_with_protected(root, &target, protected_path)
     {
-        return Err("session_path_forbidden");
+        return Err("protected_path_forbidden");
     }
     if !source.exists() {
         let metadata = fs::symlink_metadata(&target).map_err(|_| "file_unavailable")?;
@@ -1733,7 +1780,7 @@ fn rename_no_replace(source: &Path, target: &Path) -> std::io::Result<()> {
 
 pub(crate) fn remove_files(
     root: &Path,
-    session_path: &Path,
+    protected_path: &Path,
     items: &[RemovalEntry],
 ) -> OperationResult {
     if items.len() > MAX_ITEMS {
@@ -1753,7 +1800,7 @@ pub(crate) fn remove_files(
     let mut files = Vec::with_capacity(items.len().min(MAX_ITEMS));
     let mut failed = false;
     for item in items {
-        let result = remove_one(root, session_path, item);
+        let result = remove_one(root, protected_path, item);
         failed |= result.is_err();
         files.push(OperationEntry {
             path: item.path.clone(),
@@ -1767,13 +1814,13 @@ pub(crate) fn remove_files(
     }
 }
 
-fn remove_one(root: &Path, session_path: &Path, item: &RemovalEntry) -> Result<(), &'static str> {
+fn remove_one(root: &Path, protected_path: &Path, item: &RemovalEntry) -> Result<(), &'static str> {
     let path = match safe_path(root, &item.path, true) {
         Ok(path) => path,
         Err(error) => return Err(error),
     };
-    if path == root || conflicts_with_session(root, &path, session_path) {
-        return Err("session_path_forbidden");
+    if path == root || conflicts_with_protected(root, &path, protected_path) {
+        return Err("protected_path_forbidden");
     }
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
@@ -1929,6 +1976,7 @@ fn atomic_write(
     path: &Path,
     bytes: &[u8],
     overwrite: bool,
+    expected_existing_sha256: Option<&str>,
 ) -> Result<(), String> {
     let parent = path
         .parent()
@@ -1963,6 +2011,12 @@ fn atomic_write(
         return Err(error.to_string());
     }
     drop(file);
+    if let Some(expected) = expected_existing_sha256 {
+        if hash_path(path).map_or(true, |(actual, _)| actual != expected) {
+            let _ = fs::remove_file(&temporary);
+            return Err("source_changed".to_string());
+        }
+    }
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
