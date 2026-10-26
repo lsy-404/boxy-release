@@ -11,10 +11,11 @@ import test from "node:test";
 const root = fileURLToPath(new URL("..", import.meta.url));
 const html = readFileSync(`${root}/connector/bootstrap/index.html`, "utf8");
 const script = readFileSync(`${root}/connector/bootstrap/selection.js`, "utf8");
+const desktop = readFileSync(`${root}/connector/src/desktop.rs`, "utf8");
 const fixture = `${root}/test/fixtures/v23_service.mjs`;
 
 test("startup contains one blank, accessible URL field and submits on Enter", () => {
-  assert.match(html, /<title><\/title>/);
+  assert.match(html, /<title>Boxy Connector<\/title>/);
   assert.equal((html.match(/<input\b/g) ?? []).length, 1);
   assert.match(html, /id="service-url"[^>]*type="text"/);
   assert.match(html, /id="service-url"[^>]*aria-label="Service address"/);
@@ -25,6 +26,15 @@ test("startup contains one blank, accessible URL field and submits on Enter", ()
   assert.match(script, /service-form.*submit/s);
   assert.match(script, /invoke\('select_service'/);
   assert.doesNotMatch(script, /session|device|inventory|open_folder/i);
+});
+
+test("startup and bridge windows use a fixed native title", () => {
+  assert.equal((desktop.match(/\.title\("Boxy Connector"\)/g) ?? []).length, 2);
+  assert.doesNotMatch(desktop, /on_document_title_changed/);
+  const versionedUserAgents = desktop.match(
+    /\.user_agent\(concat!\("BoxyConnector\/", env!\("CARGO_PKG_VERSION"\)\)\)/g,
+  ) ?? [];
+  assert.equal(versionedUserAgents.length, 2);
 });
 
 test("startup infers only a filename URL and does not use environment or command-line options", () => {

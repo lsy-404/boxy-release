@@ -349,7 +349,8 @@ fn build_service_selection(app: &AppHandle, state: &Arc<RuntimeState>) -> Result
         "service-selection",
         WebviewUrl::App("index.html".into()),
     )
-    .title("")
+    .title("Boxy Connector")
+    .user_agent(concat!("BoxyConnector/", env!("CARGO_PKG_VERSION")))
     .inner_size(560.0, 420.0)
     .min_inner_size(440.0, 360.0)
     .incognito(true)
@@ -399,7 +400,8 @@ fn build_window(
     let popup_app = app.clone();
     let popup_state = state.clone();
     let mut builder = WebviewWindowBuilder::new(app, label, WebviewUrl::External(url))
-        .title("Boxy")
+        .title("Boxy Connector")
+        .user_agent(concat!("BoxyConnector/", env!("CARGO_PKG_VERSION")))
         .inner_size(1180.0, 820.0)
         .min_inner_size(760.0, 540.0)
         .incognito(true)

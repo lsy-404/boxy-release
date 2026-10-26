@@ -124,7 +124,7 @@ fn drive_render_smoke(
         if let Ok(snapshot) = snapshot {
             last_snapshot = snapshot;
             if last_snapshot["ready"] == "complete"
-                && last_snapshot["title"] == ""
+                && last_snapshot["title"] == "Boxy Connector"
                 && last_snapshot["inputCount"] == 1
                 && last_snapshot["inputType"] == "text"
                 && last_snapshot["inputValue"] == ""
