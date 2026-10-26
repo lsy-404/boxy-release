@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createPublicKey, verify } from "node:crypto";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 
 function option(name) {
@@ -12,6 +12,9 @@ function option(name) {
 const statePath = option("--state-file");
 const portPath = option("--port-file");
 const root = option("--root");
+const manifest = readFileSync(new URL("../../connector/Cargo.toml", import.meta.url), "utf8");
+const connectorVersion = /^version\s*=\s*"([^"]+)"/m.exec(manifest)?.[1];
+if (!connectorVersion) throw new Error("connector package version is missing");
 const state = {
   errors: [],
   hello: null,
@@ -69,17 +72,21 @@ function signed(request) {
 
 const server = createServer(async (request, response) => {
   try {
+    if (request.url.startsWith("/api/")) {
+      assert.equal(request.headers["x-boxy-connector-version"], connectorVersion);
+    }
     if (request.method === "GET" && request.url === "/editor") {
       state.browserLoaded = true;
+      state.browserUserAgent = request.headers["user-agent"] ?? null;
       save();
-      send(response, "<!doctype html><html><head><title></title></head><body>Ready</body></html>", 200, "text/html");
+      send(response, "<!doctype html><html><head><title>Remote Service</title></head><body>Ready</body></html>", 200, "text/html");
       return;
     }
     if (request.method === "POST" && request.url === "/api/connect") {
       connectionCount += 1;
       assert.equal(connectionCount, 1, "only one connection should be started");
       const hello = await body(request);
-      assert.deepEqual(Object.keys(hello).sort(), ["capabilities", "clientVersion", "platform", "protocolVersion", "publicKey"].sort());
+      assert.deepEqual(Object.keys(hello).sort(), ["capabilities", "platform", "protocolVersion", "publicKey"].sort());
       assert.equal(hello.protocolVersion, 4);
       assert.ok(["windows", "macos"].includes(hello.platform));
       assert.ok(Array.isArray(hello.capabilities));

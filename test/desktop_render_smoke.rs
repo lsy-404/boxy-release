@@ -180,8 +180,13 @@ fn drive_render_smoke(
                 && fixture["polls"][0]["taskCount"] == 0
                 && fixture["taskSentAfterReady"] == true
                 && fixture["browserLoaded"] == true
+                && fixture["browserUserAgent"]
+                    == format!("BoxyConnector/{}", env!("CARGO_PKG_VERSION"))
                 && fixture["receiptValid"] == true
             {
+                if window.title().map_err(|error| error.to_string())? != "Boxy Connector" {
+                    return Err("the remote page changed the native window title".to_string());
+                }
                 return Ok(());
             }
         }

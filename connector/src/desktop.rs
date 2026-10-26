@@ -69,6 +69,11 @@ impl ConnectorHost for DesktopHost {
             .map_err(|_| "cannot open the cloud editor window".to_string())?
     }
 
+    fn open_external(&self, url: Url) -> Result<(), String> {
+        webbrowser::open(url.as_str())
+            .map_err(|error| format!("cannot open the service-provided link: {error}"))
+    }
+
     fn approve_process(&self, executable: &str, args: &[String], cwd: Option<&Path>) -> bool {
         let directory = cwd
             .map(|path| path.display().to_string())
@@ -301,20 +306,27 @@ fn run_worker(
         boxy::run_connected(&config, &host)
     }))
     .unwrap_or_else(|_| Err("the local connector stopped unexpectedly".to_string()));
-    let retryable = startup.lock().unwrap().is_some() && !state.stopping.load(Ordering::Acquire);
+    let startup_pending = startup.lock().unwrap().is_some();
+    let stopping = state.stopping.load(Ordering::Acquire);
+    let retryable = result.is_err() && startup_pending && !stopping;
     let code = i32::from(result.is_err() && !state.stopping.load(Ordering::Acquire) && !retryable);
     let handle = app.clone();
     let _ = app.run_on_main_thread(move || {
         let pending = startup.lock().unwrap().take();
         if let Some(sender) = pending {
             if !state.stopping.load(Ordering::Acquire) {
-                state.started.store(false, Ordering::Release);
-                let _ = sender.send(Err(result
-                    .err()
-                    .unwrap_or_else(|| "connection attempt stopped".to_string())));
-                return;
+                if result.is_ok() {
+                    let _ = sender.send(Ok(()));
+                } else {
+                    state.started.store(false, Ordering::Release);
+                    let _ = sender.send(Err(result
+                        .err()
+                        .unwrap_or_else(|| "connection attempt stopped".to_string())));
+                    return;
+                }
+            } else {
+                let _ = sender.send(Err("the connector is closing".to_string()));
             }
-            let _ = sender.send(Err("the connector is closing".to_string()));
         }
         if let Err(error) = result {
             if !state.stopping.load(Ordering::Acquire) {

@@ -12,6 +12,8 @@ const root = fileURLToPath(new URL("..", import.meta.url));
 const html = readFileSync(`${root}/connector/bootstrap/index.html`, "utf8");
 const script = readFileSync(`${root}/connector/bootstrap/selection.js`, "utf8");
 const desktop = readFileSync(`${root}/connector/src/desktop.rs`, "utf8");
+const manifest = readFileSync(`${root}/connector/Cargo.toml`, "utf8");
+const connectorVersion = /^version\s*=\s*"([^"]+)"/m.exec(manifest)?.[1];
 const fixture = `${root}/test/fixtures/v23_service.mjs`;
 
 test("startup contains one blank, accessible URL field and submits on Enter", () => {
@@ -76,10 +78,9 @@ test("v4 fixture gates scoped file tasks behind authorization and verifies recei
   const rawKey = publicKey.export({ format: "der", type: "spki" }).subarray(-32);
   const connect = await fetch(`${base}/api/connect`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", "x-boxy-connector-version": connectorVersion },
     body: JSON.stringify({
       protocolVersion: 4,
-      clientVersion: "2.3.0",
       platform: "windows",
       capabilities: ["fs.list"],
       publicKey: rawKey.toString("base64url"),
@@ -90,12 +91,12 @@ test("v4 fixture gates scoped file tasks behind authorization and verifies recei
   assert.equal(connection.protocolVersion, 4);
   assert.equal(typeof connection.expiresAt, "number");
   assert.ok(connection.expiresAt > Date.now());
-  assert.equal((await fetch(connection.browserUrl)).status, 200);
+  assert.equal((await fetch(connection.browserUrl, { headers: { "user-agent": `BoxyConnector/${connectorVersion}` } })).status, 200);
 
   async function poll(nonce) {
     const path = "/api/connections/smoke_connection";
     const signature = sign(null, Buffer.from(`GET\n${path}\n${nonce}`), privateKey).toString("base64url");
-    const response = await fetch(`${base}${path}`, { headers: { "x-connector-nonce": nonce, "x-connector-signature": signature } });
+    const response = await fetch(`${base}${path}`, { headers: { "x-boxy-connector-version": connectorVersion, "x-connector-nonce": nonce, "x-connector-signature": signature } });
     assert.equal(response.status, 200);
     return response.json();
   }
@@ -111,11 +112,12 @@ test("v4 fixture gates scoped file tasks behind authorization and verifies recei
   const receiptSignature = sign(null, Buffer.from(`POST\n${receiptPath}\nreceipt_nonce`), privateKey).toString("base64url");
   const receipt = await fetch(`${base}${receiptPath}`, {
     method: "POST",
-    headers: { "content-type": "application/json", "x-connector-nonce": "receipt_nonce", "x-connector-signature": receiptSignature },
+    headers: { "content-type": "application/json", "x-boxy-connector-version": connectorVersion, "x-connector-nonce": "receipt_nonce", "x-connector-signature": receiptSignature },
     body: receiptBody,
   });
   assert.equal(receipt.status, 200);
   const state = JSON.parse(readFileSync(statePath, "utf8"));
+  assert.equal(state.browserUserAgent, `BoxyConnector/${connectorVersion}`);
   assert.equal(state.receiptValid, true);
   assert.deepEqual(state.errors, []);
 });
