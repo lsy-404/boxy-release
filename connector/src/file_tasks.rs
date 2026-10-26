@@ -1267,11 +1267,21 @@ fn collect_manifest_path(
         state.stopped = true;
         return;
     }
-    let path = match safe_path(root, relative, false) {
-        Ok(path) => path,
-        Err(error) => {
-            push_manifest_error(state, relative, error);
-            return;
+    let path = if relative == "." {
+        match root.canonicalize() {
+            Ok(path) if path.is_dir() => path,
+            _ => {
+                push_manifest_error(state, relative, "file_unavailable");
+                return;
+            }
+        }
+    } else {
+        match safe_path(root, relative, false) {
+            Ok(path) => path,
+            Err(error) => {
+                push_manifest_error(state, relative, error);
+                return;
+            }
         }
     };
     let metadata = match fs::symlink_metadata(&path) {
@@ -1337,7 +1347,11 @@ fn collect_manifest_path(
         }
         children.sort();
         for name in children {
-            let child = format!("{relative}/{}", name.to_string_lossy());
+            let child = if relative == "." {
+                name.to_string_lossy().into_owned()
+            } else {
+                format!("{relative}/{}", name.to_string_lossy())
+            };
             collect_manifest_path(root, &child, depth + 1, skipped_paths, state);
             if state.stopped {
                 break;

@@ -48,6 +48,11 @@ name = "boxy"
 path = "src/main.rs"
 required-features = ["desktop"]
 
+[[example]]
+name = "desktop_render_smoke"
+path = "../test/desktop_render_smoke.rs"
+required-features = ["desktop"]
+
 [[test]]
 name = "launch_options"
 path = "../test/launch_options.rs"

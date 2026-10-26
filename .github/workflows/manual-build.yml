@@ -82,7 +82,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: x86_64-pc-windows-msvc
 
@@ -117,6 +117,10 @@ jobs:
           if (Get-ChildItem -LiteralPath (Split-Path -Parent $exe) -Filter "*.dll" -Force) { throw "Windows package contains an adjacent loader DLL." }
           if (Get-ChildItem -LiteralPath (Split-Path -Parent $exe) -Directory -Force | Where-Object { $_.Name -match "WebView2|runtime" }) { throw "Windows package contains a WebView2 runtime directory." }
 
+      - name: Smoke test generic startup and v4 connection
+        shell: pwsh
+        run: pwsh -NoProfile -File test/windows_startup_smoke.ps1
+
       - name: Upload Boxy for Windows
         env:
           GH_TOKEN: ${{ github.token }}
@@ -138,7 +142,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
@@ -147,6 +151,9 @@ jobs:
           cargo test --locked -p boxy
           node --test test/package_portable.test.mjs
           node --test test/connector_v23_ui.test.mjs
+
+      - name: Smoke test native WebView startup and v4 connection
+        run: bash test/macos_webview_render_smoke.sh
 
       - name: Build client source
         run: |

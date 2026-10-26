@@ -66,6 +66,28 @@ fn reads_batch_files_with_hash_and_rejects_path_escape() {
 }
 
 #[test]
+fn list_root_sentinel_recursively_reports_entries_without_mutating_them() {
+    let temp = Temp::new();
+    fs::create_dir_all(temp.0.join("nested")).unwrap();
+    fs::write(temp.0.join("nested/probe.txt"), b"read only").unwrap();
+
+    let result = list_files(&temp.0, &[".".into()], &[]);
+
+    assert!(result
+        .files
+        .iter()
+        .any(|entry| entry.path == "." && entry.kind == "directory"));
+    assert!(result
+        .files
+        .iter()
+        .any(|entry| entry.path == "nested/probe.txt" && entry.kind == "file"));
+    assert_eq!(
+        fs::read(temp.0.join("nested/probe.txt")).unwrap(),
+        b"read only"
+    );
+}
+
+#[test]
 fn enforces_actual_aggregate_read_budget_and_uses_unpadded_base64url() {
     let temp = Temp::new();
     fs::write(temp.0.join("one"), [0, 255]).unwrap();
