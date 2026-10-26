@@ -152,13 +152,16 @@ fn make_browser_cookie(
     let host = url
         .host_str()
         .ok_or_else(|| "service browser URL has no host".to_string())?;
-    Ok(tauri::webview::Cookie::build((cookie.name, cookie.value))
+    let cookie = tauri::webview::Cookie::build((cookie.name, cookie.value))
         .domain(host.to_owned())
         .path("/")
         .http_only(true)
-        .same_site(tauri::webview::cookie::SameSite::Lax)
-        .secure(url.scheme() == "https")
-        .build())
+        .same_site(tauri::webview::cookie::SameSite::Lax);
+    if url.scheme() == "https" {
+        Ok(cookie.secure(true).build())
+    } else {
+        Ok(cookie.build())
+    }
 }
 
 fn application_builder(state: Arc<RuntimeState>) -> tauri::Builder<tauri::Wry> {
