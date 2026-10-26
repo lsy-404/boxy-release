@@ -93,7 +93,7 @@ const server = createServer(async (request, response) => {
         protocolVersion: 4,
         connectionId: "smoke_connection",
         browserUrl: `http://127.0.0.1:${port}/editor`,
-        expiresAt: new Date(Date.now() + 120_000).toISOString(),
+        expiresAt: Date.now() + 120_000,
       });
       return;
     }

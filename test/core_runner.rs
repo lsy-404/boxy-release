@@ -203,7 +203,7 @@ fn signed_v4_connection_waits_for_ready_before_reading_explicit_files() {
         respond(
             &mut stream,
             201,
-            &json!({"protocolVersion":4,"connectionId":"conn-1","browserUrl":format!("http://{address}/connect/conn-1"),"expiresAt":"2030-10-25T00:00:00Z"}),
+            &json!({"protocolVersion":4,"connectionId":"conn-1","browserUrl":format!("http://{address}/connect/conn-1"),"expiresAt":future_expiry_ms()}),
         );
 
         let (mut stream, request, _) = accept_json(&listener);
@@ -265,6 +265,36 @@ fn signed_v4_connection_waits_for_ready_before_reading_explicit_files() {
 }
 
 #[test]
+fn connection_expiry_rejects_non_numeric_worker_response() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, request, _) = accept_json(&listener);
+        assert_eq!(request_path(&request), "/api/connect");
+        respond(
+            &mut stream,
+            201,
+            &json!({"protocolVersion":4,"connectionId":"conn-invalid-expiry","browserUrl":format!("http://{address}/connect/conn-invalid-expiry"),"expiresAt":"2030-10-25T00:00:00Z"}),
+        );
+    });
+    let host = TestHost::default();
+    let error = run_connected(
+        &Config {
+            server_url: format!("http://{address}"),
+        },
+        &host,
+    )
+    .unwrap_err();
+
+    assert!(
+        error.contains("invalid type: string"),
+        "unexpected error: {error}"
+    );
+    assert!(host.opened.lock().unwrap().is_none());
+    server.join().unwrap();
+}
+
+#[test]
 fn awaiting_auth_task_is_rejected_before_execution_and_connection_closes() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -273,7 +303,7 @@ fn awaiting_auth_task_is_rejected_before_execution_and_connection_closes() {
         respond(
             &mut stream,
             201,
-            &json!({"protocolVersion":4,"connectionId":"conn-2","browserUrl":format!("http://{address}/"),"expiresAt":"2030-10-25T00:00:00Z"}),
+            &json!({"protocolVersion":4,"connectionId":"conn-2","browserUrl":format!("http://{address}/"),"expiresAt":future_expiry_ms()}),
         );
         let (mut stream, request, _) = accept_json(&listener);
         let path = request_path(&request);
@@ -512,6 +542,14 @@ fn accept_json(listener: &TcpListener) -> (TcpStream, String, Vec<u8>) {
     }
     let body = request[header_end..header_end + content_length].to_vec();
     (stream, headers, body)
+}
+
+fn future_expiry_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 120_000
 }
 
 fn request_path(request: &str) -> &str {

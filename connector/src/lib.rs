@@ -61,7 +61,7 @@ struct ConnectResponse {
     protocol_version: u8,
     connection_id: String,
     browser_url: String,
-    expires_at: String,
+    expires_at: i64,
 }
 
 #[derive(Deserialize)]
@@ -147,9 +147,8 @@ pub fn run_connected(config: &Config, host: &dyn ConnectorHost) -> Result<(), St
     {
         return Err("service returned an incomplete connection response".to_string());
     }
-    let expires_at = time::OffsetDateTime::parse(
-        &connected.expires_at,
-        &time::format_description::well_known::Rfc3339,
+    let expires_at = time::OffsetDateTime::from_unix_timestamp_nanos(
+        i128::from(connected.expires_at) * 1_000_000,
     )
     .map_err(|_| "service returned an invalid connection expiry".to_string())?;
     if expires_at <= time::OffsetDateTime::now_utc() {

@@ -76,6 +76,8 @@ test("v4 fixture gates scoped file tasks behind authorization and verifies recei
   assert.equal(connect.status, 200);
   const connection = await connect.json();
   assert.equal(connection.protocolVersion, 4);
+  assert.equal(typeof connection.expiresAt, "number");
+  assert.ok(connection.expiresAt > Date.now());
   assert.equal((await fetch(connection.browserUrl)).status, 200);
 
   async function poll(nonce) {
