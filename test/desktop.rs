@@ -58,6 +58,48 @@ fn remote_pages_cannot_navigate_to_local_files_or_native_protocols() {
 }
 
 #[test]
+fn browser_cookies_are_scoped_to_the_service_host_and_session() {
+    let url = Url::parse("https://boxy.example.test:8443/").unwrap();
+    let cookie = make_browser_cookie(
+        &url,
+        BrowserCookie {
+            name: "connection".into(),
+            value: "opaque".into(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(cookie.name(), "connection");
+    assert_eq!(cookie.value(), "opaque");
+    assert_eq!(cookie.domain(), Some("boxy.example.test"));
+    assert_eq!(cookie.path(), Some("/"));
+    assert_eq!(cookie.http_only(), Some(true));
+    assert_eq!(
+        cookie.same_site(),
+        Some(tauri::webview::cookie::SameSite::Lax)
+    );
+    assert_eq!(cookie.secure(), Some(true));
+    assert_eq!(cookie.expires_datetime(), None);
+    assert_eq!(cookie.max_age(), None);
+}
+
+#[test]
+fn http_browser_cookies_do_not_set_the_secure_flag() {
+    let url = Url::parse("http://127.0.0.1:8000/").unwrap();
+    let cookie = make_browser_cookie(
+        &url,
+        BrowserCookie {
+            name: "connection".into(),
+            value: "opaque".into(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(cookie.domain(), Some("127.0.0.1"));
+    assert_eq!(cookie.secure(), Some(false));
+}
+
+#[test]
 fn cleanup_removes_owned_profile_and_preserves_neighboring_files() {
     let parent = tempfile::tempdir().unwrap();
     let runtime = tempfile::Builder::new()

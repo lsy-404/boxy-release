@@ -13,6 +13,7 @@ use std::{
 #[derive(Default)]
 struct TestHost {
     opened: Mutex<Option<Url>>,
+    browser_cookies: Mutex<Vec<BrowserCookie>>,
     external_opened: Mutex<Option<Url>>,
 }
 
@@ -34,8 +35,9 @@ fn list_task_returns_an_empty_result_for_a_missing_absolute_root() {
 }
 
 impl ConnectorHost for TestHost {
-    fn open_editor(&self, url: Url) -> Result<(), String> {
+    fn open_editor(&self, url: Url, cookies: Vec<BrowserCookie>) -> Result<(), String> {
         *self.opened.lock().unwrap() = Some(url);
+        *self.browser_cookies.lock().unwrap() = cookies;
         Ok(())
     }
 
@@ -58,7 +60,7 @@ struct StopAfterChecks {
 }
 
 impl ConnectorHost for StopAfterChecks {
-    fn open_editor(&self, _url: Url) -> Result<(), String> {
+    fn open_editor(&self, _url: Url, _cookies: Vec<BrowserCookie>) -> Result<(), String> {
         unreachable!()
     }
 
@@ -206,7 +208,7 @@ fn signed_v4_connection_waits_for_ready_before_reading_explicit_files() {
         respond(
             &mut stream,
             201,
-            &json!({"protocolVersion":4,"connectionId":"conn-1","browserUrl":format!("http://{address}/connect/conn-1"),"expiresAt":future_expiry_ms()}),
+            &json!({"protocolVersion":4,"connectionId":"conn-1","browserUrl":format!("http://{address}/"),"browserCookies":[{"name":"boxy_connection","value":"test-session"}],"expiresAt":future_expiry_ms()}),
         );
 
         let (mut stream, request, _) = accept_json(&listener);
@@ -260,9 +262,13 @@ fn signed_v4_connection_waits_for_ready_before_reading_explicit_files() {
         &host,
     )
     .unwrap();
+    assert_eq!(host.opened.lock().unwrap().as_ref().unwrap().path(), "/");
     assert_eq!(
-        host.opened.lock().unwrap().as_ref().unwrap().path(),
-        "/connect/conn-1"
+        *host.browser_cookies.lock().unwrap(),
+        [BrowserCookie {
+            name: "boxy_connection".into(),
+            value: "test-session".into(),
+        }]
     );
     server.join().unwrap();
 }
@@ -277,7 +283,7 @@ fn connection_expiry_rejects_non_numeric_worker_response() {
         respond(
             &mut stream,
             201,
-            &json!({"protocolVersion":4,"connectionId":"conn-invalid-expiry","browserUrl":format!("http://{address}/connect/conn-invalid-expiry"),"expiresAt":"2030-10-25T00:00:00Z"}),
+            &json!({"protocolVersion":4,"connectionId":"conn-invalid-expiry","browserUrl":format!("http://{address}/"),"browserCookies":[{"name":"boxy_connection","value":"test-session"}],"expiresAt":"2030-10-25T00:00:00Z"}),
         );
     });
     let host = TestHost::default();
@@ -295,6 +301,54 @@ fn connection_expiry_rejects_non_numeric_worker_response() {
     );
     assert!(host.opened.lock().unwrap().is_none());
     server.join().unwrap();
+}
+
+#[test]
+fn connection_rejects_invalid_browser_cookie_before_opening_editor() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _, _) = accept_json(&listener);
+        respond(
+            &mut stream,
+            201,
+            &json!({"protocolVersion":4,"connectionId":"invalid_cookie","browserUrl":format!("http://{address}/"),"browserCookies":[{"name":"session; Secure","value":"token"}],"expiresAt":future_expiry_ms()}),
+        );
+    });
+    let host = TestHost::default();
+    let error = run_connected(
+        &Config {
+            server_url: format!("http://{address}"),
+        },
+        &host,
+    )
+    .unwrap_err();
+    assert!(error.contains("invalid browser cookie"));
+    assert!(host.opened.lock().unwrap().is_none());
+    server.join().unwrap();
+}
+
+#[test]
+fn connect_response_requires_browser_cookies() {
+    let response = json!({
+        "protocolVersion": 4,
+        "connectionId": "connection",
+        "browserUrl": "https://boxy.example.test/",
+        "expiresAt": future_expiry_ms(),
+    });
+
+    assert!(serde_json::from_value::<ConnectResponse>(response).is_err());
+}
+
+#[test]
+fn browser_cookie_validation_rejects_value_attribute_injection() {
+    let error = validate_browser_cookies(&[BrowserCookie {
+        name: "connection".into(),
+        value: "token; Domain=attacker.example".into(),
+    }])
+    .unwrap_err();
+
+    assert!(error.contains("invalid browser cookie"));
 }
 
 #[test]
@@ -400,7 +454,7 @@ fn upgrade_poll_opens_external_url_and_stops_without_repolling() {
         respond(
             &mut stream,
             201,
-            &json!({"protocolVersion":4,"connectionId":"conn-upgrade","browserUrl":format!("http://{address}/connect"),"expiresAt":future_expiry_ms()}),
+            &json!({"protocolVersion":4,"connectionId":"conn-upgrade","browserUrl":format!("http://{address}/"),"browserCookies":[{"name":"boxy_connection","value":"test-session"}],"expiresAt":future_expiry_ms()}),
         );
 
         let (mut stream, request, _) = accept_json(&listener);
@@ -440,7 +494,7 @@ fn awaiting_auth_task_is_rejected_before_execution_and_connection_closes() {
         respond(
             &mut stream,
             201,
-            &json!({"protocolVersion":4,"connectionId":"conn-2","browserUrl":format!("http://{address}/"),"expiresAt":future_expiry_ms()}),
+            &json!({"protocolVersion":4,"connectionId":"conn-2","browserUrl":format!("http://{address}/"),"browserCookies":[{"name":"boxy_connection","value":"test-session"}],"expiresAt":future_expiry_ms()}),
         );
         let (mut stream, request, _) = accept_json(&listener);
         let path = request_path(&request);

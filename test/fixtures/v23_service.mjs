@@ -19,6 +19,7 @@ const state = {
   errors: [],
   hello: null,
   browserLoaded: false,
+  browserCookie: null,
   polls: [],
   taskSentAfterReady: false,
   receipt: null,
@@ -75,8 +76,11 @@ const server = createServer(async (request, response) => {
     if (request.url.startsWith("/api/")) {
       assert.equal(request.headers["x-boxy-connector-version"], connectorVersion);
     }
-    if (request.method === "GET" && request.url === "/editor") {
+    if (request.method === "GET" && request.url === "/") {
+      const expectedCookie = "boxy_connection=synthetic-session";
+      assert.equal(request.headers.cookie, expectedCookie, "browser cookie must arrive on the first root request");
       state.browserLoaded = true;
+      state.browserCookie = request.headers.cookie;
       state.browserUserAgent = request.headers["user-agent"] ?? null;
       save();
       send(response, "<!doctype html><html><head><title>Remote Service</title></head><body>Ready</body></html>", 200, "text/html");
@@ -99,7 +103,8 @@ const server = createServer(async (request, response) => {
       send(response, {
         protocolVersion: 4,
         connectionId: "smoke_connection",
-        browserUrl: `http://127.0.0.1:${port}/editor`,
+        browserUrl: `http://127.0.0.1:${port}/`,
+        browserCookies: [{ name: "boxy_connection", value: "synthetic-session" }],
         expiresAt: Date.now() + 120_000,
       });
       return;
