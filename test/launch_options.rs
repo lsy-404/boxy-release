@@ -34,3 +34,37 @@ fn invalid_or_non_origin_urls_are_rejected_without_fallback() {
         );
     }
 }
+
+#[test]
+fn service_url_is_inferred_from_valid_executable_names() {
+    use std::path::Path;
+
+    assert_eq!(
+        launch::inferred_service_url(Path::new("service.example.test.exe")),
+        Some("https://service.example.test".to_string())
+    );
+    assert_eq!(
+        launch::inferred_service_url(Path::new("boxy.service.example.test (1).exe")),
+        Some("https://boxy.service.example.test".to_string())
+    );
+    assert_eq!(
+        launch::inferred_service_url(Path::new("ordinary-boxy-windows-x64.exe")),
+        None
+    );
+    assert_eq!(
+        launch::inferred_service_url(Path::new(
+            "Boxy.Service.Example.test.app/Contents/MacOS/Boxy"
+        )),
+        Some("https://boxy.service.example.test".to_string())
+    );
+}
+
+#[test]
+fn invalid_encoded_hostname_tokens_are_not_inferred() {
+    use std::path::Path;
+
+    assert_eq!(
+        launch::inferred_service_url(Path::new("boxy%2Eservice%2Eexample%2Etest.exe")),
+        None
+    );
+}
