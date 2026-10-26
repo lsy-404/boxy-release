@@ -37,9 +37,12 @@ const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_RECEIPT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROCESS_SECONDS: u64 = 3600;
 const POLL_DELAY: Duration = Duration::from_millis(900);
+const CONNECTOR_VERSION_HEADER: &str = "X-Boxy-Connector-Version";
+const MAX_EXTERNAL_RESPONSE_BYTES: usize = 64 * 1024;
 
 pub trait ConnectorHost: Send + Sync {
     fn open_editor(&self, url: Url) -> Result<(), String>;
+    fn open_external(&self, url: Url) -> Result<(), String>;
     fn approve_process(&self, executable: &str, args: &[String], cwd: Option<&Path>) -> bool;
     fn should_stop(&self) -> bool;
     fn set_resource_root(&self, _root: &Path) {}
@@ -49,7 +52,6 @@ pub trait ConnectorHost: Send + Sync {
 #[serde(rename_all = "camelCase")]
 struct Hello<'a> {
     protocol_version: u8,
-    client_version: &'static str,
     platform: &'static str,
     capabilities: Vec<&'static str>,
     public_key: &'a str,
@@ -62,6 +64,12 @@ struct ConnectResponse {
     connection_id: String,
     browser_url: String,
     expires_at: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpgradeResponse {
+    open_external_url: String,
 }
 
 #[derive(Deserialize)]
@@ -132,12 +140,13 @@ pub fn run_connected(config: &Config, host: &dyn ConnectorHost) -> Result<(), St
     let public_key = URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes());
     let hello = Hello {
         protocol_version: PROTOCOL_VERSION,
-        client_version: env!("CARGO_PKG_VERSION"),
         platform: platform_name(),
         capabilities: capabilities(),
         public_key: &public_key,
     };
-    let connected: ConnectResponse = post_json(config, CONNECT_PATH, &hello)?;
+    let Some(connected) = post_connect(config, &hello, host)? else {
+        return Ok(());
+    };
     if connected.protocol_version != PROTOCOL_VERSION
         || connected.connection_id.is_empty()
         || !connected
@@ -196,7 +205,6 @@ pub(crate) fn hello_body(
 ) -> Result<Value, String> {
     serde_json::to_value(Hello {
         protocol_version: PROTOCOL_VERSION,
-        client_version: env!("CARGO_PKG_VERSION"),
         platform,
         capabilities,
         public_key,
@@ -220,11 +228,15 @@ fn run_connection(
         ),
     >::new();
     let mut mounts = HashMap::<PathBuf, mounts::MountManager>::new();
+    let mut close_connection = true;
     let result = (|| loop {
         if host.should_stop() {
             break Ok(());
         }
-        let poll: PollResponse = get_signed(config, &base, key, host)?;
+        let Some(poll) = get_signed::<PollResponse>(config, &base, key, host)? else {
+            close_connection = false;
+            break Ok(());
+        };
         if poll.protocol_version != PROTOCOL_VERSION {
             break Err("service protocol version is not supported".to_string());
         }
@@ -291,6 +303,9 @@ fn run_connection(
         }
     })();
     watches.clear();
+    if !close_connection {
+        return result;
+    }
     let close = post_signed(
         config,
         &format!("{base}/close"),
@@ -660,6 +675,7 @@ fn transfer_file(
         };
         let response = ureq::post(&format!("{}{}", config.server_url, content_path))
             .timeout(Duration::from_secs(120))
+            .set(CONNECTOR_VERSION_HEADER, env!("CARGO_PKG_VERSION"))
             .set("Content-Length", &expected_size.to_string())
             .set("X-Connector-Nonce", &nonce)
             .set("X-Connector-Signature", &signature)
@@ -698,6 +714,7 @@ fn transfer_file(
         let (nonce, signature) = request_signature(key, "GET", &content_path);
         let response = ureq::get(&format!("{}{}", config.server_url, content_path))
             .timeout(Duration::from_secs(120))
+            .set(CONNECTOR_VERSION_HEADER, env!("CARGO_PKG_VERSION"))
             .set("X-Connector-Nonce", &nonce)
             .set("X-Connector-Signature", &signature)
             .call()
@@ -812,6 +829,7 @@ impl<'a> TransferProgress<'a> {
             let (nonce, signature) = request_signature(self.key, "POST", self.path);
             let _ = ureq::post(&format!("{}{}", self.config.server_url, self.path))
                 .timeout(Duration::from_secs(2))
+                .set(CONNECTOR_VERSION_HEADER, env!("CARGO_PKG_VERSION"))
                 .set("Content-Type", "application/json")
                 .set("X-Connector-Nonce", &nonce)
                 .set("X-Connector-Signature", &signature)
@@ -1426,23 +1444,64 @@ fn execute_mount(
     }
 }
 
-fn post_json<T: Serialize, R: for<'de> Deserialize<'de>>(
+fn post_connect<T: Serialize>(
     config: &Config,
-    path: &str,
     body: &T,
-) -> Result<R, String> {
-    let response = ureq::post(&format!("{}{}", config.server_url, path))
+    host: &dyn ConnectorHost,
+) -> Result<Option<ConnectResponse>, String> {
+    let response = ureq::post(&format!("{}{}", config.server_url, CONNECT_PATH))
         .timeout(Duration::from_secs(30))
+        .set(CONNECTOR_VERSION_HEADER, env!("CARGO_PKG_VERSION"))
         .set("Content-Type", "application/json")
         .send_json(serde_json::to_value(body).map_err(|e| e.to_string())?);
     match response {
-        Ok(response) => response.into_json().map_err(|e| e.to_string()),
+        Ok(response) => response.into_json().map(Some).map_err(|e| e.to_string()),
+        Err(ureq::Error::Status(426, response)) => {
+            open_external_response(response, host)?;
+            Ok(None)
+        }
         Err(ureq::Error::Status(status, response)) => Err(format!(
-            "service rejected request ({status}): {}",
+            "service rejected connection ({status}): {}",
             response.into_string().unwrap_or_default()
         )),
         Err(error) => Err(error.to_string()),
     }
+}
+
+fn validate_external_url(value: &str) -> Result<Url, String> {
+    let url =
+        Url::parse(value).map_err(|_| "service returned an invalid external URL".to_string())?;
+    let authority = value
+        .split_once("://")
+        .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or_default())
+        .unwrap_or_default();
+    if url.scheme() != "https"
+        || url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || authority.contains('@')
+    {
+        return Err("service returned an invalid external URL".to_string());
+    }
+    Ok(url)
+}
+
+fn open_external_response(
+    response: ureq::Response,
+    host: &dyn ConnectorHost,
+) -> Result<(), String> {
+    let mut body = Vec::new();
+    response
+        .into_reader()
+        .take((MAX_EXTERNAL_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut body)
+        .map_err(|error| error.to_string())?;
+    if body.len() > MAX_EXTERNAL_RESPONSE_BYTES {
+        return Err("service external-link response is too large".to_string());
+    }
+    let upgrade: UpgradeResponse = serde_json::from_slice(&body)
+        .map_err(|_| "service returned an invalid external-link response".to_string())?;
+    host.open_external(validate_external_url(&upgrade.open_external_url)?)
 }
 
 fn get_signed<R: for<'de> Deserialize<'de>>(
@@ -1450,11 +1509,12 @@ fn get_signed<R: for<'de> Deserialize<'de>>(
     path: &str,
     key: &SigningKey,
     host: &dyn ConnectorHost,
-) -> Result<R, String> {
+) -> Result<Option<R>, String> {
     while !host.should_stop() {
         let (nonce, signature) = request_signature(key, "GET", path);
         match ureq::get(&format!("{}{}", config.server_url, path))
             .timeout(Duration::from_secs(30))
+            .set(CONNECTOR_VERSION_HEADER, env!("CARGO_PKG_VERSION"))
             .set("X-Connector-Nonce", &nonce)
             .set("X-Connector-Signature", &signature)
             .call()
@@ -1470,7 +1530,12 @@ fn get_signed<R: for<'de> Deserialize<'de>>(
                     return Err("service poll response is too large".to_string());
                 }
                 return serde_json::from_slice(&bytes)
+                    .map(Some)
                     .map_err(|e| format!("service returned invalid poll JSON: {e}"));
+            }
+            Err(ureq::Error::Status(426, response)) => {
+                open_external_response(response, host)?;
+                return Ok(None);
             }
             Err(ureq::Error::Status(408 | 429 | 502 | 503 | 504, _))
             | Err(ureq::Error::Transport(_)) => {
@@ -1499,6 +1564,7 @@ fn post_signed<T: Serialize>(
     let (nonce, signature) = request_signature(key, "POST", path);
     let response = ureq::post(&format!("{}{}", config.server_url, path))
         .timeout(Duration::from_secs(30))
+        .set(CONNECTOR_VERSION_HEADER, env!("CARGO_PKG_VERSION"))
         .set("Content-Type", "application/json")
         .set("X-Connector-Nonce", &nonce)
         .set("X-Connector-Signature", &signature)
@@ -1529,6 +1595,7 @@ fn post_receipt(
         let (nonce, signature) = request_signature(key, "POST", path);
         let response = ureq::post(&format!("{}{}", config.server_url, path))
             .timeout(Duration::from_secs(30))
+            .set(CONNECTOR_VERSION_HEADER, env!("CARGO_PKG_VERSION"))
             .set("Content-Type", "application/json")
             .set("X-Connector-Nonce", &nonce)
             .set("X-Connector-Signature", &signature)

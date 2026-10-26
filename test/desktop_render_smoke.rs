@@ -124,7 +124,7 @@ fn drive_render_smoke(
         if let Ok(snapshot) = snapshot {
             last_snapshot = snapshot;
             if last_snapshot["ready"] == "complete"
-                && last_snapshot["title"] == ""
+                && last_snapshot["title"] == "Boxy Connector"
                 && last_snapshot["inputCount"] == 1
                 && last_snapshot["inputType"] == "text"
                 && last_snapshot["inputValue"] == ""
@@ -180,8 +180,13 @@ fn drive_render_smoke(
                 && fixture["polls"][0]["taskCount"] == 0
                 && fixture["taskSentAfterReady"] == true
                 && fixture["browserLoaded"] == true
+                && fixture["browserUserAgent"]
+                    == format!("BoxyConnector/{}", env!("CARGO_PKG_VERSION"))
                 && fixture["receiptValid"] == true
             {
+                if window.title().map_err(|error| error.to_string())? != "Boxy Connector" {
+                    return Err("the remote page changed the native window title".to_string());
+                }
                 return Ok(());
             }
         }

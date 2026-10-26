@@ -18,6 +18,10 @@ impl ConnectorHost for ProbeHost {
         Ok(())
     }
 
+    fn open_external(&self, _url: Url) -> Result<(), String> {
+        Err("external links are unavailable in this probe".to_string())
+    }
+
     fn approve_process(&self, _executable: &str, _args: &[String], _cwd: Option<&Path>) -> bool {
         self.process_requests.fetch_add(1, Ordering::Relaxed);
         false

@@ -13,6 +13,7 @@ use std::{
 #[derive(Default)]
 struct TestHost {
     opened: Mutex<Option<Url>>,
+    external_opened: Mutex<Option<Url>>,
 }
 
 #[test]
@@ -38,6 +39,11 @@ impl ConnectorHost for TestHost {
         Ok(())
     }
 
+    fn open_external(&self, url: Url) -> Result<(), String> {
+        *self.external_opened.lock().unwrap() = Some(url);
+        Ok(())
+    }
+
     fn approve_process(&self, _executable: &str, _args: &[String], _cwd: Option<&Path>) -> bool {
         false
     }
@@ -53,6 +59,10 @@ struct StopAfterChecks {
 
 impl ConnectorHost for StopAfterChecks {
     fn open_editor(&self, _url: Url) -> Result<(), String> {
+        unreachable!()
+    }
+
+    fn open_external(&self, _url: Url) -> Result<(), String> {
         unreachable!()
     }
 
@@ -76,7 +86,6 @@ fn hello_is_anonymous_and_task_parameters_are_strict_objects() {
         hello,
         json!({
             "protocolVersion": 4,
-            "clientVersion": env!("CARGO_PKG_VERSION"),
             "platform": "windows",
             "capabilities": ["fs.read"],
             "publicKey": "ephemeral"
@@ -188,13 +197,7 @@ fn signed_v4_connection_waits_for_ready_before_reading_explicit_files() {
             .collect();
         assert_eq!(
             keys,
-            [
-                "capabilities",
-                "clientVersion",
-                "platform",
-                "protocolVersion",
-                "publicKey"
-            ]
+            ["capabilities", "platform", "protocolVersion", "publicKey"]
         );
         let public_key = URL_SAFE_NO_PAD
             .decode(hello["publicKey"].as_str().unwrap())
@@ -291,6 +294,140 @@ fn connection_expiry_rejects_non_numeric_worker_response() {
         "unexpected error: {error}"
     );
     assert!(host.opened.lock().unwrap().is_none());
+    server.join().unwrap();
+}
+
+#[test]
+fn upgrade_handshake_opens_safe_external_url_and_stops() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, request, _) = accept_json(&listener);
+        assert_eq!(request_path(&request), "/api/connect");
+        respond_status(
+            &mut stream,
+            426,
+            &json!({"openExternalUrl":"https://updates.example/releases/latest"}),
+        );
+    });
+    let host = TestHost::default();
+    run_connected(
+        &Config {
+            server_url: format!("http://{address}"),
+        },
+        &host,
+    )
+    .unwrap();
+    assert_eq!(
+        host.external_opened
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .as_str(),
+        "https://updates.example/releases/latest"
+    );
+    assert!(host.opened.lock().unwrap().is_none());
+    server.join().unwrap();
+}
+
+#[test]
+fn upgrade_handshake_rejects_unsafe_urls_and_does_not_open_on_not_found() {
+    for value in [
+        "javascript:alert(1)",
+        "file:///etc/passwd",
+        "http://updates.example/releases/latest",
+        "https://user:pass@updates.example/releases/latest",
+        "https://@updates.example/releases/latest",
+        "/releases/latest",
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let expected = value.to_string();
+        let value = value.to_string();
+        let server = thread::spawn(move || {
+            let (mut stream, request, _) = accept_json(&listener);
+            assert_eq!(request_path(&request), "/api/connect");
+            respond_status(&mut stream, 426, &json!({"openExternalUrl":value}));
+        });
+        let host = TestHost::default();
+        let error = run_connected(
+            &Config {
+                server_url: format!("http://{address}"),
+            },
+            &host,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("invalid external URL"),
+            "{expected}: {error}"
+        );
+        assert!(host.external_opened.lock().unwrap().is_none());
+        server.join().unwrap();
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, request, _) = accept_json(&listener);
+        assert_eq!(request_path(&request), "/api/connect");
+        respond_status(&mut stream, 404, &json!({"error":"not_found"}));
+    });
+    let host = TestHost::default();
+    let error = run_connected(
+        &Config {
+            server_url: format!("http://{address}"),
+        },
+        &host,
+    )
+    .unwrap_err();
+    assert!(error.contains("404"));
+    assert!(host.external_opened.lock().unwrap().is_none());
+    server.join().unwrap();
+}
+
+#[test]
+fn upgrade_poll_opens_external_url_and_stops_without_repolling() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _, body) = accept_json(&listener);
+        let hello: Value = serde_json::from_slice(&body).unwrap();
+        let public_key = URL_SAFE_NO_PAD
+            .decode(hello["publicKey"].as_str().unwrap())
+            .unwrap();
+        let verifier = VerifyingKey::from_bytes(&public_key.try_into().unwrap()).unwrap();
+        respond(
+            &mut stream,
+            201,
+            &json!({"protocolVersion":4,"connectionId":"conn-upgrade","browserUrl":format!("http://{address}/connect"),"expiresAt":future_expiry_ms()}),
+        );
+
+        let (mut stream, request, _) = accept_json(&listener);
+        verify_signed(&request, "GET", "/api/connections/conn-upgrade", &verifier);
+        respond_status(
+            &mut stream,
+            426,
+            &json!({"openExternalUrl":"https://updates.example/releases/latest"}),
+        );
+    });
+    let host = TestHost::default();
+    run_connected(
+        &Config {
+            server_url: format!("http://{address}"),
+        },
+        &host,
+    )
+    .unwrap();
+    assert_eq!(
+        host.external_opened
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .as_str(),
+        "https://updates.example/releases/latest"
+    );
     server.join().unwrap();
 }
 
@@ -527,6 +664,15 @@ fn accept_json(listener: &TcpListener) -> (TcpStream, String, Vec<u8>) {
         }
     };
     let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
+    assert!(
+        headers.lines().any(|line| {
+            line.split_once(':').is_some_and(|(name, value)| {
+                name.eq_ignore_ascii_case("X-Boxy-Connector-Version")
+                    && value.trim() == env!("CARGO_PKG_VERSION")
+            })
+        }),
+        "native control request omitted its connector version"
+    );
     let content_length = headers
         .lines()
         .find_map(|line| {
@@ -582,8 +728,17 @@ fn verify_signed(request: &str, method: &str, path: &str, key: &VerifyingKey) {
 }
 
 fn respond(stream: &mut TcpStream, status: u16, value: &Value) {
+    respond_status(stream, status, value);
+}
+
+fn respond_status(stream: &mut TcpStream, status: u16, value: &Value) {
     let body = serde_json::to_vec(value).unwrap();
-    let reason = if status == 201 { "Created" } else { "OK" };
+    let reason = match status {
+        201 => "Created",
+        404 => "Not Found",
+        426 => "Upgrade Required",
+        _ => "OK",
+    };
     write!(stream, "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
     stream.write_all(&body).unwrap();
 }
