@@ -34,6 +34,7 @@ const PROTOCOL_VERSION: u8 = 4;
 const CONNECT_PATH: &str = "/api/connect";
 const MAX_TASK_BYTES: usize = 4 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_RECEIPT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROCESS_SECONDS: u64 = 3600;
 const POLL_DELAY: Duration = Duration::from_millis(900);
 
@@ -533,8 +534,7 @@ fn execute_file_task(
         let paths: Vec<String> =
             serde_json::from_value(params["paths"].clone()).map_err(|_| "invalid_params")?;
         let requested_root = PathBuf::from(params["root"].as_str().ok_or("invalid_root")?);
-        let result = list_task(&requested_root, &paths)?;
-        return serde_json::to_value(result).map_err(|error| error.to_string());
+        return list_task(&requested_root, &paths);
     }
     let (root, protected) = task_root(params)?;
     let protected = protected
@@ -590,18 +590,30 @@ fn execute_file_task(
     }
 }
 
-fn list_task(root: &Path, paths: &[String]) -> Result<file_tasks::ManifestResult, String> {
+fn list_task(root: &Path, paths: &[String]) -> Result<Value, String> {
     if !root.is_absolute() {
         return Err("invalid_root".to_string());
     }
-    match fs::canonicalize(root) {
+    let result = match fs::canonicalize(root) {
         Ok(root) if root.is_dir() => Ok(file_tasks::list_files(&root, paths, &[])),
         Ok(_) => Err("invalid_root".to_string()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Ok(file_tasks::list_files_for_missing_root(paths))
         }
         Err(_) => Err("invalid_root".to_string()),
+    }?;
+    let value = serde_json::to_value(result).map_err(|error| error.to_string())?;
+    let size = serde_json::to_vec(&json!({
+        "ok": false,
+        "error": "operation_failed",
+        "result": &value,
+    }))
+    .map_err(|error| error.to_string())?
+    .len();
+    if size > MAX_RECEIPT_BYTES {
+        return Err("manifest_too_large".to_string());
     }
+    Ok(value)
 }
 
 fn transfer_file(

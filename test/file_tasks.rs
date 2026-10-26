@@ -88,6 +88,49 @@ fn list_root_sentinel_recursively_reports_entries_without_mutating_them() {
 }
 
 #[test]
+fn list_manifest_handles_more_than_four_thousand_entries_without_partial_results() {
+    let temp = Temp::new();
+    for index in 0..4_100 {
+        fs::write(temp.0.join(format!("entry-{index:04}.txt")), b"x").unwrap();
+    }
+
+    let result = list_files(&temp.0, &[".".into()], &[]);
+
+    assert_eq!(result.files.len(), 4_101);
+    assert!(result.files.iter().all(|entry| entry.error.is_none()));
+}
+
+#[cfg(unix)]
+#[test]
+fn list_reports_symlink_metadata_without_following_the_link() {
+    use std::os::unix::fs::symlink;
+
+    let temp = Temp::new();
+    let root = temp.0.join("root");
+    let outside = temp.0.join("outside");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("secret.txt"), b"outside scope").unwrap();
+    symlink(&outside, root.join("alias")).unwrap();
+
+    let result = list_files(&root, &[".".into()], &[]);
+    let link = result
+        .files
+        .iter()
+        .find(|entry| entry.path == "alias")
+        .unwrap();
+    let nested = list_files(&root, &["alias/secret.txt".into()], &[]);
+
+    assert_eq!(link.kind, "symlink");
+    assert_eq!(link.error, None);
+    assert!(!result
+        .files
+        .iter()
+        .any(|entry| entry.path == "alias/secret.txt"));
+    assert_eq!(nested.files[0].error, Some("unsafe_path"));
+}
+
+#[test]
 fn enforces_actual_aggregate_read_budget_and_uses_unpadded_base64url() {
     let temp = Temp::new();
     fs::write(temp.0.join("one"), [0, 255]).unwrap();
@@ -187,6 +230,21 @@ fn enforces_file_and_total_limits_and_hashes() {
     let temp = Temp::new();
     let protected = temp.0.join("protected");
     fs::write(&protected, b"protected").unwrap();
+    let maximum = vec![b'x'; MAX_FILE_BYTES];
+    let written = write_files(
+        &temp.0,
+        &protected,
+        &[write_entry("maximum.bin", &maximum, false)],
+    );
+    assert_eq!(written.files[0].ok, Some(true));
+    let read = read_files(
+        &temp.0,
+        &["maximum.bin".into()],
+        MAX_FILE_BYTES,
+        MAX_TOTAL_BYTES,
+    );
+    assert_eq!(read.files[0].size, Some(MAX_FILE_BYTES as u64));
+
     let oversized = vec![b'x'; MAX_FILE_BYTES + 1];
     assert_eq!(
         write_files(

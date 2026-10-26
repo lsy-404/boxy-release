@@ -23,9 +23,9 @@ fn list_task_returns_an_empty_result_for_a_missing_absolute_root() {
     let result = list_task(&root, &[".".into()]).unwrap();
     let unsafe_path = list_task(&root, &["../outside".into()]).unwrap();
 
-    assert!(result.files.is_empty());
+    assert!(result["files"].as_array().unwrap().is_empty());
     assert!(!root.exists());
-    assert_eq!(unsafe_path.files[0].error, Some("unsafe_path"));
+    assert_eq!(unsafe_path["files"][0]["error"], "unsafe_path");
     assert!(matches!(
         list_task(Path::new("relative"), &[]),
         Err(error) if error == "invalid_root"
@@ -100,6 +100,47 @@ fn hello_is_anonymous_and_task_parameters_are_strict_objects() {
     assert_eq!(
         validate_task("vendor.action", &json!({})),
         Err("unsupported_task".into())
+    );
+}
+
+#[test]
+fn execute_task_accepts_worker_one_mib_read_limits_for_a_small_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let contents = b"session data";
+    std::fs::write(temp.path().join("session.json"), contents).unwrap();
+    let task = RemoteTask {
+        id: "read1".into(),
+        kind: "fs.read".into(),
+        params: json!({
+            "root":temp.path().to_string_lossy(),
+            "paths":["session.json"],
+            "maxFileBytes":1024 * 1024,
+            "maxTotalBytes":1024 * 1024,
+        }),
+    };
+    validate_task(&task.kind, &task.params).unwrap();
+    let key = SigningKey::from_bytes(&[13; 32]);
+    let mut watches = HashMap::new();
+    let mut mounts = HashMap::new();
+
+    let result = execute_task(
+        &Config {
+            server_url: "http://127.0.0.1:1".into(),
+        },
+        &key,
+        "/api/connections/conn",
+        &task,
+        &TestHost::default(),
+        &mut watches,
+        &mut mounts,
+    )
+    .unwrap();
+
+    assert_eq!(
+        URL_SAFE_NO_PAD
+            .decode(result["files"][0]["contentBase64"].as_str().unwrap())
+            .unwrap(),
+        contents
     );
 }
 

@@ -12,15 +12,15 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 const MAX_ITEMS: usize = 64;
-const MAX_FILE_BYTES: usize = 512 * 1024;
+const MAX_FILE_BYTES: usize = 1024 * 1024;
 const MAX_TOTAL_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_STREAM_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_TREE_ENTRIES: usize = 100_000;
 const MAX_MANIFEST_PATHS: usize = 16;
-const MAX_MANIFEST_FILES: usize = 1024;
-const MAX_MANIFEST_ENTRIES: usize = 4096;
+const MAX_MANIFEST_FILES: usize = 100_000;
+const MAX_MANIFEST_ENTRIES: usize = 100_000;
 const MAX_MANIFEST_DEPTH: usize = 8;
-const MAX_MANIFEST_PATH_BYTES: usize = 1024 * 1024;
+const MAX_MANIFEST_PATH_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RANGE_ITEMS: usize = 32;
 const MAX_RANGE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_RANGE_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
@@ -1310,7 +1310,7 @@ fn collect_manifest_path(
             }
         }
     } else {
-        match safe_path(root, relative, false) {
+        match safe_list_path(root, relative) {
             Ok(path) => path,
             Err(error) => {
                 push_manifest_error(state, relative, error);
@@ -1338,7 +1338,7 @@ fn collect_manifest_path(
                 kind: "symlink",
                 size: None,
                 sha256: None,
-                error: Some("unsafe_path"),
+                error: None,
             });
         }
     } else if metadata.is_dir() {
@@ -1416,6 +1416,26 @@ fn collect_manifest_path(
     } else {
         push_manifest_error(state, relative, "unsafe_path");
     }
+}
+
+fn safe_list_path(root: &Path, relative: &str) -> Result<PathBuf, &'static str> {
+    validate_relative_path(relative)?;
+    let root = root.canonicalize().map_err(|_| "file_unavailable")?;
+    let relative_path = Path::new(relative);
+    let path = root.join(relative_path);
+    let mut current = root;
+    let components = relative_path.components().collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if is_unsafe_link(&metadata) && index + 1 < components.len() => {
+                return Err("unsafe_path")
+            }
+            Ok(_) => {}
+            Err(_) => return Err("file_unavailable"),
+        }
+    }
+    Ok(path)
 }
 
 fn same_or_under(path: &Path, parent: &Path) -> bool {
