@@ -43,4 +43,10 @@ fn main() {
             .app_manifest(tauri_build::AppManifest::new().commands(&["select_service"])),
     )
     .expect("cannot build the desktop application");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!(
+            "cargo:rustc-link-arg-examples={}",
+            output.join("resource.lib").display()
+        );
+    }
 }
