@@ -19,6 +19,7 @@ test("startup contains one blank, accessible URL field and submits on Enter", ()
   assert.match(html, /id="service-url"[^>]*type="text"/);
   assert.match(html, /id="service-url"[^>]*aria-label="Service address"/);
   assert.match(html, /id="service-url"[^>]*autofocus/);
+  assert.match(html, /id="service-url"[^>]*placeholder="Type Server Link"/);
   assert.doesNotMatch(html, /<h[1-6]\b|<button\b|<select\b|<textarea\b/);
   assert.doesNotMatch(html, /<p(?![^>]*id="error")/);
   assert.match(script, /service-form.*submit/s);
@@ -26,9 +27,10 @@ test("startup contains one blank, accessible URL field and submits on Enter", ()
   assert.doesNotMatch(script, /session|device|inventory|open_folder/i);
 });
 
-test("startup cannot infer a server from environment or command-line options", () => {
+test("startup infers only a filename URL and does not use environment or command-line options", () => {
   const launch = readFileSync(`${root}/connector/src/launch.rs`, "utf8");
-  assert.doesNotMatch(launch, /BOXY_API_URL|current_exe|inferred_service_url|session_path|FileDialog/);
+  assert.match(launch, /current_exe\(\)[\s\S]*inferred_service_url/);
+  assert.doesNotMatch(launch, /BOXY_API_URL|session_path|FileDialog/);
 });
 
 test("v4 fixture gates scoped file tasks behind authorization and verifies receipts", async (t) => {

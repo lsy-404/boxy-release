@@ -175,7 +175,13 @@ pub fn run(options: LaunchOptions) -> Result<i32, String> {
         .setup(move |app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Regular);
-            build_service_selection(app.handle(), &setup_state).map_err(std::io::Error::other)?;
+            if let Some(server_url) = setup_state.options.server_url.as_deref() {
+                begin_connection(app.handle(), &setup_state, server_url, None)
+                    .map_err(std::io::Error::other)?;
+            } else {
+                build_service_selection(app.handle(), &setup_state)
+                    .map_err(std::io::Error::other)?;
+            }
             Ok(())
         })
         .build(tauri::generate_context!())
