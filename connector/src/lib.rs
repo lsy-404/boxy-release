@@ -1672,6 +1672,12 @@ fn validate_browser_url(server: &str, browser: &str) -> Result<Url, String> {
 
 fn validate_browser_cookies(cookies: &[BrowserCookie]) -> Result<(), String> {
     for cookie in cookies {
+        if cookie.name.is_empty()
+            || !cookie.name.bytes().all(is_cookie_token_byte)
+            || !cookie.value.bytes().all(is_cookie_octet)
+        {
+            return Err("service returned an invalid browser cookie".to_string());
+        }
         let pair = format!("{}={}", cookie.name, cookie.value);
         let parsed = cookie::Cookie::parse(pair.as_str())
             .map_err(|_| "service returned an invalid browser cookie".to_string())?;
@@ -1683,6 +1689,31 @@ fn validate_browser_cookies(cookies: &[BrowserCookie]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn is_cookie_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn is_cookie_octet(byte: u8) -> bool {
+    matches!(byte, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e)
 }
 
 fn zeroize_json(value: &mut Value) {
