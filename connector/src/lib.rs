@@ -41,11 +41,17 @@ const CONNECTOR_VERSION_HEADER: &str = "X-Boxy-Connector-Version";
 const MAX_EXTERNAL_RESPONSE_BYTES: usize = 64 * 1024;
 
 pub trait ConnectorHost: Send + Sync {
-    fn open_editor(&self, url: Url) -> Result<(), String>;
+    fn open_editor(&self, url: Url, cookies: Vec<BrowserCookie>) -> Result<(), String>;
     fn open_external(&self, url: Url) -> Result<(), String>;
     fn approve_process(&self, executable: &str, args: &[String], cwd: Option<&Path>) -> bool;
     fn should_stop(&self) -> bool;
     fn set_resource_root(&self, _root: &Path) {}
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct BrowserCookie {
+    pub name: String,
+    pub value: String,
 }
 
 #[derive(Serialize)]
@@ -64,6 +70,7 @@ struct ConnectResponse {
     connection_id: String,
     browser_url: String,
     expires_at: i64,
+    browser_cookies: Vec<BrowserCookie>,
 }
 
 #[derive(Deserialize)]
@@ -164,7 +171,8 @@ pub fn run_connected(config: &Config, host: &dyn ConnectorHost) -> Result<(), St
         return Err("service connection response has expired".to_string());
     }
     let browser = validate_browser_url(&config.server_url, &connected.browser_url)?;
-    host.open_editor(browser)?;
+    validate_browser_cookies(&connected.browser_cookies)?;
+    host.open_editor(browser, connected.browser_cookies)?;
     run_connection(config, &connected.connection_id, &key, host)
 }
 
@@ -1660,6 +1668,21 @@ fn validate_browser_url(server: &str, browser: &str) -> Result<Url, String> {
         return Err("service returned a browser URL outside its origin".to_string());
     }
     Ok(browser)
+}
+
+fn validate_browser_cookies(cookies: &[BrowserCookie]) -> Result<(), String> {
+    for cookie in cookies {
+        let pair = format!("{}={}", cookie.name, cookie.value);
+        let parsed = cookie::Cookie::parse(pair.as_str())
+            .map_err(|_| "service returned an invalid browser cookie".to_string())?;
+        if parsed.name() != cookie.name
+            || parsed.value() != cookie.value
+            || parsed.to_string() != pair
+        {
+            return Err("service returned an invalid browser cookie".to_string());
+        }
+    }
+    Ok(())
 }
 
 fn zeroize_json(value: &mut Value) {

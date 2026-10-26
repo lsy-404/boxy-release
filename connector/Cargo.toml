@@ -11,6 +11,7 @@ desktop = ["dep:tauri", "dep:tauri-build"]
 
 [dependencies]
 base64 = "0.22"
+cookie = "0.18.2"
 dirs = "6"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 notify = "8"
