@@ -96,7 +96,7 @@ fn http_browser_cookies_do_not_set_the_secure_flag() {
     .unwrap();
 
     assert_eq!(cookie.domain(), Some("127.0.0.1"));
-    assert_eq!(cookie.secure(), Some(false));
+    assert_eq!(cookie.secure(), None);
 }
 
 #[test]
