@@ -352,6 +352,30 @@ fn browser_cookie_validation_rejects_value_attribute_injection() {
 }
 
 #[test]
+fn browser_cookie_validation_rejects_non_token_names_and_non_octet_values() {
+    for cookie in [
+        BrowserCookie {
+            name: "has space".into(),
+            value: "token".into(),
+        },
+        BrowserCookie {
+            name: "name\r\nInjected".into(),
+            value: "token".into(),
+        },
+        BrowserCookie {
+            name: "name".into(),
+            value: "token\r\nInjected".into(),
+        },
+        BrowserCookie {
+            name: "name".into(),
+            value: "token\0injected".into(),
+        },
+    ] {
+        assert!(validate_browser_cookies(&[cookie]).is_err());
+    }
+}
+
+#[test]
 fn upgrade_handshake_opens_safe_external_url_and_stops() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
