@@ -184,7 +184,11 @@ fn drive_render_smoke(
                     == format!("BoxyConnector/{}", env!("CARGO_PKG_VERSION"))
                 && fixture["receiptValid"] == true
             {
-                if window.title().map_err(|error| error.to_string())? != "Boxy Connector" {
+                let editor = window
+                    .app_handle()
+                    .get_webview_window("editor")
+                    .ok_or("the bridge window is missing")?;
+                if editor.title().map_err(|error| error.to_string())? != "Boxy Connector" {
                     return Err("the remote page changed the native window title".to_string());
                 }
                 return Ok(());
