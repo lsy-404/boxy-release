@@ -3,7 +3,7 @@ use std::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use boxy::{ConnectorHost, LaunchOptions};
+use boxy::{BrowserCookie, ConnectorHost, LaunchOptions};
 use url::Url;
 
 #[derive(Default)]
@@ -13,7 +13,7 @@ struct ProbeHost {
 }
 
 impl ConnectorHost for ProbeHost {
-    fn open_editor(&self, _url: Url) -> Result<(), String> {
+    fn open_editor(&self, _url: Url, _cookies: Vec<BrowserCookie>) -> Result<(), String> {
         self.connected.store(true, Ordering::Release);
         Ok(())
     }

@@ -91,7 +91,15 @@ test("v4 fixture gates scoped file tasks behind authorization and verifies recei
   assert.equal(connection.protocolVersion, 4);
   assert.equal(typeof connection.expiresAt, "number");
   assert.ok(connection.expiresAt > Date.now());
-  assert.equal((await fetch(connection.browserUrl, { headers: { "user-agent": `BoxyConnector/${connectorVersion}` } })).status, 200);
+  assert.equal(connection.browserUrl, `${base}/`);
+  assert.deepEqual(connection.browserCookies, [{ name: "boxy_connection", value: "synthetic-session" }]);
+  const browserResponse = await fetch(connection.browserUrl, {
+    headers: {
+      cookie: connection.browserCookies.map(({ name, value }) => `${name}=${value}`).join("; "),
+      "user-agent": `BoxyConnector/${connectorVersion}`,
+    },
+  });
+  assert.equal(browserResponse.status, 200);
 
   async function poll(nonce) {
     const path = "/api/connections/smoke_connection";
@@ -118,6 +126,7 @@ test("v4 fixture gates scoped file tasks behind authorization and verifies recei
   assert.equal(receipt.status, 200);
   const state = JSON.parse(readFileSync(statePath, "utf8"));
   assert.equal(state.browserUserAgent, `BoxyConnector/${connectorVersion}`);
+  assert.equal(state.browserCookie, "boxy_connection=synthetic-session");
   assert.equal(state.receiptValid, true);
   assert.deepEqual(state.errors, []);
 });

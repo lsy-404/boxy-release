@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use boxy::{Config, ConnectorHost, LaunchOptions};
+use boxy::{BrowserCookie, Config, ConnectorHost, LaunchOptions};
 use tauri::{
     webview::{DownloadEvent, NewWindowFeatures, NewWindowResponse},
     AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
@@ -42,7 +42,7 @@ struct DesktopHost {
 type StartupReply = Arc<Mutex<Option<mpsc::SyncSender<Result<(), String>>>>>;
 
 impl ConnectorHost for DesktopHost {
-    fn open_editor(&self, url: Url) -> Result<(), String> {
+    fn open_editor(&self, url: Url, cookies: Vec<BrowserCookie>) -> Result<(), String> {
         let (sender, receiver) = mpsc::sync_channel(1);
         let app = self.app.clone();
         let state = self.state.clone();
@@ -52,7 +52,7 @@ impl ConnectorHost for DesktopHost {
                 let result = if state.stopping.load(Ordering::Acquire) {
                     Ok(())
                 } else {
-                    build_window(&app, &state, "editor", url, None).map(|_| {
+                    open_editor_window(&app, &state, url, cookies).map(|_| {
                         if let Some(window) = app.get_webview_window("service-selection") {
                             let _ = window.destroy();
                         }
@@ -115,6 +115,50 @@ impl ConnectorHost for DesktopHost {
             }
         }
     }
+}
+
+fn open_editor_window(
+    app: &AppHandle,
+    state: &Arc<RuntimeState>,
+    url: Url,
+    cookies: Vec<BrowserCookie>,
+) -> Result<WebviewWindow, String> {
+    let blank = Url::parse("about:blank").map_err(|error| error.to_string())?;
+    let window = build_window(app, state, "editor", blank, None)?;
+    for browser_cookie in cookies {
+        let cookie = match make_browser_cookie(&url, browser_cookie) {
+            Ok(cookie) => cookie,
+            Err(error) => {
+                let _ = window.destroy();
+                return Err(error);
+            }
+        };
+        if let Err(error) = window.set_cookie(cookie) {
+            let _ = window.destroy();
+            return Err(format!("cannot initialize service browser cookie: {error}"));
+        }
+    }
+    if let Err(error) = window.navigate(url) {
+        let _ = window.destroy();
+        return Err(format!("cannot open service browser: {error}"));
+    }
+    Ok(window)
+}
+
+fn make_browser_cookie(
+    url: &Url,
+    cookie: BrowserCookie,
+) -> Result<tauri::webview::Cookie<'static>, String> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| "service browser URL has no host".to_string())?;
+    Ok(tauri::webview::Cookie::build((cookie.name, cookie.value))
+        .domain(host.to_owned())
+        .path("/")
+        .http_only(true)
+        .same_site(tauri::webview::cookie::SameSite::Lax)
+        .secure(url.scheme() == "https")
+        .build())
 }
 
 fn application_builder(state: Arc<RuntimeState>) -> tauri::Builder<tauri::Wry> {
