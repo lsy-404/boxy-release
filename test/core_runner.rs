@@ -45,6 +45,10 @@ impl ConnectorHost for TestHost {
 
 #[test]
 fn hello_is_anonymous_and_task_parameters_are_strict_objects() {
+    let root = std::env::temp_dir()
+        .join("scope")
+        .to_string_lossy()
+        .into_owned();
     let hello = hello_body("windows", vec!["fs.read"], "ephemeral").unwrap();
     assert_eq!(
         hello,
@@ -59,7 +63,7 @@ fn hello_is_anonymous_and_task_parameters_are_strict_objects() {
     assert_eq!(
         validate_task(
             "fs.read",
-            &json!({"root":"C:/scope","paths":[],"maxFileBytes":1,"maxTotalBytes":1})
+            &json!({"root":root,"paths":[],"maxFileBytes":1,"maxTotalBytes":1})
         ),
         Ok(())
     );
