@@ -529,6 +529,13 @@ fn execute_file_task(
     host: &dyn ConnectorHost,
 ) -> Result<Value, String> {
     let params = &task.params;
+    if kind == "fs.list" {
+        let paths: Vec<String> =
+            serde_json::from_value(params["paths"].clone()).map_err(|_| "invalid_params")?;
+        let requested_root = PathBuf::from(params["root"].as_str().ok_or("invalid_root")?);
+        let result = list_task(&requested_root, &paths)?;
+        return serde_json::to_value(result).map_err(|error| error.to_string());
+    }
     let (root, protected) = task_root(params)?;
     let protected = protected
         .as_deref()
@@ -564,12 +571,6 @@ fn execute_file_task(
             serde_json::to_value(file_tasks::write_files(&root, protected, &files))
                 .map_err(|e| e.to_string())
         }
-        "fs.list" => {
-            let paths: Vec<String> =
-                serde_json::from_value(params["paths"].clone()).map_err(|_| "invalid_params")?;
-            serde_json::to_value(file_tasks::list_files(&root, &paths, &[]))
-                .map_err(|e| e.to_string())
-        }
         "fs.move" => {
             let moves: Vec<file_tasks::MoveEntry> =
                 serde_json::from_value(params["moves"].clone()).map_err(|_| "invalid_params")?;
@@ -586,6 +587,20 @@ fn execute_file_task(
             transfer_file(config, key, connection, &root, protected, task, kind)
         }
         _ => Err("unsupported_task".to_string()),
+    }
+}
+
+fn list_task(root: &Path, paths: &[String]) -> Result<file_tasks::ManifestResult, String> {
+    if !root.is_absolute() {
+        return Err("invalid_root".to_string());
+    }
+    match fs::canonicalize(root) {
+        Ok(root) if root.is_dir() => Ok(file_tasks::list_files(&root, paths, &[])),
+        Ok(_) => Err("invalid_root".to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(file_tasks::list_files_for_missing_root(paths))
+        }
+        Err(_) => Err("invalid_root".to_string()),
     }
 }
 
@@ -1070,9 +1085,8 @@ fn run_elevated_macos(
         .spawn()
         .map_err(|e| e.to_string())?;
     let out_limit = output_limit;
-    let out = thread::spawn(move || {
-        read_limited(child.stdout.take().unwrap(), out_limit.saturating_add(64))
-    });
+    let stdout = child.stdout.take().unwrap();
+    let out = thread::spawn(move || read_limited(stdout, out_limit.saturating_add(64)));
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout + 15);
     let status = loop {
         if host.should_stop() {

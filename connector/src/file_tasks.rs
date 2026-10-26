@@ -981,26 +981,8 @@ pub(crate) fn safe_path(
     relative: &str,
     allow_missing: bool,
 ) -> Result<PathBuf, &'static str> {
-    if relative.is_empty()
-        || relative.starts_with('/')
-        || relative.contains('\\')
-        || relative.chars().any(char::is_control)
-    {
-        return Err("unsafe_path");
-    }
+    validate_relative_path(relative)?;
     let relative_path = Path::new(relative);
-    if relative_path
-        .components()
-        .any(|part| !matches!(part, Component::Normal(_)))
-        || relative_path.components().any(|part| {
-            let Component::Normal(component) = part else {
-                return true;
-            };
-            !safe_windows_component(&component.to_string_lossy())
-        })
-    {
-        return Err("unsafe_path");
-    }
     let root = root.canonicalize().map_err(|_| "file_unavailable")?;
     let path = root.join(relative_path);
     let mut current = root.clone();
@@ -1023,6 +1005,30 @@ pub(crate) fn safe_path(
         }
     }
     Ok(path)
+}
+
+fn validate_relative_path(relative: &str) -> Result<(), &'static str> {
+    if relative.is_empty()
+        || relative.starts_with('/')
+        || relative.contains('\\')
+        || relative.chars().any(char::is_control)
+    {
+        return Err("unsafe_path");
+    }
+    let relative_path = Path::new(relative);
+    if relative_path
+        .components()
+        .any(|part| !matches!(part, Component::Normal(_)))
+        || relative_path.components().any(|part| {
+            let Component::Normal(component) = part else {
+                return true;
+            };
+            !safe_windows_component(&component.to_string_lossy())
+        })
+    {
+        return Err("unsafe_path");
+    }
+    Ok(())
 }
 
 pub(crate) fn safe_mount_path_parent(root: &Path, relative: &str) -> Result<PathBuf, &'static str> {
@@ -1238,6 +1244,34 @@ pub(crate) fn list_files(
         collect_manifest_path(root, path, 0, skipped_paths, &mut state);
         if state.stopped {
             break;
+        }
+    }
+    ManifestResult { files: state.files }
+}
+
+pub(crate) fn list_files_for_missing_root(paths: &[String]) -> ManifestResult {
+    let mut state = ManifestState {
+        files: Vec::new(),
+        path_bytes: 0,
+        file_count: 0,
+        entry_count: 0,
+        stopped: false,
+    };
+    if paths.len() > MAX_MANIFEST_PATHS {
+        for path in paths.iter().take(MAX_MANIFEST_PATHS) {
+            push_manifest_error(&mut state, path, "too_many_paths");
+            if state.stopped {
+                break;
+            }
+        }
+    } else {
+        for path in paths {
+            if path != "." && validate_relative_path(path).is_err() {
+                push_manifest_error(&mut state, path, "unsafe_path");
+            }
+            if state.stopped {
+                break;
+            }
         }
     }
     ManifestResult { files: state.files }

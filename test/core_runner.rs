@@ -12,6 +12,23 @@ struct TestHost {
     opened: Mutex<Option<Url>>,
 }
 
+#[test]
+fn list_task_returns_an_empty_result_for_a_missing_absolute_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("missing-database");
+
+    let result = list_task(&root, &[".".into()]).unwrap();
+    let unsafe_path = list_task(&root, &["../outside".into()]).unwrap();
+
+    assert!(result.files.is_empty());
+    assert!(!root.exists());
+    assert_eq!(unsafe_path.files[0].error, Some("unsafe_path"));
+    assert!(matches!(
+        list_task(Path::new("relative"), &[]),
+        Err(error) if error == "invalid_root"
+    ));
+}
+
 impl ConnectorHost for TestHost {
     fn open_editor(&self, url: Url) -> Result<(), String> {
         *self.opened.lock().unwrap() = Some(url);
