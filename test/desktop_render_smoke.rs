@@ -170,9 +170,42 @@ fn drive_render_smoke(
                 .as_array()
                 .is_some_and(|errors| !errors.is_empty())
             {
+                #[cfg(target_os = "macos")]
+                let cookie_diagnostic = window
+                    .app_handle()
+                    .get_webview_window("editor")
+                    .map(|editor| {
+                        let url = editor.url().ok();
+                        let cookies = editor.cookies().ok().map(|cookies| {
+                            cookies
+                                .into_iter()
+                                .filter(|cookie| cookie.name() == "boxy_connection")
+                                .map(|cookie| {
+                                    serde_json::json!({
+                                        "domain": cookie.domain(),
+                                        "path": cookie.path(),
+                                        "httpOnly": cookie.http_only(),
+                                        "secure": cookie.secure(),
+                                        "sameSite": cookie.same_site().map(|value| value.to_string()),
+                                        "session": cookie.expires_datetime().is_none() && cookie.max_age().is_none(),
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        });
+                        let matching = match url {
+                            Some(url) => editor.cookies_for_url(url).ok().map(|cookies| {
+                                cookies.iter().any(|cookie| cookie.name() == "boxy_connection")
+                            }),
+                            None => None,
+                        };
+                        serde_json::json!({"stored": cookies, "matchesCurrentUrl": matching})
+                    })
+                    .unwrap_or(serde_json::Value::Null);
+                #[cfg(not(target_os = "macos"))]
+                let cookie_diagnostic = serde_json::Value::Null;
                 return Err(format!(
-                    "the mock service rejected a request: {}",
-                    fixture["errors"]
+                    "the mock service rejected a request: {}; macOS browser cookie metadata: {}",
+                    fixture["errors"], cookie_diagnostic
                 ));
             }
             if fixture["hello"]["protocolVersion"] == 4
