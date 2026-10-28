@@ -26,6 +26,7 @@ fn run_render_smoke() -> Result<(), String> {
         next_window: AtomicU64::new(1),
         worker: Mutex::new(None),
         local_resource_policy: Mutex::new(None),
+        assistance: Mutex::new(None),
         #[cfg(windows)]
         profile: runtime.path().join("webview"),
     });
