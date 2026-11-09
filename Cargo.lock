@@ -156,10 +156,9 @@ dependencies = [
 
 [[package]]
 name = "boxy"
-version = "2.4.0"
+version = "2.3.10"
 dependencies = [
  "base64 0.22.1",
- "cc",
  "cookie",
  "ed25519-dalek",
  "libc",

@@ -2,8 +2,6 @@ mod file_tasks;
 mod http_request;
 mod launch;
 pub mod local_resources;
-#[cfg(windows)]
-mod native_session;
 pub(crate) mod request_trace;
 #[cfg(windows)]
 mod windows_process;
@@ -47,15 +45,6 @@ pub trait ConnectorHost: Send + Sync {
     fn open_editor(&self, url: Url, cookies: Vec<BrowserCookie>) -> Result<(), String>;
     fn open_external(&self, url: Url) -> Result<(), String>;
     fn should_stop(&self) -> bool;
-    fn connection_state(&self, _ready: bool) {}
-    fn panel_enabled(&self) -> bool {
-        false
-    }
-    fn panel_mode(&self, _mode: serde_json::Value) {}
-    fn panel_error(&self) {}
-    fn take_panel_request(&self) -> Option<serde_json::Value> {
-        None
-    }
     fn set_resource_root(&self, _root: &Path) {}
     fn connection_failed(&self, _assistance: ConnectionAssistance) {}
 }
@@ -185,17 +174,6 @@ impl Drop for RemoteTask {
     }
 }
 
-#[cfg(all(
-    windows,
-    target_arch = "x86_64",
-    feature = "native-session-test-fixture"
-))]
-pub fn native_session_test_reload(pid: u32, expected_file_sha256: &str) -> Result<Value, String> {
-    let params = json!({"pid":pid,"expectedFileSha256":expected_file_sha256});
-    validate_task("editor.session.reload", &params)?;
-    native_session::reload(&params)
-}
-
 pub fn prepare_config() -> Result<LaunchOptions, String> {
     LaunchOptions::from_environment_and_args()
 }
@@ -302,14 +280,6 @@ fn capabilities() -> Vec<&'static str> {
         "fs.unwatch",
         "http.request",
     ];
-    #[cfg(windows)]
-    let result = {
-        let mut result = result;
-        result.push("editor.session.status");
-        #[cfg(target_arch = "x86_64")]
-        result.push("editor.session.reload");
-        result
-    };
     result
 }
 
@@ -361,7 +331,6 @@ fn run_connection(
             idle_delay = POLL_DELAY;
             previous_state.clone_from(&poll.state);
         }
-        host.connection_state(poll.state == "ready");
         match poll.state.as_str() {
             "awaiting_auth" => {
                 if !poll.tasks.is_empty() {
@@ -373,29 +342,6 @@ fn run_connection(
                 idle_delay = next_idle_delay(idle_delay);
             }
             "ready" => {
-                if host.panel_enabled() {
-                    let panel_path = format!("{base}/account-mode");
-                    match get_panel_mode(config, &panel_path, key) {
-                        Ok(mode) => {
-                            let failed = host
-                                .take_panel_request()
-                                .map(|request| {
-                                    !valid_panel_action(&mode, &request)
-                                        || post_signed(config, &panel_path, key, &request).is_err()
-                                })
-                                .unwrap_or(false);
-                            if failed {
-                                host.panel_error();
-                            } else {
-                                host.panel_mode(mode);
-                            }
-                        }
-                        Err(_) => {
-                            let _ = host.take_panel_request();
-                            host.panel_error();
-                        }
-                    }
-                }
                 if poll.tasks.len() > 1 {
                     break Err("service returned more than one pending task".to_string());
                 }
@@ -458,7 +404,6 @@ fn run_connection(
             _ => break Err("service returned an unknown connection state".to_string()),
         }
     })();
-    host.connection_state(false);
     watches.clear();
     if let Err(error) = &result {
         let receipt_status = error
@@ -493,8 +438,6 @@ pub(crate) fn validate_task(kind: &str, params: &Value) -> Result<(), String> {
         .as_object()
         .ok_or_else(|| "invalid_params".to_string())?;
     let required: &[&str] = match kind {
-        "editor.session.status" => &[],
-        "editor.session.reload" => &["pid", "expectedFileSha256"],
         "process.exec" => &["executable", "args"],
         "fs.read" => &["root", "paths", "maxFileBytes", "maxTotalBytes"],
         "fs.write" => &["root", "files"],
@@ -520,8 +463,6 @@ pub(crate) fn validate_task(kind: &str, params: &Value) -> Result<(), String> {
         return Err("invalid_params".to_string());
     }
     let allowed: &[&str] = match kind {
-        "editor.session.status" => &["pid"],
-        "editor.session.reload" => &["pid", "expectedFileSha256"],
         "process.exec" => &[
             "executable",
             "args",
@@ -574,30 +515,6 @@ pub(crate) fn validate_task(kind: &str, params: &Value) -> Result<(), String> {
     };
     if object.keys().any(|key| !allowed.contains(&key.as_str())) {
         return Err("invalid_params".to_string());
-    }
-    if kind == "editor.session.status"
-        && object
-            .get("pid")
-            .is_some_and(|v| !v.as_u64().is_some_and(|n| n > 0 && n <= u32::MAX as u64))
-    {
-        return Err("invalid_params".to_string());
-    }
-    if kind == "editor.session.reload" {
-        let pid = object["pid"]
-            .as_u64()
-            .filter(|n| *n > 0 && *n <= u32::MAX as u64);
-        let digest = object["expectedFileSha256"]
-            .as_str()
-            .and_then(|s| URL_SAFE_NO_PAD.decode(s).ok());
-        if pid.is_none()
-            || digest.as_ref().is_none_or(|d| {
-                d.len() != 32
-                    || URL_SAFE_NO_PAD.encode(d)
-                        != object["expectedFileSha256"].as_str().unwrap_or("")
-            })
-        {
-            return Err("invalid_params".to_string());
-        }
     }
     if let Some(root) = object.get("root") {
         if !root
@@ -699,10 +616,6 @@ fn execute_task(
 ) -> Result<Value, String> {
     let params = &task.params;
     match task.kind.as_str() {
-        #[cfg(windows)]
-        "editor.session.status" => native_session::status(params),
-        #[cfg(all(windows, target_arch = "x86_64"))]
-        "editor.session.reload" => native_session::reload(params),
         "process.exec" => execute_process(params, host),
         "http.request" => execute_http(params),
         "fs.watch" => register_watch(params, watches),
@@ -1728,72 +1641,6 @@ fn open_external_response(
     let upgrade: UpgradeResponse = serde_json::from_slice(&body)
         .map_err(|_| "service returned an invalid external-link response".to_string())?;
     host.open_external(validate_external_url(&upgrade.open_external_url)?)
-}
-
-fn valid_panel_action(mode: &Value, request: &Value) -> bool {
-    if mode["authorized"] != true
-        || mode["advancedAllowed"] != true
-        || !request["pid"]
-            .as_u64()
-            .map(|pid| {
-                mode["processes"]
-                    .as_array()
-                    .map(|items| {
-                        items
-                            .iter()
-                            .any(|item| item["supported"] == true && item["pid"] == pid)
-                    })
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false)
-    {
-        return false;
-    }
-    match request["action"].as_str() {
-        Some("account.main.restore") => {
-            mode["canRestoreMain"] == true && request.as_object().map(|v| v.len()) == Some(2)
-        }
-        Some("account.source.select") => {
-            mode["canSelectSource"] == true
-                && request.as_object().map(|v| v.len()) == Some(3)
-                && request["selectionId"]
-                    .as_str()
-                    .map(|id| {
-                        mode["selections"]
-                            .as_array()
-                            .map(|items| items.iter().any(|item| item["id"] == id))
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false)
-        }
-        _ => false,
-    }
-}
-
-fn get_panel_mode(config: &Config, path: &str, key: &SigningKey) -> Result<Value, String> {
-    let (nonce, signature) = request_signature(key, "GET", path);
-    let response = ureq::get(&format!("{}{}", config.server_url, path))
-        .timeout(Duration::from_secs(5))
-        .set(CONNECTOR_VERSION_HEADER, env!("CARGO_PKG_VERSION"))
-        .set("X-Connector-Nonce", &nonce)
-        .set("X-Connector-Signature", &signature)
-        .call()
-        .map_err(|_| "account mode unavailable".to_string())?;
-    let mut bytes = Vec::new();
-    response
-        .into_reader()
-        .take((MAX_TASK_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| "invalid account mode".to_string())?;
-    if bytes.len() > MAX_TASK_BYTES {
-        return Err("invalid account mode".to_string());
-    }
-    let value: Value =
-        serde_json::from_slice(&bytes).map_err(|_| "invalid account mode".to_string())?;
-    if value["protocolVersion"] != 1 || value["authorized"] != true {
-        return Err("account mode not authorized".to_string());
-    }
-    Ok(value)
 }
 
 fn get_signed<R: for<'de> Deserialize<'de>>(

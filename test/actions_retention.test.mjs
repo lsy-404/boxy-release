@@ -129,7 +129,8 @@ test("a queued cleanup run does not block retention", async () => {
 test("workflow serializes without cancelling and only listens to producer completions", () => {
   const workflow = readFileSync(new URL("../.github/workflows/cleanup-actions.yml", import.meta.url), "utf8");
 
-  assert.match(workflow, /workflow_run:\s*\n\s+workflows:[\s\S]*?- Boxy Release Build[\s\S]*?- Boxy verification[\s\S]*?- Normalize main history\s*\n\s+types: \[completed\]/);
+  assert.match(workflow, /workflow_run:\s*\n\s+workflows:\s*\n\s+- Boxy verification\s*\n\s+types: \[completed\]/);
+  assert.doesNotMatch(workflow, /Boxy Release Build|Normalize main history/);
   assert.match(workflow, /workflow_dispatch:/);
   assert.match(workflow, /actions: write/);
   assert.match(workflow, /contents: read/);

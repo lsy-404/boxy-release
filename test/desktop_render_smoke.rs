@@ -21,9 +21,7 @@ fn run_render_smoke() -> Result<(), String> {
     let state = Arc::new(RuntimeState {
         options: LaunchOptions { server_url: None },
         started: AtomicBool::new(false),
-        stopping: Arc::new(AtomicBool::new(false)),
-        panel: Arc::new(panel_ipc::PanelState::default()),
-        panel_worker: Mutex::new(None),
+        stopping: AtomicBool::new(false),
         finished: AtomicBool::new(false),
         next_window: AtomicU64::new(1),
         worker: Mutex::new(None),
@@ -122,7 +120,7 @@ fn drive_render_smoke(
         }
         let snapshot = eval_value(
             &window,
-            "(() => { const input=document.getElementById('service-url'); const rect=input?.getBoundingClientRect(); return {ready:document.readyState,title:document.title,inputCount:document.querySelectorAll('input').length,inputType:input?.type??null,inputValue:input?.value??null,placeholder:input?.placeholder??null,visible:!!rect&&rect.width>0&&rect.height>0,headings:document.querySelectorAll('h1,h2,h3,h4,h5,h6').length,buttons:Array.from(document.querySelectorAll('button')).map(button=>button.id),selectors:document.querySelectorAll('select,textarea').length,error:!!document.getElementById('error')}; })()".to_string(),
+            "(() => { const input=document.getElementById('service-url'); const rect=input?.getBoundingClientRect(); return {ready:document.readyState,title:document.title,inputCount:document.querySelectorAll('input').length,inputType:input?.type??null,inputValue:input?.value??null,placeholder:input?.placeholder??null,visible:!!rect&&rect.width>0&&rect.height>0,headings:document.querySelectorAll('h1,h2,h3,h4,h5,h6').length,buttons:document.querySelectorAll('button').length,selectors:document.querySelectorAll('select,textarea').length,error:!!document.getElementById('error')}; })()".to_string(),
         );
         if let Ok(snapshot) = snapshot {
             last_snapshot = snapshot;
@@ -134,7 +132,7 @@ fn drive_render_smoke(
                 && last_snapshot["placeholder"] == "Type Server Link"
                 && last_snapshot["visible"] == true
                 && last_snapshot["headings"] == 0
-                && last_snapshot["buttons"] == serde_json::json!(["connect-config", "panel-install"])
+                && last_snapshot["buttons"] == 0
                 && last_snapshot["selectors"] == 0
                 && last_snapshot["error"] == true
             {

@@ -1,13 +1,12 @@
 [package]
 name = "boxy"
-version = "2.4.0"
+version = "2.3.10"
 edition = "2021"
 license = "Apache-2.0"
 publish = false
 
 [features]
 default = ["desktop"]
-native-session-test-fixture = []
 desktop = ["dep:tauri", "dep:tauri-build"]
 
 [dependencies]
@@ -30,7 +29,6 @@ webbrowser = "1.2.5"
 zeroize = "1.9"
 
 [build-dependencies]
-cc = "1"
 tauri-build = { version = "=2.7.3", optional = true }
 
 [target.'cfg(windows)'.dependencies]
@@ -38,11 +36,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
     "Win32_System_Registry",
-    "Win32_System_Diagnostics_ToolHelp",
-    "Win32_System_Diagnostics_Debug",
-    "Win32_System_Memory",
-    "Win32_System_LibraryLoader",
-    "Win32_Security",
     "Win32_System_Threading",
     "Win32_UI_Shell",
 ] }
@@ -68,8 +61,3 @@ path = "../test/launch_options.rs"
 name = "service_connect_probe"
 path = "../test/service_connect_probe.rs"
 required-features = ["desktop"]
-
-[[example]]
-name = "native_session_probe"
-path = "../test/native_session_probe.rs"
-required-features = ["native-session-test-fixture"]

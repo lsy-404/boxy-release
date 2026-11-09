@@ -3,9 +3,7 @@ name: Actions history retention
 on:
   workflow_run:
     workflows:
-      - Boxy Release Build
       - Boxy verification
-      - Normalize main history
     types: [completed]
   workflow_dispatch:
 
@@ -40,7 +38,7 @@ jobs:
             };
             const result = await retainLatestWorkflowRuns({
               api,
-              producerWorkflowNames: ["Boxy Release Build", "Boxy verification", "Normalize main history"],
+              producerWorkflowNames: ["Boxy verification"],
               cleanupWorkflowName: "Actions history retention",
               cleanupRunId: context.runId,
             });

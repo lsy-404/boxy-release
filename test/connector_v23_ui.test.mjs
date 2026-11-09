@@ -24,10 +24,8 @@ test("startup contains one blank, accessible URL field and submits on Enter", ()
   assert.match(html, /id="service-url"[^>]*aria-label="Service address"/);
   assert.match(html, /id="service-url"[^>]*autofocus/);
   assert.match(html, /id="service-url"[^>]*placeholder="Type Server Link"/);
-  assert.doesNotMatch(html, /<h[1-6]\b|<select\b|<textarea\b/);
-  assert.match(html, /id="connect-config"/);
-  assert.match(html, /id="panel-install"/);
-  assert.doesNotMatch(html, /<p(?![^>]*id="(?:error|connect-status)")/);
+  assert.doesNotMatch(html, /<h[1-6]\b|<button\b|<select\b|<textarea\b/);
+  assert.doesNotMatch(html, /<p(?![^>]*id="error")/);
   assert.match(script, /service-form.*submit/s);
   assert.match(script, /invoke\('select_service'/);
   assert.doesNotMatch(script, /session|device|inventory|open_folder/i);

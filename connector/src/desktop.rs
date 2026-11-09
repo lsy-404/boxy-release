@@ -1,5 +1,3 @@
-#[path = "panel_ipc.rs"]
-mod panel_ipc;
 use std::{
     path::Path,
     sync::{
@@ -20,9 +18,7 @@ use url::Url;
 struct RuntimeState {
     options: LaunchOptions,
     started: AtomicBool,
-    stopping: Arc<AtomicBool>,
-    panel: Arc<panel_ipc::PanelState>,
-    panel_worker: Mutex<Option<thread::JoinHandle<()>>>,
+    stopping: AtomicBool,
     finished: AtomicBool,
     next_window: AtomicU64,
     worker: Mutex<Option<thread::JoinHandle<i32>>>,
@@ -77,47 +73,6 @@ impl ConnectorHost for DesktopHost {
     fn open_external(&self, url: Url) -> Result<(), String> {
         webbrowser::open(url.as_str())
             .map_err(|error| format!("cannot open the service-provided link: {error}"))
-    }
-
-    fn connection_state(&self, ready: bool) {
-        self.state.panel.authorized.store(ready, Ordering::Release);
-        if !ready {
-            if let Ok(mut mode) = self.state.panel.mode.lock() {
-                *mode = Default::default();
-            }
-        }
-    }
-    fn panel_enabled(&self) -> bool {
-        self.state
-            .panel_worker
-            .lock()
-            .map(|worker| worker.is_some())
-            .unwrap_or(false)
-    }
-    fn panel_mode(&self, mode: serde_json::Value) {
-        if let Ok(mut value) = self.state.panel.mode.lock() {
-            *value = mode;
-        }
-        if let Ok(mut at) = self.state.panel.verified_at.lock() {
-            *at = Some(Instant::now());
-        }
-        if let Ok(mut error) = self.state.panel.error.lock() {
-            error.clear();
-        }
-    }
-    fn panel_error(&self) {
-        if let Ok(mut error) = self.state.panel.error.lock() {
-            *error = "账号服务不可用或操作未完成".into();
-        }
-        if let Ok(mut mode) = self.state.panel.mode.lock() {
-            *mode = Default::default();
-        }
-        if let Ok(mut at) = self.state.panel.verified_at.lock() {
-            *at = None;
-        }
-    }
-    fn take_panel_request(&self) -> Option<serde_json::Value> {
-        self.state.panel.account_request.lock().ok()?.take()
     }
 
     fn should_stop(&self) -> bool {
@@ -187,11 +142,7 @@ fn make_browser_cookie(
 fn application_builder(state: Arc<RuntimeState>) -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
         .manage(state)
-        .invoke_handler(tauri::generate_handler![
-            select_service,
-            configure_connect,
-            install_connect_panel
-        ])
+        .invoke_handler(tauri::generate_handler![select_service])
         .register_asynchronous_uri_scheme_protocol("boxy-local", |context, request, responder| {
             let label = context.webview_label().to_string();
             let state = context
@@ -236,9 +187,7 @@ pub fn run(options: LaunchOptions) -> Result<i32, String> {
     let state = Arc::new(RuntimeState {
         options,
         started: AtomicBool::new(false),
-        stopping: Arc::new(AtomicBool::new(false)),
-        panel: Arc::new(panel_ipc::PanelState::default()),
-        panel_worker: Mutex::new(None),
+        stopping: AtomicBool::new(false),
         finished: AtomicBool::new(false),
         next_window: AtomicU64::new(1),
         worker: Mutex::new(None),
@@ -247,15 +196,6 @@ pub fn run(options: LaunchOptions) -> Result<i32, String> {
         #[cfg(windows)]
         profile: runtime.path().join("webview"),
     });
-    match panel_ipc::start(state.panel.clone(), state.stopping.clone()) {
-        Ok(worker) => *state.panel_worker.lock().unwrap() = Some(worker),
-        Err(error) => {
-            rfd::MessageDialog::new()
-                .set_title("声梭 Connect")
-                .set_description(&error)
-                .show();
-        }
-    }
     // WebView2 environment overrides would bypass the owned temporary profile.
     std::env::remove_var("WEBVIEW2_USER_DATA_FOLDER");
     let setup_state = state.clone();
@@ -289,55 +229,11 @@ pub fn run(options: LaunchOptions) -> Result<i32, String> {
     } else {
         Ok(code)
     };
-    state.stopping.store(true, Ordering::Release);
-    if let Some(join) = state.panel_worker.lock().unwrap().take() {
-        let _ = join.join();
-    }
     drop(state);
     let cleaned = cleanup_runtime(runtime);
     let code = joined?;
     cleaned?;
     Ok(code)
-}
-
-fn require_local_selection(window: &WebviewWindow) -> Result<(), String> {
-    if window.label() != "service-selection"
-        || !local_selection_url(&window.url().map_err(|error| error.to_string())?)
-    {
-        return Err("this action is only available in the local startup window".into());
-    }
-    Ok(())
-}
-
-#[tauri::command]
-async fn configure_connect(
-    window: WebviewWindow,
-    state: tauri::State<'_, Arc<RuntimeState>>,
-) -> Result<bool, String> {
-    require_local_selection(&window)?;
-    let selected = rfd::FileDialog::new()
-        .set_title("Select 声梭 Connect runtime-settings.json")
-        .pick_file();
-    if let Some(path) = selected {
-        panel_ipc::configure(&state.panel, path)?;
-        return Ok(true);
-    }
-    Ok(false)
-}
-
-#[tauri::command]
-async fn install_connect_panel(window: WebviewWindow) -> Result<bool, String> {
-    require_local_selection(&window)?;
-    let selected = rfd::FileDialog::new()
-        .set_title("Save 声梭 Connect side panel in the Synthesizer V scripts folder")
-        .set_file_name("BoxyConnect.lua")
-        .save_file();
-    if let Some(path) = selected {
-        std::fs::write(path, include_bytes!("../sidebar/BoxyConnect.lua"))
-            .map_err(|_| "cannot save side panel".to_string())?;
-        return Ok(true);
-    }
-    Ok(false)
 }
 
 #[tauri::command]
